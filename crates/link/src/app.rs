@@ -636,6 +636,11 @@ impl LinkApp {
             .into_iter()
             .filter(|name| permissions.get(*name) == Some(&Value::Bool(false)))
             .collect();
+        // Reachable through this computer's own Public Exposure (rtx-linkd's relay.rs) too.
+        let relayed = overview
+            .pointer("/publicExposure/state")
+            .and_then(Value::as_str)
+            == Some("ready");
         let (label, tone, description) = match state.as_str() {
             "off" => ("Off", Tone::Neutral, ""),
             "unsupported" => (
@@ -648,6 +653,11 @@ impl LinkApp {
                 Tone::Danger,
                 "Something went wrong. Details below.",
             ),
+            "waiting-tailscale" if relayed && missing.is_empty() => (
+                "Ready",
+                Tone::Success,
+                "Other computers can connect through RealTimeX's relay (Tailscale isn't running).",
+            ),
             "waiting-tailscale" => (
                 "Waiting",
                 Tone::Warning,
@@ -658,6 +668,11 @@ impl LinkApp {
                 "Needs setup",
                 Tone::Warning,
                 "Allow the macOS permissions below, then other computers can connect.",
+            ),
+            _ if relayed => (
+                "Ready",
+                Tone::Success,
+                "Other computers can connect over Tailscale or through RealTimeX's relay.",
             ),
             _ => (
                 "Ready",
