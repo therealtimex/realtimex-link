@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build RealTimeX Link's executables (rtx-linkd, rtx-link) for macOS or Linux, release profile,
 # into OUTPUT_DIR. Usage: scripts/build.sh [arm64|x86_64] [output_dir]
-# Rust comes from rustup (the version in rust-toolchain.toml); the build runners already have it.
+# Rust comes from rustup (the version in rust-toolchain.toml).
 set -euo pipefail
 ARCH_PARAM="${1:-$(uname -m)}"
 OUTPUT_DIR="${2:-dist}"

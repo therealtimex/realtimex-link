@@ -1,0 +1,75 @@
+# Build RealTimeX Link for every platform RealTimeX ships for. Started by hand (Actions → Build →
+# Run workflow) or by a version tag (v0.1.0): a tag also opens a draft release with the unsigned
+# builds and their SHA-256 sums, which RealTimeX's signing job (Windows: Azure Trusted Signing,
+# macOS: Developer ID and notarization) downloads, checks, signs and uploads again.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64, runner: macos-15, arch: arm64, script: unix }
+          - { name: macos-x86_64, runner: macos-15-intel, arch: x86_64, script: unix }
+          - { name: windows-x86_64, runner: windows-2022, arch: x86_64, script: windows }
+          - { name: windows-arm64, runner: windows-11-arm, arch: arm64, script: windows }
+          # glibc 2.34, RealTimeX's floor (Ubuntu 22.04, Debian 12, Fedora 35, RHEL 9).
+          - { name: linux-x86_64, runner: ubuntu-24.04, arch: x86_64, script: unix, container: "almalinux:9" }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, arch: arm64, script: unix, container: "almalinux:9" }
+    steps:
+      - name: Tools for the container
+        if: matrix.container
+        run: |
+          dnf install -y gcc git binutils findutils xz >/dev/null
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Build (macOS, Linux)
+        if: matrix.script == 'unix'
+        run: scripts/build.sh ${{ matrix.arch }} dist/${{ matrix.name }}
+      - name: Build (Windows)
+        if: matrix.script == 'windows'
+        shell: pwsh
+        run: scripts\build.ps1 ${{ matrix.arch }} dist\${{ matrix.name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: realtimex-link-${{ matrix.name }}
+          path: dist/${{ matrix.name }}
+          if-no-files-found: error
+
+  draft-release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Archives and SHA-256 sums
+        working-directory: dist
+        run: |
+          for dir in realtimex-link-*; do
+            (cd "$dir" && chmod +x * && tar -czf "../$dir.tar.gz" *)
+          done
+          sha256sum realtimex-link-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Draft release (unsigned, until signed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/realtimex-link-*.tar.gz dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" --draft --title "RealTimeX Link ${GITHUB_REF_NAME}" \
+            --notes "Unsigned builds. Signed builds replace them before this release is published."
