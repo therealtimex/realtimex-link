@@ -61,6 +61,12 @@ jobs:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      # Compiled dependencies (libvpx, aws-lc, egui…) kept between runs, per platform: only what
+      # changed is rebuilt. Saved even when a build fails, so a fix builds fast too.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          cache-on-failure: true
       # rtx-control's VP8 encoder (libvpx) builds from source on Intel macOS, with nasm.
       - name: nasm (Intel macOS)
         if: matrix.name == 'macos-x86_64'
