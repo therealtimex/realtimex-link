@@ -20,33 +20,18 @@ pub struct Tray {
     last: std::cell::RefCell<(String, String)>,
 }
 
-/// A 32 px monitor outline, drawn here (black on transparent: macOS tints a template icon).
+/// The menu bar / tray icon (assets/tray.svg and icon.svg, made by scripts/icons.py): on macOS a
+/// template (black on transparent, 44 px: 22 pt at 2x) the system tints for the light and dark
+/// menu bar; elsewhere the app icon at 32 px.
 fn icon() -> Icon {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let mut set = |x: u32, y: u32| {
-        let i = ((y * SIZE + x) * 4) as usize;
-        rgba[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
-    };
-    for x in 3..29 {
-        for y in [5, 6, 21, 22] {
-            set(x, y);
-        }
-    }
-    for y in 5..23 {
-        for x in [3, 4, 27, 28] {
-            set(x, y);
-        }
-    }
-    for y in 23..27 {
-        set(15, y);
-        set(16, y);
-    }
-    for x in 9..23 {
-        set(x, 26);
-        set(x, 27);
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("icon")
+    #[cfg(target_os = "macos")]
+    let (rgba, size) = (
+        include_bytes!("../icons/tray-template-44.rgba").to_vec(),
+        44,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (rgba, size) = (include_bytes!("../icons/tray-32.rgba").to_vec(), 32);
+    Icon::from_rgba(rgba, size, size).expect("icon")
 }
 
 impl Tray {
