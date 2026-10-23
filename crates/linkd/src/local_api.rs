@@ -277,7 +277,7 @@ async fn request_permission(State(state): State<Shared>, Body64(body): Body64) -
     if name != "screenRecording" && name != "accessibility" {
         return Err(ApiError::bad_request("Unknown permission"));
     }
-    state.host.backend.request_permission(name).await?;
+    state.host.request_permission(name).await?;
     Ok(Json(json!({})))
 }
 

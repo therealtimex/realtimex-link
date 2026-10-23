@@ -32,6 +32,9 @@ pub const NEW_COMPUTER_POLICIES: [&str; 3] = ["ask", "own-account", "password-on
 const DEFAULT_NEW_COMPUTER_POLICY: &str = "ask";
 /// A saved client's first request after this long without one is a new session (ADR-2611 §3).
 const SESSION_GAP_MS: i64 = 10 * 60 * 1000;
+/// macOS permissions are read in a fresh helper process (a grant reaches only processes started
+/// after it); the window asks for the overview every few seconds, so the answer is kept this long.
+const PERMISSIONS_FOR: Duration = Duration::from_secs(10);
 
 /// The hosting state RealTimeX's plugin kept, besides the password.
 const COPIED_KEYS: [&str; 6] = [
@@ -104,6 +107,7 @@ pub struct Host {
     listener: tokio::sync::Mutex<Option<Listener>>,
     reconciling: tokio::sync::Mutex<()>,
     last_active: Mutex<HashMap<String, i64>>,
+    permissions: Mutex<Option<(std::time::Instant, Value)>>,
     base_port: u16,
     me: Weak<Host>,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
@@ -162,6 +166,7 @@ impl Host {
                 listener: tokio::sync::Mutex::new(None),
                 reconciling: tokio::sync::Mutex::new(()),
                 last_active: Mutex::new(HashMap::new()),
+                permissions: Mutex::new(None),
                 base_port,
                 me: me.clone(),
                 log,
@@ -828,6 +833,13 @@ impl Host {
         }
     }
 
+    /// Ask macOS for a permission (its prompt and settings pane); the next overview reads them
+    /// again instead of the kept answer.
+    pub async fn request_permission(&self, name: &str) -> Result<(), ApiError> {
+        *self.permissions.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.backend.request_permission(name).await
+    }
+
     pub async fn stop_session(&self) {
         let _ = self.backend.stop().await;
         self.state().session = None;
@@ -893,10 +905,21 @@ impl Host {
         if !self.backend.available() {
             return Value::Null;
         }
+        let cached = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some((_, permissions)) = cached.filter(|(at, _)| at.elapsed() < PERMISSIONS_FOR) {
+            return permissions;
+        }
         match self.backend.permissions().await {
             Ok(permissions) => {
                 self.state().helper_error = None;
-                permissions.unwrap_or(Value::Null)
+                let permissions = permissions.unwrap_or(Value::Null);
+                *self.permissions.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((std::time::Instant::now(), permissions.clone()));
+                permissions
             }
             Err(error) => {
                 self.state().helper_error = Some(error.message);

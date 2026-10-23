@@ -62,6 +62,10 @@ struct Controller {
     peers: HashMap<u64, Peer>,
     next_peer: u64,
     to_main: Sender<Msg>,
+    /// AppKit's window-server connection, made on the first request that needs the screen or
+    /// input. A permissions check never makes it: on macOS that connection puts the helper in
+    /// the Dock for a moment (it lives inside an app bundle), and checks run often.
+    window_server: bool,
 }
 
 /// What the control loop waits for: a request line, stdin closing, or a peer session.
@@ -133,6 +137,10 @@ impl Controller {
 
     fn handle(&mut self, request: &Value) -> Result<Value> {
         let op = request["op"].as_str().unwrap_or("");
+        if !self.window_server && !matches!(op, "permissions" | "status") {
+            platform::init_window_server();
+            self.window_server = true;
+        }
         match op {
             "start" => {
                 let size = self.input()?.screen_size();
@@ -432,7 +440,6 @@ fn write_line(out: &mut impl Write, value: &Value) {
 
 /// Serve requests until stdin closes.
 pub fn run() -> Result<()> {
-    platform::init_window_server();
     let (to_main, inbox) = mpsc::channel();
     let mut controller = Controller {
         input: None,
@@ -442,6 +449,7 @@ pub fn run() -> Result<()> {
         peers: HashMap::new(),
         next_peer: 0,
         to_main: to_main.clone(),
+        window_server: false,
     };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
