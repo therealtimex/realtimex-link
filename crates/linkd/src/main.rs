@@ -17,6 +17,7 @@ mod error;
 mod file_browse;
 mod files;
 mod host;
+mod install;
 mod local_api;
 mod lock;
 mod password;
@@ -55,6 +56,20 @@ async fn main() {
         print_line(
             json!({ "tool": "rtx-linkd", "version": version, "protocol": local_api::PROTOCOL }),
         );
+        return;
+    }
+    if args.first().map(String::as_str) == Some("install") {
+        let Some(destination) = args.get(1) else {
+            print_line(json!({ "error": "usage: rtx-linkd install DESTINATION" }));
+            std::process::exit(2);
+        };
+        match install::run(std::path::Path::new(destination)) {
+            Ok(result) => print_line(result),
+            Err(error) => {
+                print_line(json!({ "error": format!("{error:#}") }));
+                std::process::exit(1);
+            }
+        }
         return;
     }
     let data_dir =

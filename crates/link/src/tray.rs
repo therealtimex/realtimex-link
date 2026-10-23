@@ -20,9 +20,9 @@ pub struct Tray {
     last: std::cell::RefCell<(String, String)>,
 }
 
-/// The menu bar / tray icon (assets/tray.svg and the app icon, made by scripts/icons.py): on macOS a
-/// template (black on transparent, 44 px: 22 pt at 2x) the system tints for the light and dark
-/// menu bar; elsewhere the app icon at 32 px.
+/// The menu bar / tray icon (assets/tray.svg and the app icon, made by scripts/icons.py): on
+/// macOS a template (black on transparent, 44 px: 22 pt at 2x) the system tints for the light and
+/// dark menu bar; elsewhere the app icon at 32 px.
 fn icon() -> Icon {
     #[cfg(target_os = "macos")]
     let (rgba, size) = (
