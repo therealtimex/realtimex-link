@@ -31,8 +31,9 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("RealTimeX Link")
             .with_visible(!background)
-            .with_inner_size([440.0, 720.0])
-            .with_min_inner_size([380.0, 480.0])
+            // The height then follows the content (app.rs, fit_height).
+            .with_inner_size([440.0, 520.0])
+            .with_min_inner_size([380.0, 360.0])
             // RealTimeX Link's icon (RealTimeX's with assets/badge.svg, made by scripts/icons.py).
             .with_icon(std::sync::Arc::new(eframe::egui::IconData {
                 rgba: include_bytes!("../icons/window-256.rgba").to_vec(),

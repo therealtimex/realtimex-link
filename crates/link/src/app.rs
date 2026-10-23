@@ -13,6 +13,9 @@ use crate::api::Api;
 use crate::desktop;
 
 const POLL: Duration = Duration::from_millis(1500);
+/// The window's height follows its content between these; past the maximum the content scrolls.
+const MIN_HEIGHT: f32 = 360.0;
+const MAX_HEIGHT: f32 = 720.0;
 const NOTICE_FOR: Duration = Duration::from_secs(4);
 
 #[derive(Default)]
@@ -130,6 +133,24 @@ fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Grow or shrink the window by `extra` (content height minus the visible height), so no empty
+/// space stays below the content and nothing scrolls until MAX_HEIGHT.
+fn fit_height(ctx: &egui::Context, extra: f32) {
+    if extra.abs() < 2.0 {
+        return;
+    }
+    let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
+        return;
+    };
+    let height = (inner.height() + extra).clamp(MIN_HEIGHT, MAX_HEIGHT);
+    if (height - inner.height()).abs() >= 2.0 {
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
+            inner.width(),
+            height,
+        )));
     }
 }
 
@@ -435,7 +456,7 @@ impl eframe::App for LinkApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            let scroll = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
@@ -484,6 +505,7 @@ impl eframe::App for LinkApp {
                         Tab::Computers => self.computers_ui(ui, ctx, overview),
                     }
                 });
+            fit_height(ctx, scroll.content_size.y - scroll.inner_rect.height());
         });
 
         self.confirm_ui(ctx);
