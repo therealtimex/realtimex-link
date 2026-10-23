@@ -26,6 +26,7 @@ fn main() -> eframe::Result {
     }
     // One window (with its icon, except on Linux) at a time: when RealTimeX Link already runs,
     // it shows its window and this one exits. Without the daemon (or an older one), it goes on.
+    let _ = app::ROLE.set("window");
     if let Ok(api) = api::Api::ensure() {
         let answer = api.post(
             "/v1/window/open",

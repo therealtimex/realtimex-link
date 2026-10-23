@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
-use serde_json::json;
 
 use crate::app::{lock, poll_loop, Snapshot};
 use crate::tray::{Actions, Tray};
@@ -53,12 +52,9 @@ fn copy(text: String) {
 
 /// Run the icon until Quit (or until another icon is already running).
 pub fn run() -> eframe::Result {
+    let _ = crate::app::ROLE.set("tray");
     if let Ok(api) = crate::api::Api::ensure() {
-        let answer = api.post(
-            "/v1/window/open",
-            json!({ "pid": std::process::id(), "role": "tray" }),
-        );
-        if answer.is_ok_and(|answer| answer["owner"] == false) {
+        if !crate::app::register(&api) {
             return Ok(());
         }
     }

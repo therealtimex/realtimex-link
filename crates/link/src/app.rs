@@ -70,6 +70,20 @@ pub fn act(
     });
 }
 
+/// What this process is to the daemon (POST /v1/window/open): "window", or on Linux "tray" for
+/// the icon on its own (icon.rs).
+pub static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Register with the daemon as ROLE; false when another process already holds that role.
+pub fn register(api: &Api) -> bool {
+    let role = ROLE.get().copied().unwrap_or("window");
+    let answer = api.post(
+        "/v1/window/open",
+        json!({ "pid": std::process::id(), "role": role }),
+    );
+    !answer.is_ok_and(|answer| answer["owner"] == false)
+}
+
 pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
     loop {
         let api = lock(&shared).api.clone();
@@ -77,6 +91,11 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             Some(api) => Some(api),
             None => match Api::ensure() {
                 Ok(api) => {
+                    // A daemon that restarted knows no window or icon yet: register again, and
+                    // leave when another process already holds this role.
+                    if !register(&api) {
+                        std::process::exit(0);
+                    }
                     lock(&shared).api = Some(api.clone());
                     Some(api)
                 }
