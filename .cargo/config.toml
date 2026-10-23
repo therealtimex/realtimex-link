@@ -1,0 +1,8 @@
+# The same floor as RealTimeX: macOS 12 (Electron 41).
+[env]
+MACOSX_DEPLOYMENT_TARGET = "12.0"
+
+# Windows: link the C runtime statically, so the executables run without the Visual C++
+# Redistributable.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

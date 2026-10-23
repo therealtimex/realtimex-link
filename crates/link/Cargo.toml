@@ -1,0 +1,18 @@
+[package]
+name = "rtx-link"
+description = "RealTimeX Link's window and menu bar / tray icon, on top of the rtx-linkd daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The window only (#2753): it talks to rtx-linkd over its local API and starts it when it is not
+# running. No capture, input or hosting code here.
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+serde.workspace = true
+serde_json.workspace = true
+tray-icon = "0.26.1"
+ureq = { version = "3.5.0", features = ["json"] }

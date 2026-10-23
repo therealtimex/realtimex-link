@@ -1,0 +1,182 @@
+//! The menu bar (macOS) / tray (Windows) icon: whether remote control is on and who is in control,
+//! Copy App ID and password, turn it off or on, open the window or RealTimeX, and Quit, which
+//! stops hosting (closing the window does not).
+
+use std::sync::mpsc::Sender;
+use std::time::Instant;
+
+use eframe::egui::{self, ViewportCommand};
+use serde_json::{json, Value};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+use crate::app::{act, lock, Shared};
+use crate::desktop;
+
+pub struct Tray {
+    _icon: TrayIcon,
+    status: MenuItem,
+    toggle: MenuItem,
+    last: std::cell::RefCell<(String, String)>,
+}
+
+/// A 32 px monitor outline, drawn here (black on transparent: macOS tints a template icon).
+fn icon() -> Icon {
+    const SIZE: u32 = 32;
+    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let mut set = |x: u32, y: u32| {
+        let i = ((y * SIZE + x) * 4) as usize;
+        rgba[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
+    };
+    for x in 3..29 {
+        for y in [5, 6, 21, 22] {
+            set(x, y);
+        }
+    }
+    for y in 5..23 {
+        for x in [3, 4, 27, 28] {
+            set(x, y);
+        }
+    }
+    for y in 23..27 {
+        set(15, y);
+        set(16, y);
+    }
+    for x in 9..23 {
+        set(x, 26);
+        set(x, 27);
+    }
+    Icon::from_rgba(rgba, SIZE, SIZE).expect("icon")
+}
+
+impl Tray {
+    pub fn new(shared: Shared, refresh: Sender<()>, ctx: egui::Context) -> anyhow::Result<Self> {
+        let status = MenuItem::new("Remote control", false, None);
+        let toggle = MenuItem::new("Turn off remote control", true, None);
+        let copy = MenuItem::new("Copy App ID and password", true, None);
+        let open = MenuItem::new("Open RealTimeX Link…", true, None);
+        let realtimex = MenuItem::new(
+            if desktop::realtimex_app().is_some() {
+                "Open RealTimeX"
+            } else {
+                "Get RealTimeX"
+            },
+            true,
+            None,
+        );
+        let quit = MenuItem::new("Quit (other computers can't connect)", true, None);
+        let menu = Menu::new();
+        menu.append_items(&[
+            &status,
+            &PredefinedMenuItem::separator(),
+            &copy,
+            &toggle,
+            &PredefinedMenuItem::separator(),
+            &open,
+            &realtimex,
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ])?;
+        let icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("RealTimeX Link")
+            .with_icon_templated(icon())
+            .build()?;
+
+        let ids = (
+            copy.id().clone(),
+            toggle.id().clone(),
+            open.id().clone(),
+            realtimex.id().clone(),
+            quit.id().clone(),
+        );
+        // Handled here, not in the window: the window may be hidden and not drawing.
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            let (copy, toggle, open, realtimex, quit) = &ids;
+            let id = &event.id;
+            if id == open {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            } else if id == realtimex {
+                desktop::open_realtimex();
+            } else if id == copy {
+                let state = lock(&shared);
+                let app_id = state
+                    .overview
+                    .as_ref()
+                    .and_then(|o| o.get("appId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let text = format!("App ID: {app_id}\nPassword: {}", state.password);
+                drop(state);
+                ctx.copy_text(text);
+                lock(&shared).notice =
+                    Some(("App ID and password copied.".into(), true, Instant::now()));
+            } else if id == toggle {
+                let on = lock(&shared)
+                    .overview
+                    .as_ref()
+                    .and_then(|o| o.get("allowIncoming"))
+                    == Some(&Value::Bool(true));
+                let done = if on {
+                    "Remote control is off. No other computer can connect."
+                } else {
+                    "Remote control is on."
+                };
+                act(
+                    &shared,
+                    &refresh,
+                    &ctx,
+                    "/v1/host/settings",
+                    json!({ "allowIncoming": !on }),
+                    done,
+                );
+            } else if id == quit {
+                // Quit is all of RealTimeX Link: hosting stops too.
+                if let Some(api) = lock(&shared).api.clone() {
+                    let _ = api.post("/v1/shutdown", json!({}));
+                }
+                std::process::exit(0);
+            }
+            ctx.request_repaint();
+        }));
+        Ok(Self {
+            _icon: icon,
+            status,
+            toggle,
+            last: Default::default(),
+        })
+    }
+
+    /// The status line and the switch's label, from the latest overview.
+    pub fn update(&self, overview: Option<&Value>) {
+        let on = overview.and_then(|o| o.get("allowIncoming")) == Some(&Value::Bool(true));
+        let holder = overview
+            .and_then(|o| o.get("session"))
+            .filter(|s| s.get("active") == Some(&Value::Bool(true)))
+            .and_then(|s| s.get("clientName"))
+            .and_then(Value::as_str);
+        let status = match (overview, on, holder) {
+            (None, ..) => "RealTimeX Link is starting…".to_string(),
+            (_, false, _) => "Remote control is off".to_string(),
+            (_, true, Some(name)) => format!("{name} is controlling this computer"),
+            (_, true, None) => "Remote control is on".to_string(),
+        };
+        let toggle = if on {
+            "Turn off remote control"
+        } else {
+            "Turn on remote control"
+        }
+        .to_string();
+        let mut last = self.last.borrow_mut();
+        if last.0 != status {
+            self.status.set_text(&status);
+            last.0 = status;
+        }
+        if last.1 != toggle {
+            self.toggle.set_text(&toggle);
+            last.1 = toggle;
+        }
+    }
+}

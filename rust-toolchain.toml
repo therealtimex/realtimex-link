@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.99.0"
+# llvm-tools: shiguredo_libvpx builds libvpx from source on Intel macOS and renames its symbols
+# with llvm-nm/llvm-objcopy from here.
+components = ["clippy", "rustfmt", "llvm-tools"]
