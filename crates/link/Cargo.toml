@@ -15,6 +15,7 @@ eframe = { version = "0.37.0", default-features = false, features = ["glow", "de
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3.5.0", features = ["json"] }
+rtx-glibc-compat = { path = "../glibc-compat" }
 # The menu bar (macOS) and tray (Windows, Linux) icon. On Linux the StatusNotifierItem backend
 # (D-Bus, its own thread): no GTK; GNOME shows it with the AppIndicator extension (Ubuntu's default).
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }

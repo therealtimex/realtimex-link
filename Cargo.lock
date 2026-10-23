@@ -3779,6 +3779,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "eframe",
+ "rtx-glibc-compat",
  "serde",
  "serde_json",
  "tray-icon",

@@ -4,6 +4,9 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// The glibc 2.34 floor on Linux (no code to call).
+use rtx_glibc_compat as _;
+
 mod api;
 mod app;
 mod desktop;
