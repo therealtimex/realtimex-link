@@ -19,7 +19,8 @@ case "$(uname -s)" in
 esac
 export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "ERROR: Rust (rustup) is not installed on this machine" >&2; exit 1; }
-# RealTimeX ships for glibc 2.34 and later (glibc/glibc_compat.c covers the newer symbols).
+# RealTimeX ships for glibc 2.34 and later (crates/glibc-compat/glibc_compat.c covers the newer
+# symbols).
 GLIBC_MAX=2.34
 
 cd "$ROOT"
@@ -36,7 +37,14 @@ for bin in rtx-linkd rtx-link rtx-control; do
     NEED=$(objdump -p "$BIN" | sed -n '/^Version References:/,$p' | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
     echo "$bin requires glibc $NEED"
     if [ "$(printf '%s\n%s\n' "$NEED" "$GLIBC_MAX" | sort -V | tail -1)" != "$GLIBC_MAX" ]; then
-      echo "ERROR: $bin requires glibc $NEED, more than $GLIBC_MAX" >&2
+      echo "ERROR: $bin requires glibc $NEED, more than $GLIBC_MAX. Functions above it:" >&2
+      # Each needs a definition in crates/glibc-compat/glibc_compat.c.
+      objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*)\? *[^ ]*$' | sed 's/GLIBC_//; s/)//' \
+        | while read -r version name; do
+            if [ "$(printf '%s\n%s\n' "$version" "$GLIBC_MAX" | sort -V | tail -1)" != "$GLIBC_MAX" ]; then
+              echo "  $name (glibc $version)" >&2
+            fi
+          done
       exit 1
     fi
   fi
