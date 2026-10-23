@@ -56,26 +56,29 @@ int pidfd_getpid(int pidfd) {
 }
 
 /*
- * glibc 2.35 versioned hypot and hypotf again (faster, still correctly rounded); the earlier
- * versions stay in every glibc with the same meaning. rtx-link's window (egui) calls them. These
- * definitions forward to the earlier versions, so the binary references only those.
+ * glibc 2.35 versioned hypot and hypotf again (faster, still correctly rounded). rtx-link's window
+ * (egui) calls them. Defined here instead: the largest magnitude times sqrt(1 + r^2), r <= 1, so
+ * nothing overflows; within an ulp or two, enough for layout. (Forwarding to the earlier versioned
+ * symbol bound back to these very definitions and looped forever.)
  */
-#if defined(__x86_64__)
-#define RTX_LIBM_BASE "GLIBC_2.2.5"
-#elif defined(__aarch64__)
-#define RTX_LIBM_BASE "GLIBC_2.17"
-#endif
-#ifdef RTX_LIBM_BASE
-double rtx_hypot_base(double x, double y);
-float rtx_hypotf_base(float x, float y);
-__asm__(".symver rtx_hypot_base, hypot@" RTX_LIBM_BASE);
-__asm__(".symver rtx_hypotf_base, hypotf@" RTX_LIBM_BASE);
-
 double hypot(double x, double y) {
-  return rtx_hypot_base(x, y);
+  x = __builtin_fabs(x);
+  y = __builtin_fabs(y);
+  if (__builtin_isinf(x) || __builtin_isinf(y)) return __builtin_inf();
+  if (__builtin_isnan(x) || __builtin_isnan(y)) return __builtin_nan("");
+  if (x < y) {
+    double t = x;
+    x = y;
+    y = t;
+  }
+  if (x == 0.0) return 0.0;
+  double r = y / x;
+  return x * __builtin_sqrt(1.0 + r * r);
 }
 
 float hypotf(float x, float y) {
-  return rtx_hypotf_base(x, y);
+  /* In double, x*x + y*y neither overflows nor loses a float's precision. */
+  double dx = x, dy = y;
+  if (__builtin_isinf(dx) || __builtin_isinf(dy)) return __builtin_inff();
+  return (float)__builtin_sqrt(dx * dx + dy * dy);
 }
-#endif
