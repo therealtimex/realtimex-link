@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- RealTimeX Link's badge, laid on RealTimeX's icon (scripts/icons.py): a white chain link on
+       RealTimeX's orange, ringed in its navy so it stands apart from the icon under it. -->
+  <circle cx="512" cy="512" r="500" fill="#062a6b"/>
+  <circle cx="512" cy="512" r="440" fill="#ff9f2e"/>
+  <g transform="rotate(-38 512 512)" fill="none" stroke="#ffffff" stroke-width="78">
+    <rect x="196" y="402" width="380" height="220" rx="110"/>
+    <rect x="448" y="402" width="380" height="220" rx="110"/>
+  </g>
+</svg>
