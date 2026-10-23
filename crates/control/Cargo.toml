@@ -1,0 +1,42 @@
+[package]
+name = "rtx-control"
+description = "RealTimeX Remote Control's desktop side: screenshots, WebRTC live view and mouse/keyboard input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Everything that posts input, uses the clipboard or streams the screen lives in this package and
+# nowhere else; the recorder (crates/cli) shares only the capture-only crates (#2665).
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+if-addrs = "0.15"
+libc.workspace = true
+rtx-glibc-compat = { path = "../glibc-compat" }
+rtx-screens = { path = "../screens" }
+serde_json.workspace = true
+# The live view over WebRTC: sans-IO, pure-Rust crypto (no OpenSSL to install).
+str0m = { version = "0.24", default-features = false, features = ["rust-crypto"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.14", default-features = false, features = ["randr", "xtest", "xfixes"] }
+zbus = "5"
+
+# The pasteboard (paste images and files, read copies; #2682).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+# The live view: VP8 (royalty-free) through libvpx, linked statically. A prebuilt libvpx (SHA-256
+# checked) is used where one exists; Intel macOS has none, so it builds from source there
+# (configure + make + nasm). Pinned: the crate only publishes canary versions.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+shiguredo_libvpx = "=2026.2.0-canary.3"
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+shiguredo_libvpx = { version = "=2026.2.0-canary.3", features = ["source-build"] }
+

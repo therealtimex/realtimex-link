@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/linkd", "crates/link"]
+members = ["crates/glibc-compat", "crates/screens", "crates/control", "crates/linkd", "crates/link"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,3 +18,11 @@ libc = "0.2"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Dependencies are optimized in dev and test builds too: video encoding and image scaling touch
+# every pixel and are far too slow unoptimized for a live view in a dev build.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.rtx-screens]
+opt-level = 2

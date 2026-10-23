@@ -8,6 +8,8 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    # Work in progress builds here, not on a developer's machine.
+    branches-ignore: [main]
 
 permissions:
   contents: write
@@ -32,10 +34,14 @@ jobs:
       - name: Tools for the container
         if: matrix.container
         run: |
-          dnf install -y gcc git binutils findutils xz >/dev/null
+          dnf install -y gcc gcc-c++ make cmake perl git binutils findutils xz >/dev/null
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
+      # rtx-control's VP8 encoder (libvpx) builds from source on Intel macOS, with nasm.
+      - name: nasm (Intel macOS)
+        if: matrix.name == 'macos-x86_64'
+        run: brew install nasm
       - name: Build (macOS, Linux)
         if: matrix.script == 'unix'
         run: scripts/build.sh ${{ matrix.arch }} dist/${{ matrix.name }}

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build RealTimeX Link's executables (rtx-linkd, rtx-link) for macOS or Linux, release profile,
+# Build RealTimeX Link's executables (rtx-linkd, rtx-link, rtx-control) for macOS or Linux, release profile,
 # into OUTPUT_DIR. Usage: scripts/build.sh [arm64|x86_64] [output_dir]
 # Rust comes from rustup (the version in rust-toolchain.toml).
 set -euo pipefail
@@ -24,11 +24,13 @@ GLIBC_MAX=2.34
 
 cd "$ROOT"
 rustup target add "$TARGET" >/dev/null
-echo "Building rtx-linkd and rtx-link for $TARGET into $OUTPUT_DIR"
+echo "Building rtx-linkd, rtx-link and rtx-control for $TARGET into $OUTPUT_DIR"
 cargo build --release --locked --target "$TARGET" -p rtx-linkd
 cargo build --release --locked --target "$TARGET" -p rtx-link
+# Each its own build, so none takes on another's dependency features.
+cargo build --release --locked --target "$TARGET" -p rtx-control
 mkdir -p "$OUTPUT_DIR"
-for bin in rtx-linkd rtx-link; do
+for bin in rtx-linkd rtx-link rtx-control; do
   BIN="target/$TARGET/release/$bin"
   if [ "$(uname -s)" = Linux ] && command -v objdump >/dev/null 2>&1; then
     NEED=$(objdump -p "$BIN" | sed -n '/^Version References:/,$p' | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
@@ -42,4 +44,5 @@ for bin in rtx-linkd rtx-link; do
   chmod +x "$OUTPUT_DIR/$bin"
 done
 "$OUTPUT_DIR/rtx-linkd" --version
-echo "SUCCESS: $OUTPUT_DIR/rtx-linkd $OUTPUT_DIR/rtx-link"
+"$OUTPUT_DIR/rtx-control" --version
+echo "SUCCESS: $OUTPUT_DIR/rtx-linkd $OUTPUT_DIR/rtx-link $OUTPUT_DIR/rtx-control"

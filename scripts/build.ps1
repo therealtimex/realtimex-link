@@ -1,4 +1,4 @@
-# Build RealTimeX Link's executables (rtx-linkd.exe, rtx-link.exe) for Windows, release profile,
+# Build RealTimeX Link's executables (rtx-linkd.exe, rtx-link.exe, rtx-control.exe) for Windows, release profile,
 # into OutDir. Usage: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 [x86_64|arm64] [output_dir]
 # Needs Visual Studio 2022 (or its Build Tools) with the C++ tools, and Rust (rustup), which the
 # build runners already have. The C runtime is linked statically (.cargo/config.toml).
@@ -53,14 +53,15 @@ if (-not ($env:VSCMD_ARG_TGT_ARCH -eq $VsArch -and (Get-Command cl.exe -ErrorAct
 }
 
 Set-Location (Join-Path $PSScriptRoot '..')
-Write-Host "Building rtx-linkd and rtx-link for $Target into $OutDir"
+Write-Host "Building rtx-linkd, rtx-link and rtx-control for $Target into $OutDir"
 Run rustup target add $Target
 Run cargo build --release --locked --target $Target -p rtx-linkd
 Run cargo build --release --locked --target $Target -p rtx-link
+Run cargo build --release --locked --target $Target -p rtx-control
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 $built = Join-Path $targetDir "$Target\release"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-foreach ($name in 'rtx-linkd.exe', 'rtx-link.exe') {
+foreach ($name in 'rtx-linkd.exe', 'rtx-link.exe', 'rtx-control.exe') {
   $exe = Join-Path $OutDir $name
   Copy-Item -LiteralPath (Join-Path $built $name) -Destination $exe -Force
   $dlls = & dumpbin.exe /nologo /dependents $exe | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
@@ -68,4 +69,5 @@ foreach ($name in 'rtx-linkd.exe', 'rtx-link.exe') {
   if ($crt.Count -gt 0) { Fail "$name depends on the C runtime DLLs: $($crt -join ', ')" }
 }
 Run (Join-Path $OutDir 'rtx-linkd.exe') --version
-Write-Host "SUCCESS: $(Join-Path $OutDir 'rtx-linkd.exe') $(Join-Path $OutDir 'rtx-link.exe')"
+Run (Join-Path $OutDir 'rtx-control.exe') --version
+Write-Host "SUCCESS: $(Join-Path $OutDir 'rtx-linkd.exe') $(Join-Path $OutDir 'rtx-link.exe') $(Join-Path $OutDir 'rtx-control.exe')"

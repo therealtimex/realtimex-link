@@ -1,0 +1,12 @@
+[package]
+name = "rtx-glibc-compat"
+description = "glibc 2.34 floor for RealTimeX's native executables built on newer Linux systems"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Linux (gnu) only: glibc_compat.c, linked whole into each executable that uses this crate
+# (`use rtx_glibc_compat as _;` in its main.rs). Elsewhere it is empty.
+[build-dependencies]
+cc = "1.2"

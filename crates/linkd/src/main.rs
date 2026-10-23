@@ -3,6 +3,9 @@
 //! ({ error, code }), and stops cleanly on SIGTERM or SIGINT. Exit code 3: another daemon
 //! already runs for this data folder (callers then use that one).
 
+// The glibc 2.34 floor on Linux (no code to call).
+use rtx_glibc_compat as _;
+
 mod actions;
 mod backend;
 mod clients;

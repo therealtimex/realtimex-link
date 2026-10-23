@@ -17,6 +17,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 if-addrs = "0.15"
 libc.workspace = true
+rtx-glibc-compat = { path = "../glibc-compat" }
 rand = "0.9"
 # SQLite built in: the same remote-host.db the JavaScript daemon keeps (one data folder).
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -33,9 +34,6 @@ uuid = { version = "1", features = ["v4"] }
 png = "0.17"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
-[build-dependencies]
-# Linux only: ../../glibc/glibc_compat.c (see build.rs).
-cc = "1.2"
 
 [dev-dependencies]
 tempfile = "3"
