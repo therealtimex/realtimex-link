@@ -27,6 +27,7 @@ pub fn run(destination: &Path) -> Result<Value> {
     }
     let stopped = destination.exists() && stop(destination)?;
     replace(&source, destination)?;
+    menu_entry(destination)?;
     Ok(json!({
         "installed": true,
         "version": ours,
@@ -208,6 +209,32 @@ fn replace(source: &Path, destination: &Path) -> Result<()> {
     if old.exists() {
         let _ = std::fs::remove_dir_all(&old);
     }
+    Ok(())
+}
+
+/// Linux, installed for everyone (root): RealTimeX Link in the applications menu, so its window
+/// opens without the tray. macOS and Windows have theirs (/Applications, the Start menu shortcut
+/// RealTimeX's installer adds).
+#[cfg(target_os = "linux")]
+fn menu_entry(destination: &Path) -> Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let path = Path::new("/usr/share/applications/realtimex-link.desktop");
+    let app = destination.join("rtx-link");
+    let icon = destination.join("icon.png");
+    let text = format!(
+        "[Desktop Entry]\nType=Application\nName=RealTimeX Link\nComment=Lets your other computers \
+         connect to this one\nExec={}\nIcon={}\nTerminal=false\nCategories=Network;RemoteAccess;\n",
+        crate::autostart::desktop_exec(&app, ""),
+        icon.display()
+    );
+    std::fs::write(path, text).with_context(|| format!("could not write {}", path.display()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn menu_entry(_destination: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -51,16 +51,20 @@ fn command_line(app: &Path) -> String {
         // ProgramArguments: the path alone; --background is the second argument.
         path
     } else {
-        // Desktop Entry Exec: quoted, with ", `, $ and \ escaped.
-        let mut quoted = String::from("\"");
-        for c in path.chars() {
-            if matches!(c, '"' | '`' | '$' | '\\') {
-                quoted.push('\\');
-            }
-            quoted.push(c);
-        }
-        quoted + "\" --background"
+        desktop_exec(app, " --background")
     }
+}
+
+/// A Desktop Entry's Exec value: the program quoted, with ", `, $ and \ escaped, then `args`.
+pub fn desktop_exec(app: &Path, args: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in app.display().to_string().chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted + "\"" + args
 }
 
 #[cfg(target_os = "macos")]

@@ -59,6 +59,8 @@ else
     cp "$BUILT/$bin" "$OUTPUT_DIR/$bin"
     chmod +x "$OUTPUT_DIR/$bin"
   done
+  # The menu entry's and the autostart entry's icon (rtx-linkd's install.rs, autostart.rs).
+  cp assets/icon-256.png "$OUTPUT_DIR/icon.png"
   OUT="$OUTPUT_DIR"
 fi
 "$OUT/rtx-linkd" --version
