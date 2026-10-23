@@ -34,16 +34,18 @@ jobs:
         run: |
           test='[
             {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix"},
-            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix","container":"almalinux:9"}
+            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix"}
           ]'
-          # glibc 2.34 in the Linux containers, RealTimeX's floor (Ubuntu 22.04, Debian 12, RHEL 9).
+          # Linux builds on Ubuntu 24.04, like RealTimeX's own: the prebuilt libvpx is Ubuntu's, and
+          # the glibc 2.34 floor (Ubuntu 22.04, Debian 12, RHEL 9) comes from rtx-glibc-compat and
+          # build.sh's check of every binary's glibc references.
           all='[
             {"name":"macos-arm64","runner":"macos-15","arch":"arm64","script":"unix"},
             {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix"},
             {"name":"windows-x86_64","runner":"windows-2022","arch":"x86_64","script":"windows"},
             {"name":"windows-arm64","runner":"windows-11-arm","arch":"arm64","script":"windows"},
-            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix","container":"almalinux:9"},
-            {"name":"linux-arm64","runner":"ubuntu-24.04-arm","arch":"arm64","script":"unix","container":"almalinux:9"}
+            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix"},
+            {"name":"linux-arm64","runner":"ubuntu-24.04-arm","arch":"arm64","script":"unix"}
           ]'
           if [ "$ALL" = "true" ]; then list="$all"; else list="$test"; fi
           echo "matrix=$(echo "$list" | tr -d '\n ')" >> "$GITHUB_OUTPUT"
@@ -58,12 +60,6 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - name: Tools for the container
-        if: matrix.container
-        run: |
-          dnf install -y gcc gcc-c++ make cmake perl git binutils findutils xz >/dev/null
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
       # rtx-control's VP8 encoder (libvpx) builds from source on Intel macOS, with nasm.
       - name: nasm (Intel macOS)
