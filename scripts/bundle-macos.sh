@@ -51,4 +51,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
+# Ad-hoc signed, so macOS can keep its Privacy & Security permissions (an unsigned app has no
+# stable identity: Accessibility stays off). Releases are signed again with RealTimeX's
+# Developer ID and notarized.
+codesign --force --deep --sign - --identifier ai.realtimex.link "$APP"
+codesign --verify --deep --strict "$APP"
 echo "$APP ($VERSION)"
