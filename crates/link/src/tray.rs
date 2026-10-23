@@ -77,11 +77,15 @@ impl Tray {
             &PredefinedMenuItem::separator(),
             &quit,
         ])?;
-        let icon = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("RealTimeX Link")
-            .with_icon_templated(icon())
-            .build()?;
+            .with_tooltip("RealTimeX Link");
+        // macOS tints a template icon for the light and dark menu bar.
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_templated(icon());
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_icon(icon());
+        let icon = builder.build()?;
 
         let ids = (
             copy.id().clone(),
