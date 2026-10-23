@@ -14,12 +14,19 @@ use crate::tray::{Actions, Tray};
 
 /// Start the window process (it keeps one window open at a time itself).
 pub fn open_window() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let child = Command::new(exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    // Collected when it closes, so no finished window lingers as a zombie.
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 
