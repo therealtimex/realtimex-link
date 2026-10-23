@@ -13,9 +13,13 @@ mod desktop;
 mod tray;
 
 fn main() -> eframe::Result {
+    // --background: started at login (rtx-linkd's autostart.rs). The menu bar / tray icon and
+    // the daemon, no window until it is opened from the icon.
+    let background = std::env::args().any(|arg| arg == "--background");
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("RealTimeX Link")
+            .with_visible(!background)
             .with_inner_size([440.0, 720.0])
             .with_min_inner_size([380.0, 480.0])
             // RealTimeX Link's icon (assets/icon.svg, made by scripts/icons.py).

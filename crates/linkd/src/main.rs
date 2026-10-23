@@ -7,6 +7,7 @@
 use rtx_glibc_compat as _;
 
 mod actions;
+mod autostart;
 mod backend;
 mod clients;
 mod clipboard_share;

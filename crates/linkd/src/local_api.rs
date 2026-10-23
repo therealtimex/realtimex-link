@@ -22,7 +22,7 @@ use crate::util::same_bytes;
 /// The local API's protocol: a caller that speaks another one says so instead of misreading it.
 pub const PROTOCOL: u32 = 1;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-pub const FEATURES: &[&str] = &["host"];
+pub const FEATURES: &[&str] = &["host", "autostart"];
 
 pub struct LocalState {
     pub token: String,
@@ -41,6 +41,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/import", post(import))
         .route("/v1/shutdown", post(shutdown))
+        .route("/v1/autostart", get(autostart).post(set_autostart))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/overview", get(host_overview))
         .route("/v1/host/settings", post(host_settings))
@@ -154,6 +155,25 @@ type Answer = ApiResult<Json<Value>>;
 async fn shutdown(State(state): State<Shared>) -> Answer {
     state.shutdown.notify_one();
     Ok(Json(json!({ "stopping": true })))
+}
+
+/// Start at login (autostart.rs): { enabled, available }. Available: rtx-link is installed next to
+/// this daemon, so there is something to start.
+async fn autostart() -> Answer {
+    Ok(Json(json!({
+        "enabled": crate::autostart::enabled(),
+        "available": crate::autostart::app_binary().is_some(),
+    })))
+}
+
+/// { enabled: bool }: add or remove the login item.
+async fn set_autostart(Body64(body): Body64) -> Answer {
+    let on = body
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
+    crate::autostart::set(on).map_err(ApiError::internal)?;
+    autostart().await
 }
 
 /// RealTimeX's hosting state, once: { state: { clients, settings… }, password: { password,
