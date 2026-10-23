@@ -94,6 +94,7 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let seen = std::mem::replace(&mut lock(&shared).show_window, shown);
             if let (Some(seen), Some(shown)) = (seen, shown) {
                 if shown > seen {
+                    crate::dock::set_open(true);
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
@@ -394,7 +395,9 @@ impl eframe::App for LinkApp {
         if ctx.input(|i| i.viewport().close_requested()) && self.has_tray() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            crate::dock::set_open(false);
         }
+        crate::dock::apply();
         if let Some(tray) = &self.tray {
             tray.update(lock(&self.shared).overview.as_ref());
         }

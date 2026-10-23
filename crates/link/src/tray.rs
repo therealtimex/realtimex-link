@@ -28,6 +28,7 @@ impl Actions {
         let (show, copy) = (ctx.clone(), ctx.clone());
         Self {
             open: Box::new(move || {
+                crate::dock::set_open(true);
                 show.send_viewport_cmd(ViewportCommand::Visible(true));
                 show.send_viewport_cmd(ViewportCommand::Focus);
             }),

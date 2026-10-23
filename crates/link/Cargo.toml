@@ -19,3 +19,8 @@ rtx-glibc-compat = { path = "../glibc-compat" }
 # The menu bar (macOS) and tray (Windows, Linux) icon. On Linux the StatusNotifierItem backend
 # (D-Bus, its own thread): no GTK; GNOME shows it with the AppIndicator extension (Ubuntu's default).
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+
+# macOS: in the Dock only while the window is open (dock.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }

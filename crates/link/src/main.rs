@@ -10,6 +10,7 @@ use rtx_glibc_compat as _;
 mod api;
 mod app;
 mod desktop;
+mod dock;
 #[cfg(target_os = "linux")]
 mod icon;
 mod tray;
@@ -41,6 +42,7 @@ fn main() -> eframe::Result {
             }
         }
     }
+    dock::set_open(!background);
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("RealTimeX Link")
