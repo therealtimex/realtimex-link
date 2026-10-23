@@ -1,6 +1,8 @@
-//! The menu bar (macOS) / tray (Windows) icon: whether remote control is on and who is in control,
-//! Copy App ID and password, turn it off or on, open the window or RealTimeX, and Quit, which
-//! stops hosting (closing the window does not).
+//! The menu bar (macOS) / tray (Windows, Linux) icon: whether remote control is on and who is in
+//! control, Copy App ID and password, turn it off or on, open the window or RealTimeX, and Quit,
+//! which stops hosting (closing the window does not). How the window opens and text is copied is
+//! up to the process that shows the icon (Actions): the window's own on macOS and Windows, a
+//! separate window process on Linux (icon.rs).
 
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -12,6 +14,27 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::app::{act, lock, Shared};
 use crate::desktop;
+
+/// What the icon's menu does for the process showing it.
+pub struct Actions {
+    pub open: Box<dyn Fn() + Send + Sync>,
+    pub copy: Box<dyn Fn(String) + Send + Sync>,
+}
+
+impl Actions {
+    /// The icon's own window, hidden until opened (macOS, Windows).
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub fn window(ctx: &egui::Context) -> Self {
+        let (show, copy) = (ctx.clone(), ctx.clone());
+        Self {
+            open: Box::new(move || {
+                show.send_viewport_cmd(ViewportCommand::Visible(true));
+                show.send_viewport_cmd(ViewportCommand::Focus);
+            }),
+            copy: Box::new(move |text| copy.copy_text(text)),
+        }
+    }
+}
 
 pub struct Tray {
     _icon: TrayIcon,
@@ -35,7 +58,12 @@ fn icon() -> Icon {
 }
 
 impl Tray {
-    pub fn new(shared: Shared, refresh: Sender<()>, ctx: egui::Context) -> anyhow::Result<Self> {
+    pub fn new(
+        shared: Shared,
+        refresh: Sender<()>,
+        ctx: egui::Context,
+        actions: Actions,
+    ) -> anyhow::Result<Self> {
         let status = MenuItem::new("Remote control", false, None);
         let toggle = MenuItem::new("Turn off remote control", true, None);
         let copy = MenuItem::new("Copy App ID and password", true, None);
@@ -84,8 +112,7 @@ impl Tray {
             let (copy, toggle, open, realtimex, quit) = &ids;
             let id = &event.id;
             if id == open {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(ViewportCommand::Focus);
+                (actions.open)();
             } else if id == realtimex {
                 desktop::open_realtimex();
             } else if id == copy {
@@ -99,7 +126,7 @@ impl Tray {
                     .to_string();
                 let text = format!("App ID: {app_id}\nPassword: {}", state.password);
                 drop(state);
-                ctx.copy_text(text);
+                (actions.copy)(text);
                 lock(&shared).notice =
                     Some(("App ID and password copied.".into(), true, Instant::now()));
             } else if id == toggle {
@@ -122,9 +149,12 @@ impl Tray {
                     done,
                 );
             } else if id == quit {
-                // Quit is all of RealTimeX Link: hosting stops too.
+                // Quit is all of RealTimeX Link: hosting stops too, and any other window.
                 if let Some(api) = lock(&shared).api.clone() {
-                    let _ = api.post("/v1/shutdown", json!({}));
+                    let _ = api.post(
+                        "/v1/shutdown",
+                        json!({ "app": true, "pid": std::process::id() }),
+                    );
                 }
                 std::process::exit(0);
             }

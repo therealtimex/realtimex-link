@@ -32,8 +32,10 @@ pub struct LocalState {
     pub host: Arc<Host>,
     /// Asked to stop (POST /v1/shutdown): where no signal reaches the daemon, as on Windows.
     pub shutdown: Arc<tokio::sync::Notify>,
-    /// The running rtx-link's pid (POST /v1/window/open): one window and menu bar icon at a time.
-    pub window: Mutex<Option<u32>>,
+    /// The running rtx-link pids by role (POST /v1/window/open): one window and one menu bar /
+    /// tray icon at a time. On macOS and Windows one process is both ("window"); on Linux the icon
+    /// runs on its own ("tray") and each opened window is a process ("window").
+    pub window: Mutex<std::collections::HashMap<String, u32>>,
     /// How often another rtx-link asked the running one to show its window (GET /v1/status).
     pub show_window: AtomicU64,
 }
@@ -158,32 +160,78 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
 
 type Answer = ApiResult<Json<Value>>;
 
-/// Stop the daemon: the answer goes out first, then it stops as on SIGTERM.
-async fn shutdown(State(state): State<Shared>) -> Answer {
+/// Stop the daemon: the answer goes out first, then it stops as on SIGTERM. { app: true, pid }:
+/// Quit in RealTimeX Link, which ends its other processes too (an open window would start the
+/// daemon again).
+async fn shutdown(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    if body.get("app") == Some(&Value::Bool(true)) {
+        let caller = body.get("pid").and_then(Value::as_u64);
+        let pids: Vec<u32> = state
+            .window
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .copied()
+            .filter(|pid| Some(u64::from(*pid)) != caller)
+            .collect();
+        for pid in pids {
+            end_process(pid);
+        }
+    }
     state.shutdown.notify_one();
     Ok(Json(json!({ "stopping": true })))
 }
 
-/// RealTimeX Link's window, one at a time: { pid } makes this rtx-link the running one, unless
-/// another is alive; then that one is asked to show its window (showWindow in /v1/status goes up)
-/// and this one is told to exit. { owner: true }: keep going.
+#[cfg(unix)]
+fn end_process(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        if pid > 0 {
+            // SAFETY: SIGTERM to a process this daemon registered; nothing else is touched.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
+}
+
+/// Windows: the window and the icon are one process, the caller.
+#[cfg(not(unix))]
+fn end_process(_pid: u32) {}
+
+/// RealTimeX Link's window and icon, one of each at a time: { pid, role } (role "window", the
+/// default, or "tray") makes this rtx-link the running one for its role, unless another is alive;
+/// then a window is asked to show itself (showWindow in /v1/status goes up) and this one is told
+/// to exit. { owner: true }: keep going. `tray`: whether an icon runs.
 async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let pid = body
         .get("pid")
         .and_then(Value::as_u64)
         .and_then(|pid| u32::try_from(pid).ok())
         .ok_or_else(|| ApiError::bad_request("pid is required"))?;
-    let mut window = state.window.lock().unwrap_or_else(|p| p.into_inner());
-    match *window {
-        Some(owner) if owner != pid && crate::lock::alive(owner) => {
-            state.show_window.fetch_add(1, Ordering::Relaxed);
-            Ok(Json(json!({ "owner": false })))
+    let role = match body.get("role").and_then(Value::as_str) {
+        None | Some("window") => "window",
+        Some("tray") => "tray",
+        Some(_) => return Err(ApiError::bad_request("role is window or tray")),
+    };
+    let mut roles = state.window.lock().unwrap_or_else(|p| p.into_inner());
+    let running = |roles: &std::collections::HashMap<String, u32>, role: &str| {
+        roles
+            .get(role)
+            .copied()
+            .filter(|pid| crate::lock::alive(*pid))
+    };
+    let owner = match running(&roles, role) {
+        Some(other) if other != pid => {
+            if role == "window" {
+                state.show_window.fetch_add(1, Ordering::Relaxed);
+            }
+            false
         }
         _ => {
-            *window = Some(pid);
-            Ok(Json(json!({ "owner": true })))
+            roles.insert(role.to_string(), pid);
+            true
         }
-    }
+    };
+    let tray = running(&roles, "tray").is_some();
+    Ok(Json(json!({ "owner": owner, "tray": tray })))
 }
 
 /// Start at login (autostart.rs): { enabled, available }. Available: rtx-link is installed next to

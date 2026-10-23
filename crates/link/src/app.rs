@@ -70,7 +70,7 @@ pub fn act(
     });
 }
 
-fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
+pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
     loop {
         let api = lock(&shared).api.clone();
         let api = match api {
@@ -185,8 +185,22 @@ impl LinkApp {
             let (shared, ctx) = (shared.clone(), cc.egui_ctx.clone());
             std::thread::spawn(move || poll_loop(shared, wake, ctx));
         }
+        // On Linux the icon is its own process (icon.rs): a hidden window cannot be shown again
+        // on Wayland, so this window is only ever open, and closing it ends this process.
+        let tray = if cfg!(target_os = "linux") {
+            None
+        } else {
+            let actions = crate::tray::Actions::window(&cc.egui_ctx);
+            crate::tray::Tray::new(
+                shared.clone(),
+                refresh.clone(),
+                cc.egui_ctx.clone(),
+                actions,
+            )
+            .ok()
+        };
         Self {
-            tray: crate::tray::Tray::new(shared.clone(), refresh.clone(), cc.egui_ctx.clone()).ok(),
+            tray,
             shared,
             refresh,
             tab: Tab::ThisComputer,

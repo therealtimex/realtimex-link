@@ -10,21 +10,35 @@ use rtx_glibc_compat as _;
 mod api;
 mod app;
 mod desktop;
+#[cfg(target_os = "linux")]
+mod icon;
 mod tray;
 
 fn main() -> eframe::Result {
-    // --background: started at login (rtx-linkd's autostart.rs). The menu bar / tray icon and
-    // the daemon, no window until it is opened from the icon.
+    // --background: started at login (rtx-linkd's autostart.rs) or by RealTimeX. The menu bar /
+    // tray icon and the daemon, no window until it is opened from the icon. On Linux the icon is
+    // a process of its own (icon.rs).
     let background = std::env::args().any(|arg| arg == "--background");
-    // One window and menu bar icon at a time: when RealTimeX Link already runs, it shows its
-    // window and this one exits. Without the daemon (or an older one), it goes on.
+    #[cfg(target_os = "linux")]
+    if background {
+        return icon::run();
+    }
+    // One window (with its icon, except on Linux) at a time: when RealTimeX Link already runs,
+    // it shows its window and this one exits. Without the daemon (or an older one), it goes on.
     if let Ok(api) = api::Api::ensure() {
         let answer = api.post(
             "/v1/window/open",
-            serde_json::json!({ "pid": std::process::id() }),
+            serde_json::json!({ "pid": std::process::id(), "role": "window" }),
         );
-        if answer.is_ok_and(|answer| answer["owner"] == false) {
+        if answer.as_ref().is_ok_and(|answer| answer["owner"] == false) {
             return Ok(());
+        }
+        // Linux: the window was opened on its own (the applications menu); its icon comes too.
+        #[cfg(target_os = "linux")]
+        if answer.is_ok_and(|answer| answer["tray"] == false) {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).arg("--background").spawn();
+            }
         }
     }
     let options = eframe::NativeOptions {
