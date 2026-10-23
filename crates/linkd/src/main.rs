@@ -22,6 +22,7 @@ mod local_api;
 mod lock;
 mod password;
 mod paths;
+mod relay;
 mod requests;
 mod router;
 mod secret_box;
@@ -51,6 +52,8 @@ fn print_line(value: serde_json::Value) {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // TLS for the relay (relay.rs) with one crypto provider, chosen here.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let version = env!("CARGO_PKG_VERSION").to_string();
     if args.iter().any(|arg| arg == "--version") {
         print_line(

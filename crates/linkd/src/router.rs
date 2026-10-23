@@ -1,5 +1,7 @@
-//! The Remote Control API controllers speak, on this computer's Tailscale address
-//! (protocol 2): /hello, sign-in (/connect, connection requests),
+//! The Remote Control API controllers speak, on this computer's Tailscale address, and through
+//! RealTimeX Link's own Public Exposure relay (`public`, relay.rs: the caller's address is the
+//! public client's, /hello leaves the machine name out, failed sign-ins are limited per address
+//! and in total, and there is no MJPEG live view through the relay) (protocol 2): /hello, sign-in (/connect, connection requests),
 //! then with a client token /status, /screenshot, /actions, /frames (MJPEG live view),
 //! /peer/offer (the WebRTC live view, whose DataChannel messages come back as helper events),
 //! /transfer and /stop. RealTimeX's controller (server/utils/remoteControl/computers.js) and agents' CLI speak it.
@@ -35,6 +37,12 @@ use crate::util::{iso_now, now_ms, unbase64};
 
 const AUTH_FAILURE_WINDOW_MS: i64 = 60 * 1000;
 pub const MAX_AUTH_FAILURES: usize = 10;
+// Sign-ins over Public Exposure, which anyone on the internet can reach: failed passwords per
+// client address, and across all of them.
+const PUBLIC_FAILURES_PER_ADDRESS: usize = 5;
+const PUBLIC_ADDRESS_WINDOW_MS: i64 = 15 * 60 * 1000;
+const PUBLIC_FAILURES_TOTAL: usize = 30;
+const PUBLIC_TOTAL_WINDOW_MS: i64 = 60 * 60 * 1000;
 pub const SERVICE: &str = "realtimex-remote-control";
 /// 2 (ADR-2611 §4.5): peer live view, connection requests, client keys, identity tokens.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -109,6 +117,8 @@ struct Peer {
 
 pub struct Shared {
     host: Weak<Host>,
+    /// The Public Exposure listener (see the module comment).
+    public: bool,
     backend: Arc<Backend>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
     failures: Mutex<HashMap<String, Vec<i64>>>,
@@ -160,22 +170,12 @@ impl Listener {
     }
 }
 
-/// Serve the Remote Control routes on exactly one address (the Tailscale IP).
-pub async fn start_listener(
-    address: &str,
-    port: u16,
+/// The state behind one set of Remote Control routes (`public`: the Public Exposure relay's).
+fn new_shared(
     host: Weak<Host>,
+    public: bool,
     log: Arc<dyn Fn(&str) + Send + Sync>,
-) -> std::io::Result<Listener> {
-    let ip: std::net::IpAddr = address
-        .parse()
-        .map_err(|_| std::io::Error::other("Remote Control must listen on one IP address"))?;
-    if ip.is_unspecified() {
-        return Err(std::io::Error::other(
-            "Remote Control must listen on one IP address",
-        ));
-    }
-    let socket = tokio::net::TcpListener::bind(SocketAddr::new(ip, port)).await?;
+) -> std::io::Result<Arc<Shared>> {
     let backend = host
         .upgrade()
         .map(|h| h.backend.clone())
@@ -183,6 +183,7 @@ pub async fn start_listener(
     let (temp_dir, downloads) = Transfers::default_dirs();
     let shared = Arc::new(Shared {
         host,
+        public,
         backend,
         log,
         failures: Mutex::new(HashMap::new()),
@@ -201,7 +202,11 @@ pub async fn start_listener(
     });
     let events = spawn_event_loop(&shared);
     lock(&shared.tasks).push(events);
-    let routes = Router::new()
+    Ok(shared)
+}
+
+fn routes(shared: &Arc<Shared>) -> Router {
+    Router::new()
         .route("/remote-control/hello", get(hello))
         .route("/remote-control/connect", post(connect))
         .route("/remote-control/connect/requests/{id}", get(poll_request))
@@ -218,7 +223,27 @@ pub async fn start_listener(
         .route("/remote-control/stop", post(stop))
         .fallback(|| async { ApiError::new(404, "Not found") })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(shared.clone());
+        .with_state(shared.clone())
+}
+
+/// Serve the Remote Control routes on exactly one address (the Tailscale IP).
+pub async fn start_listener(
+    address: &str,
+    port: u16,
+    host: Weak<Host>,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+) -> std::io::Result<Listener> {
+    let ip: std::net::IpAddr = address
+        .parse()
+        .map_err(|_| std::io::Error::other("Remote Control must listen on one IP address"))?;
+    if ip.is_unspecified() {
+        return Err(std::io::Error::other(
+            "Remote Control must listen on one IP address",
+        ));
+    }
+    let socket = tokio::net::TcpListener::bind(SocketAddr::new(ip, port)).await?;
+    let shared = new_shared(host, false, log)?;
+    let routes = routes(&shared);
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let service = routes.into_make_service_with_connect_info::<SocketAddr>();
@@ -233,6 +258,36 @@ pub async fn start_listener(
         stop: Some(stop),
         server,
     })
+}
+
+/// The Remote Control routes for the Public Exposure relay (relay.rs), served in-process in public
+/// mode: the relay gives each request the public client's address as its ConnectInfo.
+pub struct PublicRoutes {
+    shared: Arc<Shared>,
+    pub router: Router,
+}
+
+impl PublicRoutes {
+    pub fn new(host: Weak<Host>, log: Arc<dyn Fn(&str) + Send + Sync>) -> std::io::Result<Self> {
+        let shared = new_shared(host, true, log)?;
+        let router = routes(&shared);
+        Ok(Self { shared, router })
+    }
+
+    pub fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
+    }
+
+    /// End the open live views of clients `matches` accepts.
+    pub fn end_streams(&self, matches: &dyn Fn(&str) -> bool) {
+        end_streams(&self.shared, matches);
+    }
+
+    /// Stop: open live views and sessions end.
+    pub fn shutdown(&self) {
+        end_streams(&self.shared, &|_| true);
+        close_all(&self.shared);
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -266,19 +321,44 @@ fn no_store(mut response: Response) -> Response {
 // --- failed sign-ins ---------------------------------------------------------------------
 
 fn blocked(shared: &Shared, key: &str) -> bool {
+    blocked_within(shared, key, AUTH_FAILURE_WINDOW_MS, MAX_AUTH_FAILURES)
+}
+
+fn blocked_within(shared: &Shared, key: &str, window_ms: i64, max: usize) -> bool {
     let now = now_ms();
     let mut failures = lock(&shared.failures);
     let recent = failures.entry(key.to_string()).or_default();
-    recent.retain(|at| now - at < AUTH_FAILURE_WINDOW_MS);
-    recent.len() >= MAX_AUTH_FAILURES
+    recent.retain(|at| now - at < window_ms);
+    recent.len() >= max
 }
 
 fn fail(shared: &Shared, key: &str) {
     let now = now_ms();
     let mut failures = lock(&shared.failures);
     let recent = failures.entry(key.to_string()).or_default();
-    recent.retain(|at| now - at < AUTH_FAILURE_WINDOW_MS);
+    let window = if key.starts_with("public") {
+        PUBLIC_TOTAL_WINDOW_MS
+    } else {
+        AUTH_FAILURE_WINDOW_MS
+    };
+    recent.retain(|at| now - at < window);
     recent.push(now);
+}
+
+/// Public sign-ins: blocked after PUBLIC_FAILURES_PER_ADDRESS failed passwords from one address
+/// (15 minutes) or PUBLIC_FAILURES_TOTAL from all (an hour).
+fn public_blocked(shared: &Shared, address: &str) -> bool {
+    blocked_within(
+        shared,
+        &format!("public:{address}"),
+        PUBLIC_ADDRESS_WINDOW_MS,
+        PUBLIC_FAILURES_PER_ADDRESS,
+    ) || blocked_within(
+        shared,
+        "public:*",
+        PUBLIC_TOTAL_WINDOW_MS,
+        PUBLIC_FAILURES_TOTAL,
+    )
 }
 
 fn clear(shared: &Shared, key: &str) {
@@ -300,6 +380,10 @@ async fn hello(State(shared): State<Ctx>) -> ApiResult<Json<Value>> {
         host_of(&shared)?.identity().as_object(),
     ) {
         target.extend(identity.clone());
+        // Over Public Exposure the App ID alone should not reveal the computer's name.
+        if shared.public {
+            target.remove("machine");
+        }
     }
     Ok(Json(answer))
 }
@@ -313,19 +397,25 @@ async fn connect(
 ) -> Response {
     let address = peer.ip().to_string();
     let key = format!("password:{address}");
-    if blocked(&shared, &key) {
+    if blocked(&shared, &key) || (shared.public && public_blocked(&shared, &address)) {
         return too_many();
     }
     let host = match host_of(&shared) {
         Ok(host) => host,
         Err(error) => return error.into_response(),
     };
-    match host.admit(&body, &address, "tailnet").await {
+    let via = if shared.public { "public" } else { "tailnet" };
+    match host.admit(&body, &address, via).await {
         Ok(admitted) => {
             if admitted.wrong_password {
                 fail(&shared, &key);
+                if shared.public {
+                    fail(&shared, &format!("public:{address}"));
+                    fail(&shared, "public:*");
+                }
             } else if admitted.status == 200 {
                 clear(&shared, &key);
+                clear(&shared, &format!("public:{address}"));
                 clear(&shared, &format!("token:{address}"));
                 let name = admitted
                     .body
@@ -684,6 +774,13 @@ async fn frames(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if shared.public {
+        // A stream would carry the whole screen through the relay; the WebRTC view goes direct.
+        return json_status(
+            403,
+            json!({ "error": "The live view is not available over Public Exposure", "code": "live-view-not-public" }),
+        );
+    }
     let signed = signed_with!(shared, headers, peer, "view");
     let number = |name: &str| {
         query

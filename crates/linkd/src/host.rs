@@ -3,8 +3,11 @@
 //! the password or a client key and are listed as clients, each with its own permissions; a new
 //! computer may ask first. It listens on Tailscale.
 //!
+//! It is also reached through its own Public Exposure relay (relay.rs) once RealTimeX has signed
+//! it in; its App ID is then the relay's exposure ID.
+//!
 //! Not here yet (#2753 phase 2): same-account admission (the daemon has no RealTimeX sign-in of
-//! its own yet) and the Public Exposure relay. "Allow my own computers" then behaves like "Ask me".
+//! its own yet). "Allow my own computers" then behaves like "Ask me".
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -16,6 +19,7 @@ use crate::backend::Backend;
 use crate::clients::{normalize_permissions, Authenticated, ClientStore, ConnectRequest, KeyState};
 use crate::error::ApiError;
 use crate::password;
+use crate::relay::Relay;
 use crate::requests::{NewRequest, Poll, RequestStore};
 use crate::router::{self, Listener};
 use crate::secret_box::SecretBox;
@@ -105,6 +109,8 @@ pub struct Host {
     pub backend: Arc<Backend>,
     state: Mutex<State>,
     listener: tokio::sync::Mutex<Option<Listener>>,
+    /// This computer's own Public Exposure (relay.rs).
+    pub relay: Arc<Relay>,
     reconciling: tokio::sync::Mutex<()>,
     last_active: Mutex<HashMap<String, i64>>,
     permissions: Mutex<Option<(std::time::Instant, Value)>>,
@@ -164,6 +170,7 @@ impl Host {
                     stopped: true,
                 }),
                 listener: tokio::sync::Mutex::new(None),
+                relay: Relay::new(me.clone()),
                 reconciling: tokio::sync::Mutex::new(()),
                 last_active: Mutex::new(HashMap::new()),
                 permissions: Mutex::new(None),
@@ -180,19 +187,56 @@ impl Host {
 
     // --- identity -----------------------------------------------------------
 
-    /// This computer's App ID: its own until the relay gives it one (phase 2).
-    /// The App ID RealTimeX handed over, else this computer's own.
+    /// This computer's App ID: the relay's exposure ID once Link has its own (relay.rs), else the
+    /// App ID RealTimeX handed over, else this computer's own.
     pub fn app_id(&self) -> String {
+        self.relay
+            .exposure_id()
+            .or_else(|| self.imported_app_id())
+            .unwrap_or_else(|| self.state().fallback_app_id.clone())
+    }
+
+    fn imported_app_id(&self) -> Option<String> {
         self.store
             .get(keys::APP_ID)
             .and_then(|v| v.as_str().map(String::from))
             .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| self.state().fallback_app_id.clone())
+    }
+
+    /// App IDs this computer had before (the one RealTimeX handed over, its own): controllers
+    /// that saved one find it by them.
+    fn former_app_ids(&self) -> Vec<String> {
+        let current = self.app_id();
+        let mut former: Vec<String> = [
+            self.imported_app_id(),
+            Some(self.state().fallback_app_id.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|id| !id.is_empty() && *id != current)
+        .collect();
+        former.dedup();
+        former
     }
 
     pub fn identity(&self) -> Value {
         // Controllers mark only "dev" (a development build); the daemon is an installed app.
-        json!({ "appId": self.app_id(), "machine": machine_name(), "channel": "app" })
+        let mut identity =
+            json!({ "appId": self.app_id(), "machine": machine_name(), "channel": "app" });
+        let former = self.former_app_ids();
+        if !former.is_empty() {
+            identity["formerAppIds"] = json!(former);
+        }
+        identity
+    }
+
+    /// A secret sealed with this computer's key (for the store).
+    pub fn seal_secret(&self, text: &str) -> anyhow::Result<Value> {
+        self.secrets.seal(text)
+    }
+
+    pub fn open_secret(&self, sealed: &Value) -> Option<String> {
+        self.secrets.open(sealed)
     }
 
     pub fn password(&self) -> String {
@@ -208,9 +252,9 @@ impl Host {
         }
     }
 
-    /// Public Exposure is RealTimeX's for now.
+    /// This computer's own Public Exposure (relay.rs): { state, url, detail }.
     pub fn public_state(&self) -> Value {
-        json!({ "state": "not-set-up", "url": null })
+        self.relay.state()
     }
 
     pub fn load_identity(&self) -> Result<(), ApiError> {
@@ -719,6 +763,7 @@ impl Host {
             self.state().session = None;
         }
         self.reconcile().await;
+        self.relay.wake();
         Ok(())
     }
 
@@ -730,6 +775,7 @@ impl Host {
             self.state().last_error = Some(error.message);
         }
         self.reconcile().await;
+        self.relay.start();
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
@@ -815,6 +861,7 @@ impl Host {
 
     pub async fn stop(&self) {
         self.state().stopped = true;
+        self.relay.stop();
         self.close_listener().await;
         self.backend.dispose();
     }
@@ -824,11 +871,15 @@ impl Host {
         if let Some(listener) = self.listener.lock().await.as_ref() {
             listener.end_streams(&matches);
         }
+        if let Some(routes) = self.relay.routes() {
+            routes.end_streams(&matches);
+        }
     }
 
     async fn revalidate(&self, id: &str) {
         let listener = self.listener.lock().await.as_ref().map(Listener::shared);
-        if let Some(shared) = listener {
+        let relayed = self.relay.routes().map(|routes| routes.shared());
+        for shared in listener.into_iter().chain(relayed) {
             router::revalidate_peers(&shared, |client| client == id).await;
         }
     }

@@ -23,7 +23,7 @@ use crate::util::same_bytes;
 /// The local API's protocol: a caller that speaks another one says so instead of misreading it.
 pub const PROTOCOL: u32 = 1;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-pub const FEATURES: &[&str] = &["host", "autostart", "window"];
+pub const FEATURES: &[&str] = &["host", "autostart", "window", "relay"];
 
 pub struct LocalState {
     pub token: String,
@@ -50,6 +50,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/autostart", get(autostart).post(set_autostart))
         .route("/v1/window/open", post(open_window))
+        .route("/v1/account/token", post(account_token))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/overview", get(host_overview))
         .route("/v1/host/settings", post(host_settings))
@@ -232,6 +233,21 @@ async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answe
     };
     let tray = running(&roles, "tray").is_some();
     Ok(Json(json!({ "owner": owner, "tray": tray })))
+}
+
+/// The signed-in account's access token, from RealTimeX: { token, apiBase }. This computer's own
+/// Public Exposure (relay.rs) needs it to enroll; the tunnel itself does not.
+async fn account_token(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let token = body
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("token is required"))?;
+    state
+        .host
+        .relay
+        .set_account(token, body.get("apiBase").and_then(Value::as_str))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(Json(json!({ "accepted": true })))
 }
 
 /// Start at login (autostart.rs): { enabled, available }. Available: rtx-link is installed next to

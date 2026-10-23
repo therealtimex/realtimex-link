@@ -14,6 +14,14 @@ aes-gcm = "0.10.3"
 anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
+# The relay (relay.rs): its HTTP stream bodies, the WebSocket to it (rustls with ring, chosen in
+# main.rs), the Remote Control routes called in-process, and the Marketplace API (blocking, rare).
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tower = { version = "0.5", features = ["util"] }
+ureq = { version = "3.5.0", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 if-addrs = "0.15"
 libc.workspace = true
