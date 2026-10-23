@@ -34,7 +34,7 @@ also be installed on its own from [Releases](https://github.com/therealtimex/rea
 Rust is pinned in `rust-toolchain.toml` (rustup installs it).
 
 ```
-scripts/build.sh [arm64|x86_64] dist          # macOS, Linux
+scripts/build.sh [arm64|x86_64] dist          # macOS (RealTimeX Link.app), Linux
 scripts\build.ps1 [x86_64|arm64] dist         # Windows (Visual Studio C++ tools)
 cargo test
 scripts/test-macos-control.py path/to/rtx-control   # live macOS check of rtx-control

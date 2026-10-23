@@ -1,6 +1,7 @@
 #!/bin/bash
-# Build RealTimeX Link's executables (rtx-linkd, rtx-link, rtx-control) for macOS or Linux, release profile,
-# into OUTPUT_DIR. Usage: scripts/build.sh [arm64|x86_64] [output_dir]
+# Build RealTimeX Link's executables (rtx-linkd, rtx-link, rtx-control) for macOS or Linux, release
+# profile, into OUTPUT_DIR: on macOS as RealTimeX Link.app (scripts/bundle-macos.sh), on Linux as
+# the three executables. Usage: scripts/build.sh [arm64|x86_64] [output_dir]
 # Rust comes from rustup (the version in rust-toolchain.toml).
 set -euo pipefail
 ARCH_PARAM="${1:-$(uname -m)}"
@@ -30,9 +31,10 @@ cargo build --release --locked --target "$TARGET" -p rtx-linkd
 cargo build --release --locked --target "$TARGET" -p rtx-link
 # Each its own build, so none takes on another's dependency features.
 cargo build --release --locked --target "$TARGET" -p rtx-control
+BUILT="target/$TARGET/release"
 mkdir -p "$OUTPUT_DIR"
 for bin in rtx-linkd rtx-link rtx-control; do
-  BIN="target/$TARGET/release/$bin"
+  BIN="$BUILT/$bin"
   if [ "$(uname -s)" = Linux ] && command -v objdump >/dev/null 2>&1; then
     NEED=$(objdump -p "$BIN" | sed -n '/^Version References:/,$p' | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
     echo "$bin requires glibc $NEED"
@@ -48,9 +50,17 @@ for bin in rtx-linkd rtx-link rtx-control; do
       exit 1
     fi
   fi
-  cp "$BIN" "$OUTPUT_DIR/$bin"
-  chmod +x "$OUTPUT_DIR/$bin"
 done
-"$OUTPUT_DIR/rtx-linkd" --version
-"$OUTPUT_DIR/rtx-control" --version
-echo "SUCCESS: $OUTPUT_DIR/rtx-linkd $OUTPUT_DIR/rtx-link $OUTPUT_DIR/rtx-control"
+if [ "$(uname -s)" = Darwin ]; then
+  scripts/bundle-macos.sh "$BUILT" "$OUTPUT_DIR"
+  OUT="$OUTPUT_DIR/RealTimeX Link.app/Contents/MacOS"
+else
+  for bin in rtx-linkd rtx-link rtx-control; do
+    cp "$BUILT/$bin" "$OUTPUT_DIR/$bin"
+    chmod +x "$OUTPUT_DIR/$bin"
+  done
+  OUT="$OUTPUT_DIR"
+fi
+"$OUT/rtx-linkd" --version
+"$OUT/rtx-control" --version
+echo "SUCCESS: $OUT/rtx-linkd $OUT/rtx-link $OUT/rtx-control"
