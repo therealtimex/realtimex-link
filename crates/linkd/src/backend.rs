@@ -143,7 +143,7 @@ pub fn detect() -> Detected {
         code: code.map(Into::into),
     };
     if cfg!(target_os = "linux") {
-        let var = |name: &str| std::env::var(name).unwrap_or_default();
+        let var = session_var;
         let session = var("XDG_SESSION_TYPE").to_lowercase();
         let desktop = var("XDG_CURRENT_DESKTOP").to_lowercase();
         let wayland = session == "wayland" || !var("WAYLAND_DISPLAY").is_empty();
@@ -175,8 +175,76 @@ pub fn detect() -> Detected {
     )
 }
 
+/// Variables of the desktop session this daemon serves: its own, else the session's (a daemon
+/// started outside the desktop, from a terminal or a service, may lack them).
+const SESSION_VARS: [&str; 6] = [
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// This user's desktop session environment (Linux): the environment of its desktop shell, found
+/// in /proc. Empty when there is none (no one signed in to the desktop yet).
+#[cfg(target_os = "linux")]
+fn desktop_session_env() -> std::collections::HashMap<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    const SHELLS: [&str; 5] = [
+        "gnome-shell",
+        "plasmashell",
+        "kwin_wayland",
+        "xfce4-session",
+        "cinnamon",
+    ];
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let dir = entry.path();
+        let shell = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        if !SHELLS.contains(&shell.trim()) || entry.metadata().map(|m| m.uid()).ok() != Some(uid) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(dir.join("environ")) else {
+            continue;
+        };
+        return raw
+            .split(|byte| *byte == 0)
+            .filter_map(|pair| {
+                let pair = String::from_utf8_lossy(pair);
+                pair.split_once('=')
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+            })
+            .collect();
+    }
+    Default::default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn desktop_session_env() -> std::collections::HashMap<String, String> {
+    Default::default()
+}
+
+/// A session variable: this daemon's own, else the desktop session's.
+fn session_var(name: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| desktop_session_env().remove(name))
+        .unwrap_or_default()
+}
+
 /// Desktop session variables a daemon started outside the desktop may lack.
 fn helper_env(command: &mut Command) {
+    let session = desktop_session_env();
+    for name in SESSION_VARS {
+        if std::env::var_os(name).is_none_or(|value| value.is_empty()) {
+            if let Some(value) = session.get(name) {
+                command.env(name, value);
+            }
+        }
+    }
     #[cfg(unix)]
     {
         // SAFETY: getuid has no preconditions.
@@ -184,7 +252,9 @@ fn helper_env(command: &mut Command) {
         let runtime =
             std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{uid}"));
         command.env("XDG_RUNTIME_DIR", &runtime);
-        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+            && !session.contains_key("DBUS_SESSION_BUS_ADDRESS")
+        {
             command.env(
                 "DBUS_SESSION_BUS_ADDRESS",
                 format!("unix:path={runtime}/bus"),
