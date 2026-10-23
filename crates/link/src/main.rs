@@ -16,6 +16,17 @@ fn main() -> eframe::Result {
     // --background: started at login (rtx-linkd's autostart.rs). The menu bar / tray icon and
     // the daemon, no window until it is opened from the icon.
     let background = std::env::args().any(|arg| arg == "--background");
+    // One window and menu bar icon at a time: when RealTimeX Link already runs, it shows its
+    // window and this one exits. Without the daemon (or an older one), it goes on.
+    if let Ok(api) = api::Api::ensure() {
+        let answer = api.post(
+            "/v1/window/open",
+            serde_json::json!({ "pid": std::process::id() }),
+        );
+        if answer.is_ok_and(|answer| answer["owner"] == false) {
+            return Ok(());
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("RealTimeX Link")

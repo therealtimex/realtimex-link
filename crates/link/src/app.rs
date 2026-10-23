@@ -23,6 +23,8 @@ pub struct Snapshot {
     pub password: String,
     pub error: Option<String>,
     pub notice: Option<(String, bool, Instant)>,
+    /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
+    pub show_window: Option<u64>,
 }
 
 pub type Shared = Arc<Mutex<Snapshot>>;
@@ -82,6 +84,17 @@ fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             },
         };
         if let Some(api) = api {
+            let shown = api
+                .get("/v1/status")
+                .ok()
+                .and_then(|status| status["showWindow"].as_u64());
+            let seen = std::mem::replace(&mut lock(&shared).show_window, shown);
+            if let (Some(seen), Some(shown)) = (seen, shown) {
+                if shown > seen {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+            }
             let overview = api.get("/v1/host/overview");
             let requests = api.get("/v1/host/connection-requests");
             let password = api.get("/v1/host/password");

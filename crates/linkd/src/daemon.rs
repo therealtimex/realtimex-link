@@ -75,6 +75,8 @@ pub async fn start(options: Options) -> Result<Daemon> {
         started_at: started_at.clone(),
         host: host.clone(),
         shutdown: shutdown.clone(),
+        window: Default::default(),
+        show_window: Default::default(),
     });
     let socket = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
     let port = socket.local_addr()?.port();

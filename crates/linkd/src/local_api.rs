@@ -3,7 +3,8 @@
 //! token from the data folder (same-user trust, like a Docker socket); a request addressed to any
 //! other host name is refused, so a web page can't reach it through DNS rebinding.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -22,7 +23,7 @@ use crate::util::same_bytes;
 /// The local API's protocol: a caller that speaks another one says so instead of misreading it.
 pub const PROTOCOL: u32 = 1;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-pub const FEATURES: &[&str] = &["host", "autostart"];
+pub const FEATURES: &[&str] = &["host", "autostart", "window"];
 
 pub struct LocalState {
     pub token: String,
@@ -31,6 +32,10 @@ pub struct LocalState {
     pub host: Arc<Host>,
     /// Asked to stop (POST /v1/shutdown): where no signal reaches the daemon, as on Windows.
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// The running rtx-link's pid (POST /v1/window/open): one window and menu bar icon at a time.
+    pub window: Mutex<Option<u32>>,
+    /// How often another rtx-link asked the running one to show its window (GET /v1/status).
+    pub show_window: AtomicU64,
 }
 
 type Shared = Arc<LocalState>;
@@ -42,6 +47,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/import", post(import))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/autostart", get(autostart).post(set_autostart))
+        .route("/v1/window/open", post(open_window))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/overview", get(host_overview))
         .route("/v1/host/settings", post(host_settings))
@@ -146,6 +152,7 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         "schema": SCHEMA_VERSION,
         "startedAt": state.started_at,
         "imported": imported,
+        "showWindow": state.show_window.load(Ordering::Relaxed),
     }))
 }
 
@@ -155,6 +162,28 @@ type Answer = ApiResult<Json<Value>>;
 async fn shutdown(State(state): State<Shared>) -> Answer {
     state.shutdown.notify_one();
     Ok(Json(json!({ "stopping": true })))
+}
+
+/// RealTimeX Link's window, one at a time: { pid } makes this rtx-link the running one, unless
+/// another is alive; then that one is asked to show its window (showWindow in /v1/status goes up)
+/// and this one is told to exit. { owner: true }: keep going.
+async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let pid = body
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| ApiError::bad_request("pid is required"))?;
+    let mut window = state.window.lock().unwrap_or_else(|p| p.into_inner());
+    match *window {
+        Some(owner) if owner != pid && crate::lock::alive(owner) => {
+            state.show_window.fetch_add(1, Ordering::Relaxed);
+            Ok(Json(json!({ "owner": false })))
+        }
+        _ => {
+            *window = Some(pid);
+            Ok(Json(json!({ "owner": true })))
+        }
+    }
 }
 
 /// Start at login (autostart.rs): { enabled, available }. Available: rtx-link is installed next to
