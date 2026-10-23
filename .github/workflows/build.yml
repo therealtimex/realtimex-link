@@ -100,8 +100,9 @@ jobs:
       - name: Archives and SHA-256 sums
         working-directory: dist
         run: |
+          # Artifacts lose the executable bit: the programs get it back (also inside the .app).
           for dir in realtimex-link-*; do
-            (cd "$dir" && chmod +x * && tar -czf "../$dir.tar.gz" *)
+            (cd "$dir" && find . -type f -name 'rtx-*' -exec chmod +x {} + && tar -czf "../$dir.tar.gz" *)
           done
           sha256sum realtimex-link-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
