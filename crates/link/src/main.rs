@@ -33,7 +33,7 @@ fn main() -> eframe::Result {
             .with_visible(!background)
             .with_inner_size([440.0, 720.0])
             .with_min_inner_size([380.0, 480.0])
-            // RealTimeX Link's icon (assets/icon.svg, made by scripts/icons.py).
+            // RealTimeX Link's icon (RealTimeX's with assets/badge.svg, made by scripts/icons.py).
             .with_icon(std::sync::Arc::new(eframe::egui::IconData {
                 rgba: include_bytes!("../icons/window-256.rgba").to_vec(),
                 width: 256,
