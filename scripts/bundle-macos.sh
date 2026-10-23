@@ -47,6 +47,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Computers you allow can list and get files from your Desktop and send files here.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Computers you allow can list and get files from your Documents.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Computers you allow can send files to your Downloads, and list and get files there.</string>
 </dict>
 </plist>
 PLIST

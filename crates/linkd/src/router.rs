@@ -1348,6 +1348,19 @@ fn note_pulled(shared: &Shared, pulled: Option<Pulled>) {
     }
 }
 
+/// Work that touches the user's folders. On macOS opening Desktop, Documents or Downloads can wait
+/// for the person to answer a privacy prompt: run where waiting cannot freeze the daemon (the
+/// runtime moves its other work off this thread).
+fn files_work<T>(work: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
 /// One transfer message: full access (Control) includes the clipboard and files.
 async fn run_transfer(
     shared: &Arc<Shared>,
@@ -1364,10 +1377,10 @@ async fn run_transfer(
     }
     let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
-        "xfer_begin" => shared.transfers.begin(session, message),
-        "xfer_chunk" => shared.transfers.chunk(session, message),
+        "xfer_begin" => files_work(|| shared.transfers.begin(session, message)),
+        "xfer_chunk" => files_work(|| shared.transfers.chunk(session, message)),
         "xfer_cancel" => Ok(shared.transfers.cancel(session, message)),
-        "xfer_end" => match shared.transfers.end(session, message)? {
+        "xfer_end" => match files_work(|| shared.transfers.end(session, message))? {
             Ended::Image(png) => {
                 let size = png.len();
                 shared
@@ -1469,10 +1482,11 @@ async fn run_transfer(
             })
         }
         "pull_chunk" => {
-            let (answer, pulled) =
+            let (answer, pulled) = files_work(|| {
                 shared
                     .clipboard
-                    .chunk(session, Some(&client.with_actor()), message)?;
+                    .chunk(session, Some(&client.with_actor()), message)
+            })?;
             note_pulled(shared, pulled);
             Ok(answer)
         }
@@ -1481,9 +1495,10 @@ async fn run_transfer(
             note_pulled(shared, pulled);
             Ok(json!({}))
         }
-        "fs_list" => file_browse::list(&shared.home, message),
+        "fs_list" => files_work(|| file_browse::list(&shared.home, message)),
         "fs_pull" => {
-            let (path, name, size) = file_browse::pull_target(&shared.home, message)?;
+            let (path, name, size) =
+                files_work(|| file_browse::pull_target(&shared.home, message))?;
             let batch = message.get("batch").and_then(Value::as_str);
             let pull = shared.clipboard.offer_file(session, path, size, batch);
             Ok(json!({ "pull": pull, "name": name, "size": size }))
