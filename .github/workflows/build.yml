@@ -6,6 +6,12 @@ name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: "test: macOS Intel and Linux x64 only; all: every platform"
+        type: choice
+        options: [test, all]
+        default: test
   push:
     tags: ["v*"]
     # Work in progress builds here, not on a developer's machine.
@@ -15,21 +21,42 @@ permissions:
   contents: write
 
 jobs:
+  # Which platforms: every one for a release tag (or "all" by hand); while testing, only the
+  # machines it is tried on (macOS Intel, Linux x64).
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        env:
+          ALL: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.targets == 'all' }}
+        run: |
+          test='[
+            {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix"},
+            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix","container":"almalinux:9"}
+          ]'
+          # glibc 2.34 in the Linux containers, RealTimeX's floor (Ubuntu 22.04, Debian 12, RHEL 9).
+          all='[
+            {"name":"macos-arm64","runner":"macos-15","arch":"arm64","script":"unix"},
+            {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix"},
+            {"name":"windows-x86_64","runner":"windows-2022","arch":"x86_64","script":"windows"},
+            {"name":"windows-arm64","runner":"windows-11-arm","arch":"arm64","script":"windows"},
+            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix","container":"almalinux:9"},
+            {"name":"linux-arm64","runner":"ubuntu-24.04-arm","arch":"arm64","script":"unix","container":"almalinux:9"}
+          ]'
+          if [ "$ALL" = "true" ]; then list="$all"; else list="$test"; fi
+          echo "matrix=$(echo "$list" | tr -d '\n ')" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.name }}
+    needs: plan
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { name: macos-arm64, runner: macos-15, arch: arm64, script: unix }
-          - { name: macos-x86_64, runner: macos-15-intel, arch: x86_64, script: unix }
-          - { name: windows-x86_64, runner: windows-2022, arch: x86_64, script: windows }
-          - { name: windows-arm64, runner: windows-11-arm, arch: arm64, script: windows }
-          # glibc 2.34, RealTimeX's floor (Ubuntu 22.04, Debian 12, Fedora 35, RHEL 9).
-          - { name: linux-x86_64, runner: ubuntu-24.04, arch: x86_64, script: unix, container: "almalinux:9" }
-          - { name: linux-arm64, runner: ubuntu-24.04-arm, arch: arm64, script: unix, container: "almalinux:9" }
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Tools for the container
         if: matrix.container
