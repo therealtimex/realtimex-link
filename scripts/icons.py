@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Make RealTimeX Link's icon files from assets/icon.svg and assets/tray.svg.
+"""Make RealTimeX Link's icon files: RealTimeX's icon (assets/realtimex-icon.png) with Link's badge
+(assets/badge.svg) in its bottom-right corner, and the tray icon from assets/tray.svg.
 
   assets/icon-<size>.png   16 to 1024 px (Linux, docs)
   assets/icon.ico          Windows (16 to 256 px)
@@ -67,6 +68,19 @@ def render(svg_path, size, out_png):
     return image
 
 
+# The badge: about 44% of the icon, in its bottom-right corner, clear of the edge.
+BADGE_SIZE = 452
+BADGE_MARGIN = 20
+
+
+def compose(badge):
+    """RealTimeX's icon with Link's badge in the bottom-right corner, 1024 px."""
+    base = Image.open(os.path.join(ASSETS, "realtimex-icon.png")).convert("RGBA").resize((1024, 1024), Image.LANCZOS)
+    at = 1024 - BADGE_SIZE - BADGE_MARGIN
+    base.alpha_composite(badge, (at, at))
+    return base
+
+
 def write_rgba(image, size, name):
     os.makedirs(RGBA_DIR, exist_ok=True)
     resized = image.resize((size, size), Image.LANCZOS)
@@ -76,7 +90,7 @@ def write_rgba(image, size, name):
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
-        master = render(os.path.join(ASSETS, "icon.svg"), 1024, os.path.join(tmp, "icon.png"))
+        master = compose(render(os.path.join(ASSETS, "badge.svg"), BADGE_SIZE, os.path.join(tmp, "badge.png")))
         tray = render(os.path.join(ASSETS, "tray.svg"), 176, os.path.join(tmp, "tray.png"))
 
     sizes = [16, 32, 48, 64, 128, 256, 512, 1024]
