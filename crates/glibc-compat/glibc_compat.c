@@ -1,9 +1,10 @@
 /*
- * Keeps RealTimeX's native executables (rtx-capture, rtx-control, rtx-linkd) built on a newer
- * system (the arm64 runner: Ubuntu 24.04, glibc 2.39) running on glibc 2.34. Every symbol version
- * a binary references is a hard requirement at load time, weak references included, so each newer
- * symbol is defined here instead of taken from glibc. Linked into every executable that depends
- * on the rtx-glibc-compat crate (its build.rs), whole, since nothing in Rust references it.
+ * Keeps RealTimeX's native executables (rtx-capture, rtx-control, rtx-linkd, rtx-link) built on a
+ * newer system (the arm64 runner: Ubuntu 24.04, glibc 2.39) running on glibc 2.34. Every symbol
+ * version a binary references is a hard requirement at load time, weak references included, so
+ * each newer symbol is defined here instead of taken from glibc. Linked into every executable that
+ * depends on the rtx-glibc-compat crate (its build.rs), whole, since nothing in Rust references
+ * it.
  *
  * glibc 2.38 renamed strtol and sscanf to __isoc23_* for C code built with _GNU_SOURCE (C23 adds
  * "0b" binary input). aws-lc (DTLS for rtx-control's live view, through str0m) is C that defines
@@ -53,3 +54,28 @@ int pidfd_getpid(int pidfd) {
   errno = ENOSYS;
   return -1;
 }
+
+/*
+ * glibc 2.35 versioned hypot and hypotf again (faster, still correctly rounded); the earlier
+ * versions stay in every glibc with the same meaning. rtx-link's window (egui) calls them. These
+ * definitions forward to the earlier versions, so the binary references only those.
+ */
+#if defined(__x86_64__)
+#define RTX_LIBM_BASE "GLIBC_2.2.5"
+#elif defined(__aarch64__)
+#define RTX_LIBM_BASE "GLIBC_2.17"
+#endif
+#ifdef RTX_LIBM_BASE
+double rtx_hypot_base(double x, double y);
+float rtx_hypotf_base(float x, float y);
+__asm__(".symver rtx_hypot_base, hypot@" RTX_LIBM_BASE);
+__asm__(".symver rtx_hypotf_base, hypotf@" RTX_LIBM_BASE);
+
+double hypot(double x, double y) {
+  return rtx_hypot_base(x, y);
+}
+
+float hypotf(float x, float y) {
+  return rtx_hypotf_base(x, y);
+}
+#endif
