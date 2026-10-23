@@ -15,8 +15,6 @@ eframe = { version = "0.37.0", default-features = false, features = ["glow", "de
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3.5.0", features = ["json"] }
-
-# The menu bar (macOS) and tray (Windows) icon. Not on Linux, where it needs GTK; there the window
-# is the way in.
-[target.'cfg(any(target_os = "macos", windows))'.dependencies]
-tray-icon = "0.26.1"
+# The menu bar (macOS) and tray (Windows, Linux) icon. On Linux the StatusNotifierItem backend
+# (D-Bus, its own thread): no GTK; GNOME shows it with the AppIndicator extension (Ubuntu's default).
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }

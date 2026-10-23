@@ -140,7 +140,6 @@ pub struct LinkApp {
     show_password: bool,
     editing_password: Option<String>,
     confirm: Option<Confirm>,
-    #[cfg(any(target_os = "macos", windows))]
     tray: Option<crate::tray::Tray>,
 }
 
@@ -153,7 +152,6 @@ impl LinkApp {
             std::thread::spawn(move || poll_loop(shared, wake, ctx));
         }
         Self {
-            #[cfg(any(target_os = "macos", windows))]
             tray: crate::tray::Tray::new(shared.clone(), refresh.clone(), cc.egui_ctx.clone()).ok(),
             shared,
             refresh,
@@ -169,10 +167,7 @@ impl LinkApp {
     }
 
     fn has_tray(&self) -> bool {
-        #[cfg(any(target_os = "macos", windows))]
-        return self.tray.is_some();
-        #[cfg(not(any(target_os = "macos", windows)))]
-        false
+        self.tray.is_some()
     }
 }
 
@@ -352,7 +347,6 @@ impl eframe::App for LinkApp {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
-        #[cfg(any(target_os = "macos", windows))]
         if let Some(tray) = &self.tray {
             tray.update(lock(&self.shared).overview.as_ref());
         }

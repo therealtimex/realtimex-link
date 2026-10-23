@@ -7,7 +7,6 @@
 mod api;
 mod app;
 mod desktop;
-#[cfg(any(target_os = "macos", windows))]
 mod tray;
 
 fn main() -> eframe::Result {
