@@ -88,6 +88,16 @@ jobs:
           name: realtimex-link-${{ matrix.name }}
           path: dist/${{ matrix.name }}
           if-no-files-found: error
+      # The Windows installer compiles (NSIS is on the runner). The one released is built and
+      # signed on RealTimeX's GitLab, around the signed executables.
+      - name: Installer compiles (Windows)
+        if: matrix.script == 'windows'
+        shell: pwsh
+        working-directory: packaging/windows
+        run: |
+          $version = (Select-String -Path ..\..\Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /V2 /DVERSION=$version /DPAYLOAD=..\..\dist\${{ matrix.name }} /DOUTFILE=$env:RUNNER_TEMP\setup.exe installer.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
 
   draft-release:
     name: Draft release
@@ -105,12 +115,40 @@ jobs:
           for dir in realtimex-link-*; do
             (cd "$dir" && find . -type f -name 'rtx-*' -exec chmod +x {} + && tar -czf "../$dir.tar.gz" *)
           done
-          sha256sum realtimex-link-*.tar.gz > SHA256SUMS
+      # Linux packages: no signing needed, so they are built here (nfpm, pinned).
+      - uses: actions/checkout@v4
+        with:
+          path: source
+      - name: Linux packages (.deb, .rpm)
+        working-directory: dist
+        env:
+          NFPM: "2.48.0"
+          NFPM_SHA256: "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750"
+        run: |
+          curl -fsSL -o nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM}/nfpm_${NFPM}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  nfpm.tar.gz" | sha256sum -c -
+          tar -xzf nfpm.tar.gz nfpm
+          VERSION="${GITHUB_REF_NAME#v}"
+          for pair in x86_64:amd64:x86_64 arm64:arm64:aarch64; do
+            IFS=: read -r name deb rpm <<<"$pair"
+            for packager in deb rpm; do
+              arch=$([ "$packager" = deb ] && echo "$deb" || echo "$rpm")
+              (cd ../source && ARCH="$arch" VERSION="$VERSION" PAYLOAD="$PWD/../dist/realtimex-link-linux-$name" \
+                ../dist/nfpm package --config packaging/linux/nfpm.yaml --packager "$packager" \
+                --target "../dist/realtimex-link_${VERSION}_${arch}.${packager}")
+            done
+          done
+          ls -l *.deb *.rpm
+      - name: SHA-256 sums
+        working-directory: dist
+        run: |
+          sha256sum realtimex-link-*.tar.gz realtimex-link_*.deb realtimex-link_*.rpm > SHA256SUMS
           cat SHA256SUMS
       - name: Draft release (unsigned, until signed)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/realtimex-link-*.tar.gz dist/SHA256SUMS \
+          gh release create "${GITHUB_REF_NAME}" dist/realtimex-link-*.tar.gz dist/realtimex-link_*.deb \
+            dist/realtimex-link_*.rpm dist/SHA256SUMS \
             --repo "${GITHUB_REPOSITORY}" --draft --title "RealTimeX Link ${GITHUB_REF_NAME}" \
             --notes "Unsigned builds. Signed builds replace them before this release is published."

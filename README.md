@@ -29,8 +29,23 @@ reads the keyboard) is checked by RealTimeX against this repo's sources at the p
 build script or input API in `rtx-control` or `rtx-screens` needs review there before RealTimeX
 moves its pin.
 
-RealTimeX ships RealTimeX Link and manages it from Settings → Sharing → Remote control. It can
-also be installed on its own from [Releases](https://github.com/therealtimex/realtimex-link/releases).
+RealTimeX ships RealTimeX Link and manages it from Settings → Sharing → Remote control. Link
+also works on its own, for a computer that should be controlled from RealTimeX elsewhere without
+RealTimeX installed here: download it from
+[Releases](https://github.com/therealtimex/realtimex-link/releases), sign in to your RealTimeX
+account in its window and turn on **Allow remote control**.
+
+| Platform | Download | Installs to |
+| --- | --- | --- |
+| macOS | `RealTimeX-Link-<version>-macos-<arch>.dmg` (signed, notarized): drag it to Applications | `/Applications/RealTimeX Link.app` |
+| Windows | `RealTimeX-Link-Setup-<version>.exe` (signed) | `C:\Program Files\RealTimeX Link` |
+| Linux | `realtimex-link_<version>_<arch>.deb` / `.rpm` | `/opt/RealTimeX Link` |
+
+RealTimeX installs Link in the same places, so either one installs or updates it, never a
+downgrade. **Releases:** GitHub Actions builds every tag (unsigned archives, Linux packages);
+RealTimeX's GitLab then signs and notarizes the macOS and Windows builds, adds the `.dmg` and the
+Windows installer, and publishes the release. This repository is a mirror of
+`rtgit.rta.vn/rtlab/rtwebteam/realtimex-link`; send changes there.
 
 - **Installing:** `rtx-linkd install DESTINATION` installs the Link it belongs to as its own app:
   `/Applications/RealTimeX Link.app`, `C:\Program Files\RealTimeX Link`, `/opt/RealTimeX Link`

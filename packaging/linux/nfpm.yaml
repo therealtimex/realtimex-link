@@ -1,0 +1,38 @@
+# RealTimeX Link's .deb and .rpm (nfpm): the release binaries go to a payload folder, and the
+# package's post-install script installs them with Link's own installer into /opt/RealTimeX Link,
+# where RealTimeX's own package puts it too (never a downgrade; a running Link is stopped first).
+# Built by the release workflow: VERSION, ARCH (amd64|arm64) and PAYLOAD (the binaries) from the env.
+name: realtimex-link
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: RealTimeX <support@realtimex.ai>
+vendor: RealTimeX
+homepage: https://realtimex.ai
+license: Apache-2.0
+description: |
+  RealTimeX Link lets RealTimeX on your other computers see and control this one: screen,
+  keyboard and mouse, clipboard and files, over Tailscale or RealTimeX's relay. Works without
+  RealTimeX installed here.
+contents:
+  - src: ${PAYLOAD}/rtx-linkd
+    dst: /usr/lib/realtimex-link/payload/rtx-linkd
+    file_info:
+      mode: 0755
+  - src: ${PAYLOAD}/rtx-link
+    dst: /usr/lib/realtimex-link/payload/rtx-link
+    file_info:
+      mode: 0755
+  - src: ${PAYLOAD}/rtx-control
+    dst: /usr/lib/realtimex-link/payload/rtx-control
+    file_info:
+      mode: 0755
+  - src: ${PAYLOAD}/icon.png
+    dst: /usr/lib/realtimex-link/payload/icon.png
+    file_info:
+      mode: 0644
+scripts:
+  postinstall: packaging/linux/postinstall.sh
+  preremove: packaging/linux/preremove.sh
