@@ -41,23 +41,9 @@ const SESSION_GAP_MS: i64 = 10 * 60 * 1000;
 /// after it); the window asks for the overview every few seconds, so the answer is kept this long.
 const PERMISSIONS_FOR: Duration = Duration::from_secs(10);
 
-/// The hosting state RealTimeX's plugin kept, besides the password.
-const COPIED_KEYS: [&str; 6] = [
-    "app-id",
-    "clients",
-    "fallback-app-id",
-    "settings",
-    "account",
-    "identity-keys",
-];
-pub const IMPORT_MARK: &str = "legacy_import";
-
 pub mod keys {
     pub const PASSWORD: &str = "password";
     pub const FALLBACK_APP_ID: &str = "fallback-app-id";
-    /// The App ID RealTimeX was reached by (its Public Exposure ID), handed over with its state:
-    /// it stays this computer's, so computers that saved it keep finding it.
-    pub const APP_ID: &str = "app-id";
     pub const SETTINGS: &str = "settings";
 }
 
@@ -196,36 +182,24 @@ impl Host {
 
     // --- identity -----------------------------------------------------------
 
-    /// This computer's App ID: the relay's exposure ID once Link has its own (relay.rs), else the
-    /// App ID RealTimeX handed over, else this computer's own.
+    /// This computer's App ID, Link's own: its relay exposure ID once it has one (relay.rs), else
+    /// the one it made for itself.
     pub fn app_id(&self) -> String {
         self.relay
             .exposure_id()
-            .or_else(|| self.imported_app_id())
             .unwrap_or_else(|| self.state().fallback_app_id.clone())
     }
 
-    fn imported_app_id(&self) -> Option<String> {
-        self.store
-            .get(keys::APP_ID)
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|id| !id.is_empty())
-    }
-
-    /// App IDs this computer had before (the one RealTimeX handed over, its own): controllers
-    /// that saved one find it by them.
+    /// The App ID Link had before its relay exposure (the one it made for itself): controllers
+    /// that saved it find Link by it and move to the current one.
     fn former_app_ids(&self) -> Vec<String> {
         let current = self.app_id();
-        let mut former: Vec<String> = [
-            self.imported_app_id(),
-            Some(self.state().fallback_app_id.clone()),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|id| !id.is_empty() && *id != current)
-        .collect();
-        former.dedup();
-        former
+        let fallback = self.state().fallback_app_id.clone();
+        if fallback.is_empty() || fallback == current {
+            Vec::new()
+        } else {
+            vec![fallback]
+        }
     }
 
     pub fn identity(&self) -> Value {
@@ -358,62 +332,6 @@ impl Host {
         let _ = self.backend.stop().await;
         self.state().session = None;
         Ok(())
-    }
-
-    /// Bring RealTimeX's hosting state in, once (POST /v1/import): the clients, settings and App
-    /// ID unchanged, so other computers' saved entries keep working, and the password RealTimeX
-    /// decrypted, sealed again with the daemon's key. The controlling side's `computers` and
-    /// `controller-id` stay with RealTimeX.
-    pub async fn import_legacy(&self, body: &Value) -> Result<Value, ApiError> {
-        if let Some(done) = self.store.meta_get(IMPORT_MARK) {
-            let done: Value = serde_json::from_str(&done).unwrap_or(Value::Null);
-            let mut error = ApiError::coded(
-                409,
-                "already-imported",
-                "RealTimeX's state was imported already",
-            );
-            error.message = format!(
-                "{} ({})",
-                error.message,
-                done.get("at").and_then(Value::as_str).unwrap_or("earlier")
-            );
-            return Err(error);
-        }
-        let mut values: Vec<(&str, Value)> = Vec::new();
-        let state = body.get("state").cloned().unwrap_or(json!({}));
-        for key in COPIED_KEYS {
-            if let Some(value) = state.get(key).filter(|v| !v.is_null()) {
-                values.push((key, value.clone()));
-            }
-        }
-        let supplied = body.get("password");
-        if let Some(password) = supplied
-            .and_then(|p| p.get("password"))
-            .and_then(Value::as_str)
-            .filter(|p| !p.is_empty())
-        {
-            let ciphertext = self.secrets.encrypt(password).map_err(ApiError::from)?;
-            let changed_at = supplied
-                .and_then(|p| p.get("changedAt"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let generation = supplied
-                .and_then(|p| p.get("generation"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            values.push((keys::PASSWORD, json!({ "ciphertext": ciphertext, "changedAt": changed_at, "generation": generation })));
-        }
-        let imported: Vec<&str> = values.iter().map(|(key, _)| *key).collect();
-        let mark = json!({ "at": iso_now(), "keys": imported }).to_string();
-        self.store.transaction(&values, &[(IMPORT_MARK, mark)])?;
-        self.clients.reload();
-        self.load_identity()?;
-        self.reconcile().await;
-        (self.log)(&format!(
-            "[remote-control] imported RealTimeX's hosting state: {}",
-            imported.join(", ")
-        ));
-        Ok(json!({ "keys": imported }))
     }
 
     // --- sign-in ------------------------------------------------------------

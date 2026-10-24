@@ -196,11 +196,6 @@ fn not_found() -> ApiError {
 }
 
 impl ClientStore {
-    /// Read the saved list again (after an import replaced it).
-    pub fn reload(&self) {
-        *self.clients.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    }
-
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,

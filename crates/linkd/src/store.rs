@@ -97,6 +97,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn meta_get(&self, key: &str) -> Option<String> {
         self.db()
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {

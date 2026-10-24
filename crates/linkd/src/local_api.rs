@@ -46,7 +46,6 @@ pub fn router(state: Shared) -> Router {
     Router::new()
         .route("/v1/version", get(version))
         .route("/v1/status", get(status))
-        .route("/v1/import", post(import))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/autostart", get(autostart).post(set_autostart))
         .route("/v1/window/open", post(open_window))
@@ -149,19 +148,12 @@ async fn version(State(state): State<Shared>) -> Json<Value> {
 }
 
 async fn status(State(state): State<Shared>) -> Json<Value> {
-    let imported = state
-        .host
-        .store
-        .meta_get("legacy_import")
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or(Value::Null);
     Json(json!({
         "pid": std::process::id(),
         "version": state.version,
         "protocol": PROTOCOL,
         "schema": SCHEMA_VERSION,
         "startedAt": state.started_at,
-        "imported": imported,
         "showWindow": state.show_window.load(Ordering::Relaxed),
     }))
 }
@@ -342,10 +334,6 @@ async fn set_autostart(Body64(body): Body64) -> Answer {
 
 /// RealTimeX's hosting state, once: { state: { clients, settings… }, password: { password,
 /// changedAt, generation } }.
-async fn import(State(state): State<Shared>, Body64(body): Body64) -> Answer {
-    Ok(Json(state.host.import_legacy(&body).await?))
-}
-
 async fn host_status(State(state): State<Shared>) -> Answer {
     Ok(Json(state.host.status().await))
 }
