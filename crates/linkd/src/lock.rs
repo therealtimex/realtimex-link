@@ -1,9 +1,14 @@
 //! One hosting daemon per data folder: a standalone RealTimeX Link and the one RealTimeX
-//! installed must not both listen and fight over the clipboard. The lock holds the owner's pid;
-//! one left by a process that died is taken over.
+//! installed must not both listen and fight over the clipboard. The owner holds an OS lock on
+//! the lock file (flock on Unix, LockFileEx on Windows) for as long as it runs. The OS lets go of
+//! it when the process ends however it ends (killed at logoff, a crash), so a stale lock can't
+//! keep hosting off after a restart, and two starters can't both take one over. The pid in the
+//! file is only for people reading it.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, TryLockError};
+use std::io::{Read, Seek, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::files;
 
@@ -11,6 +16,8 @@ pub const LOCK_FILE: &str = "linkd.lock";
 
 #[derive(Debug)]
 pub enum LockError {
+    /// Another process holds the lock: its pid, or 0 when the file can't tell (Windows doesn't
+    /// let others read a locked file).
     AlreadyRunning(u32),
     Io(std::io::Error),
 }
@@ -18,6 +25,7 @@ pub enum LockError {
 impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            LockError::AlreadyRunning(0) => write!(f, "RealTimeX Link is already running"),
             LockError::AlreadyRunning(pid) => {
                 write!(f, "RealTimeX Link is already running (pid {pid})")
             }
@@ -29,53 +37,59 @@ impl std::fmt::Display for LockError {
 impl std::error::Error for LockError {}
 
 pub struct InstanceLock {
-    file: PathBuf,
-    pid: u32,
+    file: File,
+    released: AtomicBool,
 }
 
 impl InstanceLock {
     pub fn acquire(data_dir: &Path) -> Result<Self, LockError> {
-        Self::acquire_as(data_dir, std::process::id(), alive)
-    }
-
-    pub fn acquire_as(
-        data_dir: &Path,
-        pid: u32,
-        is_alive: fn(u32) -> bool,
-    ) -> Result<Self, LockError> {
         files::ensure_private_dir(data_dir).map_err(LockError::Io)?;
-        let file = data_dir.join(LOCK_FILE);
-        for _ in 0..2 {
-            match files::create_new(&file, &pid.to_string()) {
-                Ok(()) => return Ok(Self { file, pid }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let owner = fs::read_to_string(&file)
-                        .ok()
-                        .and_then(|text| text.trim().parse::<u32>().ok())
-                        .unwrap_or(0);
-                    // A live owner keeps it, this process included: a daemon started twice must not fork.
-                    if owner > 0 && is_alive(owner) {
-                        return Err(LockError::AlreadyRunning(owner));
-                    }
-                    // Left by a process that died: take it over once.
-                    let _ = fs::remove_file(&file);
-                }
-                Err(error) => return Err(LockError::Io(error)),
-            }
+        let path = data_dir.join(LOCK_FILE);
+        // Never truncated before it is ours, and never removed: a removed lock file lets one
+        // starter lock the old file while another locks a new one.
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        Err(LockError::Io(std::io::Error::other(
-            "the lock file keeps coming back",
-        )))
+        let mut file = options.open(&path).map_err(LockError::Io)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let mut text = String::new();
+                let _ = file.read_to_string(&mut text);
+                return Err(LockError::AlreadyRunning(
+                    text.trim().parse::<u32>().unwrap_or(0),
+                ));
+            }
+            Err(TryLockError::Error(error)) => return Err(LockError::Io(error)),
+        }
+        let written = (|| -> std::io::Result<()> {
+            file.set_len(0)?;
+            file.rewind()?;
+            file.write_all(std::process::id().to_string().as_bytes())?;
+            file.flush()
+        })();
+        if let Err(error) = written {
+            let _ = file.unlock();
+            return Err(LockError::Io(error));
+        }
+        Ok(Self {
+            file,
+            released: AtomicBool::new(false),
+        })
     }
 
+    /// Let go of the lock now (closing the file does too). The pid goes first, while it is ours.
+    /// Once: after that the file may already be the next owner's.
     pub fn release(&self) {
-        let ours = fs::read_to_string(&self.file)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-            == Some(self.pid);
-        if ours {
-            let _ = fs::remove_file(&self.file);
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
         }
+        let _ = self.file.set_len(0);
+        let _ = self.file.unlock();
     }
 }
 
@@ -127,30 +141,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_owner_and_a_dead_ones_lock_is_taken_over() {
+    fn one_owner_at_a_time_and_the_lock_is_free_again_after_it() {
         let dir = tempfile::tempdir().unwrap();
-        let first = InstanceLock::acquire_as(dir.path(), 4242, |_| true).unwrap();
-        assert!(matches!(
-            InstanceLock::acquire_as(dir.path(), 4343, |_| true),
-            Err(LockError::AlreadyRunning(4242))
-        ));
-        std::mem::forget(first);
-        let second = InstanceLock::acquire_as(dir.path(), 4343, |_| false).unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join(LOCK_FILE)).unwrap(),
-            "4343"
-        );
-        drop(second);
-        assert!(!dir.path().join(LOCK_FILE).exists());
-    }
-
-    #[test]
-    fn this_process_does_not_take_its_own_lock_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        let _held = InstanceLock::acquire(dir.path()).unwrap();
+        let first = InstanceLock::acquire(dir.path()).unwrap();
+        // A second open of the same file is a second owner, even in this process.
         assert!(matches!(
             InstanceLock::acquire(dir.path()),
             Err(LockError::AlreadyRunning(_))
         ));
+        drop(first);
+        let second = InstanceLock::acquire(dir.path()).unwrap();
+        drop(second);
+        // The file stays: removing it would let two starters lock different files.
+        assert!(dir.path().join(LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn a_lock_file_left_behind_is_not_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        // A daemon killed without cleanup leaves its pid behind (this process's: alive, too).
+        fs::write(
+            dir.path().join(LOCK_FILE),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let held = InstanceLock::acquire(dir.path()).unwrap();
+        drop(held);
+        fs::write(dir.path().join(LOCK_FILE), "not a pid").unwrap();
+        let _held = InstanceLock::acquire(dir.path()).unwrap();
+    }
+
+    // Reads the held lock file: Unix only (Windows keeps others out of a locked file).
+    #[cfg(unix)]
+    #[test]
+    fn released_once_so_the_next_owners_pid_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = InstanceLock::acquire(dir.path()).unwrap();
+        // daemon.rs releases on stop, and the lock is dropped later still.
+        first.release();
+        let second = InstanceLock::acquire(dir.path()).unwrap();
+        drop(first);
+        drop(second);
+        let third = InstanceLock::acquire(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(LOCK_FILE)).unwrap(),
+            std::process::id().to_string()
+        );
+        drop(third);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_process_holding_it_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = InstanceLock::acquire(dir.path()).unwrap();
+        // flock from another process: it can't have the lock while this one holds it.
+        let status = std::process::Command::new("flock")
+            .args(["-n"])
+            .arg(dir.path().join(LOCK_FILE))
+            .arg("true")
+            .status();
+        if let Ok(status) = status {
+            assert!(!status.success());
+        }
+        match InstanceLock::acquire(dir.path()) {
+            Err(LockError::AlreadyRunning(pid)) => assert_eq!(pid, std::process::id()),
+            _ => panic!("the lock was taken twice"),
+        }
     }
 }

@@ -142,6 +142,9 @@ async fn wait_for_stop() {
     }
 }
 
+/// Windows: RealTimeX and the window stop the daemon with POST /v1/shutdown. At logoff Windows
+/// ends it without any signal, so nothing here cleans up; the instance lock is the OS's and goes
+/// with the process (lock.rs), so the next login's daemon starts.
 #[cfg(not(unix))]
 async fn wait_for_stop() {
     let _ = tokio::signal::ctrl_c().await;
