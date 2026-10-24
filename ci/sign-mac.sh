@@ -81,7 +81,7 @@ spctl --assess --type execute --verbose=2 "$APP"
 (cd "$WORK/app" && tar -czf "$OLDPWD/$OUT/$NAME" "RealTimeX Link.app")
 
 # The .dmg to drag Link to Applications: signed, notarized and stapled itself.
-packaging/macos/dmg.sh "$APP" "$OUT/$DMG"
+bash packaging/macos/dmg.sh "$APP" "$OUT/$DMG"
 codesign --force --timestamp ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} --sign "$IDENTITY" "$OUT/$DMG"
 notarize "$OUT/$DMG"
 xcrun stapler staple "$OUT/$DMG"

@@ -73,9 +73,25 @@ try {
     "$env:ProgramFiles\NSIS\makensis.exe"
   ) | Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $nsis) {
-    # electron-builder keeps NSIS in its cache on this runner (RealTimeX's own installer).
-    $nsis = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'electron-builder\Cache\nsis') -Recurse -Filter makensis.exe -ErrorAction SilentlyContinue |
-      Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+    # electron-builder's NSIS, where RealTimeX's own installer builds left it on this runner (the
+    # runner's service account keeps its cache in SystemTemp).
+    $caches = @($env:ELECTRON_BUILDER_CACHE, (Join-Path "$env:LOCALAPPDATA" 'electron-builder\Cache'), 'C:\Windows\SystemTemp\electron-builder-cache') |
+      Where-Object { $_ -and (Test-Path (Join-Path $_ 'nsis')) }
+    $nsis = $caches | ForEach-Object { Get-ChildItem -Path (Join-Path $_ 'nsis') -Recurse -Filter makensis.exe -ErrorAction SilentlyContinue } |
+      Where-Object { $_.FullName -match '\\Bin\\makensis\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+  }
+  if (-not $nsis) {
+    # Else the same build electron-builder downloads (nsis-3.0.4.1), checked against its SHA-512.
+    $archive = Join-Path $work 'nsis-3.0.4.1.7z'
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/electron-userland/electron-builder-binaries/releases/download/nsis-3.0.4.1/nsis-3.0.4.1.7z' -OutFile $archive
+    $sha512 = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($archive)))
+    if ($sha512 -ne 'VKMiizYdmNdJOWpRGz4trl4lD++BvYP2irAXpMilheUP0pc93iKlWAoP843Vlraj8YG19CVn0j+dCo/hURz9+Q==') { throw "nsis-3.0.4.1.7z: unexpected SHA-512" }
+    $unpacked = Join-Path $work 'nsis'
+    New-Item -ItemType Directory -Force -Path $unpacked | Out-Null
+    tar -xf $archive -C $unpacked
+    if ($LASTEXITCODE -ne 0) { throw "couldn't unpack nsis-3.0.4.1.7z" }
+    $nsis = Get-ChildItem -Path $unpacked -Recurse -Filter makensis.exe | Where-Object { $_.FullName -match '\\Bin\\makensis\.exe$' } |
+      Select-Object -First 1 -ExpandProperty FullName
   }
   if (-not $nsis) { throw "NSIS (makensis.exe) is not on this runner" }
   Write-Host "NSIS: $nsis"
