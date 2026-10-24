@@ -7,8 +7,10 @@
 //!
 //! This computer's account is the one RealTimeX handed over (POST /v1/account/token, its `sub`),
 //! kept in the store so a restart without RealTimeX still knows it. The keys are kept there too,
-//! refreshed at most hourly and at most once per 5 minutes for an unknown key ID. Any failure
-//! means "not the same account", never an error.
+//! with the issuer they came from (a set from another API base is never used), refreshed at most
+//! hourly and at most once per 5 minutes for an unknown key ID; when the Marketplace can't be
+//! reached the last good set serves for at most 72 hours. Any failure means "not the same
+//! account", never an error.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -22,7 +24,7 @@ use crate::store::Store;
 pub mod keys {
     /// { subject, email }: this computer's RealTimeX account.
     pub const ACCOUNT: &str = "account";
-    /// { keys: [JWK], fetchedAt }: the Marketplace's identity keys, last good set.
+    /// { keys: [JWK], fetchedAt, issuer }: the Marketplace's identity keys, last good set.
     pub const IDENTITY_KEYS: &str = "identity-keys";
 }
 
@@ -31,6 +33,9 @@ pub const AUDIENCE_PREFIX: &str = "rtx-remote-control:";
 const SKEW_S: i64 = 60;
 const KEYS_REFRESH_MS: i64 = 60 * 60 * 1000;
 const UNKNOWN_KID_REFETCH_MS: i64 = 5 * 60 * 1000;
+/// The kept set stands in for an unreachable Marketplace this long at most: keys it has since
+/// withdrawn must stop working some time.
+const KEPT_KEYS_MAX_AGE_MS: i64 = 72 * 60 * 60 * 1000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A verified same-account controller.
@@ -166,7 +171,7 @@ impl IdentityVerifier {
                 .find(|k| k.get("kid").and_then(Value::as_str) == Some(kid))
                 .cloned()
         };
-        let kept = store.get(keys::IDENTITY_KEYS).unwrap_or(json!({}));
+        let kept = kept_keys(store.get(keys::IDENTITY_KEYS), api_base, now_ms());
         let fetched_at = kept.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0);
         let stale = now_ms() - fetched_at >= KEYS_REFRESH_MS;
         if !stale {
@@ -190,10 +195,22 @@ impl IdentityVerifier {
                 let _ = store.set(keys::IDENTITY_KEYS, &set);
                 find(&set)
             }
-            // The last good set when the Marketplace can't be reached.
+            // The last good set when the Marketplace can't be reached (kept_keys: from this
+            // issuer, and not older than 72 hours).
             None => find(&kept),
         }
     }
+}
+
+/// The kept key set when it came from `issuer` and is at most KEPT_KEYS_MAX_AGE_MS old, else
+/// an empty one. Sets kept before the issuer was recorded count as another issuer's.
+fn kept_keys(kept: Option<Value>, issuer: &str, now: i64) -> Value {
+    kept.filter(|set| set.get("issuer").and_then(Value::as_str) == Some(issuer))
+        .filter(|set| {
+            let fetched_at = set.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0);
+            now - fetched_at < KEPT_KEYS_MAX_AGE_MS
+        })
+        .unwrap_or_else(|| json!({}))
 }
 
 /// GET <api base>/v1/remote-control/identity-keys: { keys: [JWK] }.
@@ -202,6 +219,7 @@ async fn fetch_keys(api_base: &str) -> Option<Value> {
         return None;
     }
     let url = format!("{api_base}/v1/remote-control/identity-keys");
+    let issuer = api_base.to_string();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(FETCH_TIMEOUT))
@@ -209,7 +227,7 @@ async fn fetch_keys(api_base: &str) -> Option<Value> {
             .into();
         let answer: Value = agent.get(&url).call().ok()?.body_mut().read_json().ok()?;
         answer.get("keys").filter(|k| k.is_array())?;
-        Some(json!({ "keys": answer["keys"], "fetchedAt": now_ms() }))
+        Some(json!({ "keys": answer["keys"], "fetchedAt": now_ms(), "issuer": issuer }))
     })
     .await
     .ok()
@@ -245,7 +263,7 @@ mod tests {
         store
             .set(
                 keys::IDENTITY_KEYS,
-                &json!({ "keys": [{ "kid": "k1", "kty": "OKP", "crv": "Ed25519", "x": enc(pair.public_key().as_ref()) }], "fetchedAt": now_ms() }),
+                &json!({ "keys": [{ "kid": "k1", "kty": "OKP", "crv": "Ed25519", "x": enc(pair.public_key().as_ref()) }], "fetchedAt": now_ms(), "issuer": API }),
             )
             .unwrap();
         Fixture {
@@ -321,6 +339,41 @@ mod tests {
         f.store.set(keys::ACCOUNT, &json!({})).unwrap();
         assert!(verifier
             .verify(&f.store, &token(&f.pair, claims("j7")), "APP", API)
+            .await
+            .is_none());
+    }
+
+    #[test]
+    fn kept_keys_belong_to_their_issuer_and_age_out() {
+        let now = now_ms();
+        let set = |issuer: Value, fetched_at: i64| {
+            Some(json!({ "keys": [{ "kid": "k1" }], "fetchedAt": fetched_at, "issuer": issuer }))
+        };
+        assert!(kept_keys(set(json!(API), now), API, now).get("keys").is_some());
+        // Another issuer's set, or one kept before issuers were recorded, is not used.
+        assert_eq!(kept_keys(set(json!("https://other.example"), now), API, now), json!({}));
+        assert_eq!(kept_keys(set(Value::Null, now), API, now), json!({}));
+        // Not older than 72 hours, even when the Marketplace can't be reached.
+        let hour = 60 * 60 * 1000;
+        assert!(kept_keys(set(json!(API), now - 71 * hour), API, now)
+            .get("keys")
+            .is_some());
+        assert_eq!(kept_keys(set(json!(API), now - 73 * hour), API, now), json!({}));
+        assert_eq!(kept_keys(None, API, now), json!({}));
+    }
+
+    #[tokio::test]
+    async fn another_issuers_keys_verify_nothing() {
+        let f = fixture();
+        let mut kept = f.store.get(keys::IDENTITY_KEYS).unwrap();
+        kept["issuer"] = json!("https://other.example");
+        f.store.set(keys::IDENTITY_KEYS, &kept).unwrap();
+        let verifier = IdentityVerifier::new();
+        // Its key isn't used, and the fetch from the (non-https test) base finds nothing.
+        let mut local = claims("j8");
+        local["iss"] = json!("http://127.0.0.1:9");
+        assert!(verifier
+            .verify(&f.store, &token(&f.pair, local), "APP", "http://127.0.0.1:9")
             .await
             .is_none());
     }

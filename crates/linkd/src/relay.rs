@@ -44,6 +44,14 @@ pub mod keys {
 
 const SURFACE: &str = "d";
 const DEFAULT_API_BASE: &str = "https://marketplace-api-next.realtimex.ai";
+/// The Marketplace API hosts RealTimeX may name (over https, default port). The API base is also
+/// the identity tokens' issuer and where their keys come from, so any other host is ignored.
+const API_HOSTS: [&str; 2] = [
+    "marketplace-api-next.realtimex.ai",
+    "marketplace-api.realtimex.ai",
+];
+/// A local Marketplace (http, any port), in debug builds only.
+const DEBUG_API_HOSTS: [&str; 2] = ["127.0.0.1", "localhost"];
 const PROTOCOL_NAME: &str = "rtx-relay/1";
 const WEBSOCKET_SUBPROTOCOL: &str = "rtx-relay-v1";
 const PROTOCOL_VERSION: u8 = 1;
@@ -160,27 +168,36 @@ impl Relay {
     }
 
     /// RealTimeX hands over the signed-in account's access token (and its API base). It signs
-    /// Link in only when Link has no sign-in of its own (signin.rs); the API base always counts.
+    /// Link in only when Link has no sign-in of its own (signin.rs); the API base counts only then,
+    /// and only when it names an allowed host (`allowed_api_base`).
     /// Ok(false): kept as an offer only.
     pub fn handover(&self, token: &str, api_base: Option<&str>) -> Result<bool> {
         let token = token.trim();
         if token.is_empty() || token.contains(char::is_whitespace) {
             bail!("token must be the account's access token");
         }
-        let api_base = api_base
-            .map(|base| base.trim().trim_end_matches('/').to_string())
-            .filter(|base| base.starts_with("https://") || base.starts_with("http://127.0.0.1"));
-        if let Some(base) = &api_base {
-            *lock(&self.api_base) = Some(base.clone());
-        }
         let takes = self
             .host
             .upgrade()
             .is_some_and(|host| host.signin.takes_handover(token));
         if takes {
+            if let Some(base) = api_base.and_then(allowed_api_base) {
+                self.set_api_base(base);
+            }
             self.set_account(token)?;
         }
         Ok(takes)
+    }
+
+    /// Another API base is another issuer: the identity keys kept for the last one go with it.
+    fn set_api_base(&self, base: String) {
+        let previous = self.api_base();
+        *lock(&self.api_base) = Some(base.clone());
+        if previous != base {
+            if let Some(host) = self.host.upgrade() {
+                let _ = host.store.remove(crate::identity::keys::IDENTITY_KEYS);
+            }
+        }
     }
 
     /// Sign in with this access token: this computer's account from now on.
@@ -1160,9 +1177,78 @@ fn jitter(max: Duration) -> Duration {
     Duration::from_millis(u64::from_le_bytes(crate::util::random_bytes::<8>()) % millis)
 }
 
+/// The Marketplace API base as `https://<allowed host>`, or None. Parsed, not prefix-matched:
+/// "https://marketplace-api.realtimex.ai.evil.com" and "https://x@marketplace-api.realtimex.ai"
+/// name other hosts (or carry user info) and are refused, as is anything with a path, query,
+/// fragment or port. Loopback over http (any port) only in debug builds.
+fn allowed_api_base(base: &str) -> Option<String> {
+    let base = base.trim().trim_end_matches('/');
+    let (scheme, authority) = base.split_once("://")?;
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '@' | '\\') || c.is_whitespace())
+    {
+        return None;
+    }
+    let authority = authority.to_ascii_lowercase();
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" if API_HOSTS.contains(&authority.as_str()) => Some(format!("https://{authority}")),
+        "http" if cfg!(debug_assertions) => {
+            let (host, port) = authority
+                .rsplit_once(':')
+                .unwrap_or((authority.as_str(), ""));
+            let port_ok = port.is_empty()
+                || (port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit()));
+            (DEBUG_API_HOSTS.contains(&host) && port_ok).then(|| format!("http://{authority}"))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_marketplace_hosts_are_api_bases() {
+        assert_eq!(
+            allowed_api_base("https://marketplace-api-next.realtimex.ai/").as_deref(),
+            Some("https://marketplace-api-next.realtimex.ai")
+        );
+        assert_eq!(
+            allowed_api_base(" HTTPS://Marketplace-API.realtimex.ai ").as_deref(),
+            Some("https://marketplace-api.realtimex.ai")
+        );
+        for refused in [
+            "http://127.0.0.1.evil.com",
+            "http://127.0.0.1@evil.com",
+            "https://marketplace-api.realtimex.ai.evil.com",
+            "https://evil.com@marketplace-api.realtimex.ai",
+            "https://marketplace-api.realtimex.ai@evil.com",
+            "https://marketplace-api.realtimex.ai:8443",
+            "https://marketplace-api.realtimex.ai/v1",
+            "https://marketplace-api.realtimex.ai?x=1",
+            "https://marketplace-api.realtimex.ai\\@evil.com",
+            "http://marketplace-api.realtimex.ai",
+            "https://evil.com",
+            "marketplace-api.realtimex.ai",
+            "",
+        ] {
+            assert_eq!(allowed_api_base(refused), None, "{refused}");
+        }
+        // A local Marketplace only in a debug build, and only loopback.
+        assert_eq!(
+            allowed_api_base("http://127.0.0.1:3001").is_some(),
+            cfg!(debug_assertions)
+        );
+        assert_eq!(
+            allowed_api_base("http://localhost").is_some(),
+            cfg!(debug_assertions)
+        );
+        assert_eq!(allowed_api_base("http://127.0.0.1:x"), None);
+        assert_eq!(allowed_api_base("http://10.0.0.1:3001"), None);
+    }
 
     fn connection() -> Connection {
         Connection {
