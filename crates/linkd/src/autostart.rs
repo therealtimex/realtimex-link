@@ -322,7 +322,8 @@ mod platform {
         };
         let text = format!(
             "[Desktop Entry]\nType=Application\nName={NAME}\nComment=Lets your other computers \
-             connect to this one\nExec={exec}\n{icon}Terminal=false\nNoDisplay=true\n\
+             connect to this one\nExec={exec}\n{icon}StartupWMClass=realtimex-link\n\
+             Terminal=false\nNoDisplay=true\n\
              X-GNOME-Autostart-enabled=true\n"
         );
         std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))

@@ -384,25 +384,76 @@ fn replace(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Linux, installed for everyone (root): RealTimeX Link in the applications menu, so its window
-/// opens without the tray. macOS and Windows have theirs (/Applications, the Start menu shortcut
-/// RealTimeX's installer adds).
+/// Linux: the icon theme's sizes, as the payload's icons folder has them (scripts/build.sh), and
+/// the name of the icon and of the menu entry, which is also the window's app_id (rtx-link).
+#[cfg(target_os = "linux")]
+const ICON_SIZES: [u32; 8] = [16, 24, 32, 48, 64, 128, 256, 512];
+#[cfg(target_os = "linux")]
+const DESKTOP_ID: &str = "realtimex-link";
+
+/// Linux: RealTimeX Link in the applications menu, so its window opens without the tray, and its
+/// icon in the hicolor theme at every size. The entry's StartupWMClass is the window's app_id, so
+/// the dock shows an open window under the entry and its icon. For everyone when installed as
+/// root (/usr/share), else for this user ($XDG_DATA_HOME). macOS and Windows have theirs
+/// (/Applications, the Start menu shortcut the installers add).
 #[cfg(target_os = "linux")]
 fn menu_entry(destination: &Path) -> Result<()> {
     // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(());
+    let root = unsafe { libc::geteuid() } == 0;
+    let share = if root {
+        PathBuf::from("/usr/share")
+    } else {
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(crate::paths::home_dir()).join(".local/share"))
+    };
+    menu_entry_in(destination, &share)?;
+    // GTK reads the system theme from its cache when there is one: brought up to date (a user's
+    // folder has none, and making one would hide icons other apps put there later).
+    let icons = share.join("icons/hicolor");
+    if root && icons.join("icon-theme.cache").exists() {
+        let _ = crate::util::command("gtk-update-icon-cache")
+            .args(["-q", "-f"])
+            .arg(&icons)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    let path = Path::new("/usr/share/applications/realtimex-link.desktop");
-    let app = destination.join("rtx-link");
-    let icon = destination.join("icon.png");
+    Ok(())
+}
+
+/// The icons into SHARE/icons/hicolor and the entry into SHARE/applications.
+#[cfg(target_os = "linux")]
+fn menu_entry_in(destination: &Path, share: &Path) -> Result<()> {
+    let mut themed = false;
+    for size in ICON_SIZES {
+        let from = destination.join("icons").join(format!("{size}.png"));
+        if !from.is_file() {
+            continue;
+        }
+        let dir = share.join(format!("icons/hicolor/{size}x{size}/apps"));
+        std::fs::create_dir_all(&dir)?;
+        let to = dir.join(format!("{DESKTOP_ID}.png"));
+        std::fs::copy(&from, &to).with_context(|| format!("could not copy {}", to.display()))?;
+        themed = true;
+    }
+    // Without the icons folder (a Link built before it), the one icon by its path.
+    let icon = if themed {
+        DESKTOP_ID.to_string()
+    } else {
+        destination.join("icon.png").display().to_string()
+    };
+    let path = share.join(format!("applications/{DESKTOP_ID}.desktop"));
+    std::fs::create_dir_all(path.parent().unwrap())?;
     let text = format!(
         "[Desktop Entry]\nType=Application\nName=RealTimeX Link\nComment=Lets your other computers \
-         connect to this one\nExec={}\nIcon={}\nTerminal=false\nCategories=Network;RemoteAccess;\n",
-        crate::autostart::desktop_exec(&app, ""),
-        icon.display()
+         connect to this one\nExec={}\nIcon={icon}\nStartupWMClass={DESKTOP_ID}\nTerminal=false\n\
+         Categories=Network;RemoteAccess;\n",
+        crate::autostart::desktop_exec(&destination.join("rtx-link"), ""),
     );
-    std::fs::write(path, text).with_context(|| format!("could not write {}", path.display()))
+    std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -430,6 +481,17 @@ fn copy(source: &Path, staging: &Path) -> Result<()> {
     std::fs::create_dir_all(staging)?;
     let mut names: Vec<String> = EXECUTABLES.iter().map(|name| executable(name)).collect();
     names.push("icon.png".to_string());
+    // Linux: the icon at each size for the icon theme (icons/16.png…), installed by menu_entry.
+    let icons = source.join("icons");
+    if icons.is_dir() {
+        std::fs::create_dir_all(staging.join("icons"))?;
+        for entry in std::fs::read_dir(&icons)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".png") {
+                names.push(format!("icons/{name}"));
+            }
+        }
+    }
     for name in names {
         let from = source.join(&name);
         if name == "icon.png" && !from.exists() {
@@ -440,9 +502,17 @@ fn copy(source: &Path, staging: &Path) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = if name == "icon.png" { 0o644 } else { 0o755 };
+            let mode = if name.ends_with(".png") { 0o644 } else { 0o755 };
             std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode))?;
         }
+    }
+    #[cfg(unix)]
+    if icons.is_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            staging.join("icons"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
     }
     let version = staging.join(VERSION_FILE);
     std::fs::write(&version, env!("CARGO_PKG_VERSION"))
@@ -545,6 +615,43 @@ mod tests {
                 assert!(refused.is_err());
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_menu_entry_names_the_themed_icon_and_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("RealTimeX Link");
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(destination.join("icons")).unwrap();
+        for size in ICON_SIZES {
+            std::fs::write(destination.join(format!("icons/{size}.png")), b"png").unwrap();
+        }
+        menu_entry_in(&destination, &share).unwrap();
+        for size in ICON_SIZES {
+            assert!(share
+                .join(format!(
+                    "icons/hicolor/{size}x{size}/apps/realtimex-link.png"
+                ))
+                .is_file());
+        }
+        let text =
+            std::fs::read_to_string(share.join("applications/realtimex-link.desktop")).unwrap();
+        assert!(text.contains("\nIcon=realtimex-link\n"));
+        assert!(text.contains("\nStartupWMClass=realtimex-link\n"));
+        assert!(text.contains(&format!(
+            "Exec=\"{}\"",
+            destination.join("rtx-link").display()
+        )));
+
+        // A Link without the icons folder: its one icon by path.
+        let older = dir.path().join("older");
+        std::fs::create_dir_all(&older).unwrap();
+        let share = dir.path().join("share-older");
+        menu_entry_in(&older, &share).unwrap();
+        let text =
+            std::fs::read_to_string(share.join("applications/realtimex-link.desktop")).unwrap();
+        assert!(text.contains(&format!("\nIcon={}\n", older.join("icon.png").display())));
     }
 
     #[cfg(unix)]

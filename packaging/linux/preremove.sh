@@ -11,3 +11,7 @@ for name in rtx-link rtx-linkd rtx-control; do
 done
 rm -rf "/opt/RealTimeX Link"
 rm -f /usr/share/applications/realtimex-link.desktop
+rm -f /usr/share/icons/hicolor/*/apps/realtimex-link.png
+if [ -f /usr/share/icons/hicolor/icon-theme.cache ]; then
+  gtk-update-icon-cache -q -f /usr/share/icons/hicolor 2>/dev/null || true
+fi
