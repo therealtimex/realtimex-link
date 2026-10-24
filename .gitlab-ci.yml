@@ -30,7 +30,7 @@ build:
     - $LINK_CI_RUNNER_TAG
   timeout: 3h
   script:
-    - python3 ci/github_build.py
+    - python3 -u ci/github_build.py
 
 sign:
   stage: sign
