@@ -114,6 +114,8 @@ pub struct Host {
     pub relay: Arc<Relay>,
     /// Link's own sign-in to the account (signin.rs).
     pub signin: Arc<crate::signin::SignIn>,
+    /// Link's own updates (update.rs).
+    pub updater: Arc<crate::update::Updater>,
     identity: IdentityVerifier,
     reconciling: tokio::sync::Mutex<()>,
     last_active: Mutex<HashMap<String, i64>>,
@@ -176,6 +178,7 @@ impl Host {
                 listener: tokio::sync::Mutex::new(None),
                 relay: Relay::new(me.clone()),
                 signin: Arc::new(crate::signin::SignIn::new(me.clone())),
+                updater: crate::update::Updater::new(me.clone()),
                 identity: IdentityVerifier::new(),
                 reconciling: tokio::sync::Mutex::new(()),
                 last_active: Mutex::new(HashMap::new()),
@@ -798,6 +801,7 @@ impl Host {
         }
         self.reconcile().await;
         self.relay.start();
+        self.updater.start();
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {

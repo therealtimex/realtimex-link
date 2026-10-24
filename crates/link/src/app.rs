@@ -26,6 +26,8 @@ pub struct Snapshot {
     pub password: String,
     /// The account Link is signed in to (GET /v1/account).
     pub account: Option<Value>,
+    /// Link's own updates (GET /v1/update).
+    pub update: Option<Value>,
     pub error: Option<String>,
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
@@ -66,6 +68,31 @@ pub fn act(
         };
         if !notice.0.is_empty() {
             lock(&shared).notice = Some((notice.0, notice.1, Instant::now()));
+        }
+        let _ = refresh.send(());
+        ctx.request_repaint();
+    });
+}
+
+/// Update to the latest release: the daemon installs it and the new Link starts itself, or (Linux)
+/// the release page opens for its .deb / .rpm.
+pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) {
+    let (shared, refresh, ctx) = (shared.clone(), refresh.clone(), ctx.clone());
+    std::thread::spawn(move || {
+        let api = lock(&shared).api.clone();
+        let answer = match api {
+            Some(api) => api.post("/v1/update/install", json!({})),
+            None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+        };
+        match answer {
+            Ok(answer) => {
+                if let Some(page) = answer.get("open").and_then(Value::as_str) {
+                    desktop::open_url(page);
+                }
+            }
+            Err(error) => {
+                lock(&shared).notice = Some((error.to_string(), false, Instant::now()));
+            }
         }
         let _ = refresh.send(());
         ctx.request_repaint();
@@ -124,8 +151,10 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let requests = api.get("/v1/host/connection-requests");
             let password = api.get("/v1/host/password");
             let account = api.get("/v1/account").ok();
+            let update = api.get("/v1/update").ok();
             let mut state = lock(&shared);
             state.account = account;
+            state.update = update;
             match overview {
                 Ok(overview) => {
                     state.overview = Some(overview);
@@ -423,13 +452,14 @@ impl eframe::App for LinkApp {
         }
         crate::dock::apply();
         if let Some(tray) = &self.tray {
-            tray.update(lock(&self.shared).overview.as_ref());
+            let state = lock(&self.shared);
+            tray.update(state.overview.as_ref(), state.update.as_ref());
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        let (overview, requests, password, account, error, notice) = {
+        let (overview, requests, password, account, update, error, notice) = {
             let mut state = lock(&self.shared);
             if state
                 .notice
@@ -443,6 +473,7 @@ impl eframe::App for LinkApp {
                 state.requests.clone(),
                 state.password.clone(),
                 state.account.clone(),
+                state.update.clone(),
                 state.error.clone(),
                 state.notice.clone(),
             )
@@ -472,26 +503,26 @@ impl eframe::App for LinkApp {
             let installed = desktop::realtimex_app().is_some();
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Link on its own is the whole point here: RealTimeX is a quiet link.
                     if installed {
                         if ui.button("Open RealTimeX").clicked() {
                             desktop::open_realtimex();
                         }
-                    } else if ui
-                        .add(egui::Button::new(RichText::new("Get RealTimeX").strong()))
-                        .clicked()
-                    {
+                    } else if ui.link("Get RealTimeX").clicked() {
                         desktop::open_realtimex();
                     }
-                    ui.add(egui::Label::new(
-                        RichText::new(if installed {
-                            "Control your other computers from RealTimeX."
-                        } else {
-                            "To see and control your other computers from this one, get RealTimeX."
-                        })
-                        .small()
-                        .weak(),
-                    )
-                    .wrap());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if installed {
+                                "Control your other computers from RealTimeX."
+                            } else {
+                                "Control this computer from RealTimeX on another computer."
+                            })
+                            .small()
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
                 });
             });
             ui.add_space(8.0);
@@ -527,6 +558,7 @@ impl eframe::App for LinkApp {
                         }
                         return;
                     };
+                    self.update_ui(ui, ctx, update.as_ref());
                     self.requests_ui(ui, ctx, &requests);
                     self.session_ui(ui, overview);
                     ui.horizontal(|ui| {
@@ -544,8 +576,16 @@ impl eframe::App for LinkApp {
                     ui.separator();
                     match self.tab {
                         Tab::ThisComputer => {
-                            self.this_computer_ui(ui, ctx, overview, &password);
-                            self.account_ui(ui, ctx, account.as_ref());
+                            // On its own and not signed in yet, signing in comes first.
+                            let signed_in = account.as_ref().and_then(|a| a.get("signedIn"))
+                                == Some(&Value::Bool(true));
+                            if !signed_in && desktop::realtimex_app().is_none() {
+                                self.account_ui(ui, ctx, account.as_ref());
+                                self.this_computer_ui(ui, ctx, overview, &password);
+                            } else {
+                                self.this_computer_ui(ui, ctx, overview, &password);
+                                self.account_ui(ui, ctx, account.as_ref());
+                            }
                         }
                         Tab::Computers => self.computers_ui(ui, ctx, overview),
                     }
@@ -558,6 +598,51 @@ impl eframe::App for LinkApp {
 }
 
 impl LinkApp {
+    /// A newer RealTimeX Link: Update, and how it is going.
+    fn update_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, update: Option<&Value>) {
+        let Some(update) = update else { return };
+        let available = update.get("available") == Some(&Value::Bool(true));
+        let error = update.get("error").and_then(Value::as_str);
+        if !available {
+            return;
+        }
+        let latest = text(update, "latest");
+        alert(
+            ui,
+            Tone::Info,
+            &format!("RealTimeX Link {latest} is available"),
+            |ui| {
+                ui.horizontal(|ui| {
+                    caption(ui, format!("You have {}.", text(update, "current")));
+                    let page = text(update, "page");
+                    if !page.is_empty() && ui.link("What's new").clicked() {
+                        desktop::open_url(&page);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        match update.get("busy").and_then(Value::as_str) {
+                            Some(busy) => {
+                                ui.label(if busy == "downloading" {
+                                    "Downloading…"
+                                } else {
+                                    "Installing…"
+                                });
+                                ui.spinner();
+                            }
+                            None => {
+                                if ui.button(RichText::new("Update").strong()).clicked() {
+                                    start_update(&self.shared, &self.refresh, ctx);
+                                }
+                            }
+                        }
+                    });
+                });
+                if let Some(error) = error {
+                    ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).1));
+                }
+            },
+        );
+    }
+
     /// The RealTimeX account: Link signs in itself in the browser, or takes RealTimeX's.
     fn account_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, account: Option<&Value>) {
         let Some(account) = account else { return };

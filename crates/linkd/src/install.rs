@@ -37,7 +37,7 @@ pub fn run(destination: &Path) -> Result<Value> {
 }
 
 /// What to copy: the .app this executable is in (macOS), else its folder.
-fn source() -> Result<PathBuf> {
+pub(crate) fn source() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("where is rtx-linkd?")?;
     let dir = exe.parent().context("rtx-linkd has no folder")?;
     if cfg!(target_os = "macos") {
@@ -53,7 +53,7 @@ fn source() -> Result<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
-fn executable(name: &str) -> String {
+pub(crate) fn executable(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
     } else {
@@ -62,7 +62,7 @@ fn executable(name: &str) -> String {
 }
 
 /// Where the executables are under an installed Link.
-fn executables_dir(install: &Path) -> PathBuf {
+pub(crate) fn executables_dir(install: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         install.join("Contents/MacOS")
     } else {
@@ -83,7 +83,7 @@ fn installed_version(destination: &Path) -> Option<String> {
 }
 
 /// "1.2.3" (anything after a "-" or "+" ignored) as numbers, for comparing.
-fn version_key(version: &str) -> Vec<u64> {
+pub(crate) fn version_key(version: &str) -> Vec<u64> {
     version
         .split(['-', '+'])
         .next()
