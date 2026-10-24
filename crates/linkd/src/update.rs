@@ -4,11 +4,15 @@
 //!
 //! Only a signed, installed Link updates itself, and only to a build signed by the same signer:
 //! - macOS: the release's signed archive (checked against SHA256SUMS), its app checked with
-//!   codesign (strict) and for this app's own Team ID, then installed with that build's
-//!   `rtx-linkd install` into this app's place and opened again (a detached helper: installing
-//!   stops this daemon).
-//! - Windows: the release's signed installer (SHA256SUMS, then Authenticode: valid and the same
-//!   signer as this rtx-linkd), started for the person to confirm (it asks for administrator).
+//!   codesign (strict) against a requirement that an Apple-issued Developer ID certificate with
+//!   this app's own Team ID signed it, and with spctl (notarized), then installed with that
+//!   build's `rtx-linkd install` into this app's place. A detached helper does it (installing
+//!   stops this daemon) and opens whatever is installed afterwards, so a failed install leaves
+//!   the old Link running again rather than none.
+//! - Windows: the release's signed installer (SHA256SUMS, then Authenticode: valid, chained to
+//!   the same Microsoft root, with the same subject and the same Trusted Signing profile EKU as
+//!   this rtx-linkd), started for the person to confirm (it asks for administrator). A detached
+//!   helper waits for it and starts the installed Link again if nothing runs it.
 //! - Linux: /opt needs root, so the window opens the release page (the .deb / .rpm are there).
 
 use std::path::Path;
@@ -290,6 +294,33 @@ fn parse_release(answer: &Value) -> Option<Release> {
     })
 }
 
+/// The codesign requirement the downloaded app must meet: Apple's anchor, a Developer ID
+/// intermediate (1.2.840.113635.100.6.2.6), a Developer ID Application leaf
+/// (1.2.840.113635.100.6.1.13) and this app's Team ID as the leaf's OU. A self-signed
+/// certificate can claim any OU; only Apple issues one under this anchor. None for a Team ID
+/// that isn't one (ten letters and digits), so nothing odd lands in the requirement.
+#[cfg(any(target_os = "macos", test))]
+fn codesign_requirement(team: &str) -> Option<String> {
+    let valid = team.len() == 10
+        && team
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    valid.then(|| {
+        format!(
+            "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
+             certificate leaf[field.1.2.840.113635.100.6.1.13] exists and \
+             certificate leaf[subject.OU] = \"{team}\""
+        )
+    })
+}
+
+/// What the macOS helper runs: install the new Link ($1 is its rtx-linkd, $2 the installed app),
+/// then open whatever is installed, whether that worked or not (`;`, not `&&`). The install
+/// stops the running Link only once it can replace it; either way one runs again.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_HELPER: &str =
+    r#""$1" install "$2"; /usr/bin/open -g -a "$2" --args --background"#;
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
@@ -326,20 +357,34 @@ mod platform {
             bail!("couldn't unpack {}", archive.display());
         }
         let app = dir.join("RealTimeX Link.app");
+        let requirement = codesign_requirement(&ours)
+            .ok_or_else(|| anyhow!("This RealTimeX Link's Team ID ({ours}) isn't one"))?;
         let verified = Command::new("/usr/bin/codesign")
-            .args(["--verify", "--deep", "--strict"])
+            .args(["--verify", "--deep", "--strict", "-R"])
+            .arg(format!("={requirement}"))
             .arg(&app)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
-        if !verified.success() || team_id(&app).as_deref() != Some(ours.as_str()) {
+        if !verified.success() {
             bail!("the downloaded RealTimeX Link isn't signed by the same developer");
         }
+        // Notarized too, as Gatekeeper would want it opened.
+        let notarized = Command::new("/usr/sbin/spctl")
+            .args(["--assess", "--type", "execute"])
+            .arg(&app)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !notarized.success() {
+            bail!("the downloaded RealTimeX Link isn't notarized");
+        }
         // Installing stops this daemon (and the window): a helper of its own installs and opens
-        // the new Link, in the background like at login.
+        // the installed Link, in the background like at login.
         let linkd = crate::install::executables_dir(&app).join("rtx-linkd");
-        let script = r#""$1" install "$2" && /usr/bin/open -g -a "$2" --args --background"#;
         detached(
             Command::new("/bin/sh")
-                .args(["-c", script, "update"])
+                .args(["-c", MACOS_HELPER, "update"])
                 .arg(&linkd)
                 .arg(&installed),
         )?;
@@ -364,42 +409,167 @@ mod platform {
     }
 }
 
+/// Windows: an Authenticode signature, as far as deciding "the same publisher" needs it.
+#[cfg(any(windows, test))]
+mod authenticode {
+    use std::path::Path;
+
+    use serde_json::Value;
+
+    /// Azure Trusted Signing puts an EKU of the signing profile under this arc on every leaf
+    /// certificate; it stays the same when the (short-lived) certificates are renewed, so it
+    /// names the publisher where a thumbprint can't.
+    const PROFILE_EKU: &str = "1.3.6.1.4.1.311.97.";
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub struct Signature {
+        pub valid: bool,
+        pub subject: String,
+        /// The chain's root certificate: thumbprint and subject.
+        pub root: String,
+        pub root_subject: String,
+        /// The leaf's EKUs under PROFILE_EKU.
+        pub profile: Vec<String>,
+    }
+
+    /// One JSON line: { status, subject, root, rootSubject, ekus } (ekus comma-separated). The
+    /// chain is built only to name its root (Status already says whether Windows trusts it); the
+    /// leaf is usually expired by now, its signature timestamped, so time isn't checked.
+    const SCRIPT: &str = r#"$s = Get-AuthenticodeSignature -LiteralPath '{path}'
+$c = $s.SignerCertificate
+$root = ''; $rootSubject = ''; $ekus = @()
+if ($c) {
+  $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+  $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+  $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::IgnoreNotTimeValid
+  [void]$chain.Build($c)
+  if ($chain.ChainElements.Count -gt 0) {
+    $top = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
+    $root = $top.Thumbprint; $rootSubject = $top.Subject
+  }
+  foreach ($e in $c.Extensions) {
+    if ($e.Oid.Value -eq '2.5.29.37') {
+      $u = [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($e, $false)
+      foreach ($o in $u.EnhancedKeyUsages) { $ekus += $o.Value }
+    }
+  }
+}
+[pscustomobject]@{ status = [string]$s.Status; subject = [string]$c.Subject; root = [string]$root; rootSubject = [string]$rootSubject; ekus = ($ekus -join ',') } | ConvertTo-Json -Compress"#;
+
+    pub fn script(path: &Path) -> String {
+        SCRIPT.replace("{path}", &path.display().to_string().replace('\'', "''"))
+    }
+
+    pub fn parse(text: &str) -> Option<Signature> {
+        let answer: Value = serde_json::from_str(text.trim()).ok()?;
+        let field = |name: &str| {
+            answer
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        Some(Signature {
+            valid: field("status") == "Valid",
+            subject: field("subject"),
+            root: field("root"),
+            root_subject: field("rootSubject"),
+            profile: field("ekus")
+                .split(',')
+                .map(str::trim)
+                .filter(|eku| eku.starts_with(PROFILE_EKU))
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+
+    /// Whether this rtx-linkd's own signature can vouch for others: valid, Trusted Signing.
+    pub fn usable(ours: &Signature) -> bool {
+        ours.valid && !ours.subject.is_empty() && !ours.root.is_empty() && !ours.profile.is_empty()
+    }
+
+    /// The downloaded file is signed as this rtx-linkd is: valid, chained to the same Microsoft
+    /// root, the same subject and every profile EKU this one carries.
+    pub fn same_publisher(ours: &Signature, theirs: &Signature) -> bool {
+        usable(ours)
+            && theirs.valid
+            && theirs.root.eq_ignore_ascii_case(&ours.root)
+            && theirs.root_subject.contains("O=Microsoft Corporation")
+            && theirs.subject == ours.subject
+            && ours.profile.iter().all(|eku| theirs.profile.contains(eku))
+    }
+
+    /// What the Windows helper runs: start the installer (it asks for administrator) and wait
+    /// for it, then start the installed Link in the background unless it already runs (the
+    /// installer's "Open" may have started it). Cancelled or failed, the Link stopped for it
+    /// comes back all the same.
+    pub fn helper_script(setup: &Path, app: &Path) -> String {
+        let quote = |path: &Path| path.display().to_string().replace('\'', "''");
+        format!(
+            "try {{ Start-Process -FilePath '{setup}' -Wait -ErrorAction Stop }} catch {{ }}; \
+             if (-not (Get-Process -Name 'rtx-link' -ErrorAction SilentlyContinue | \
+             Where-Object {{ $_.Path -eq '{app}' }})) {{ \
+             Start-Process -FilePath '{app}' -ArgumentList '--background' }}",
+            setup = quote(setup),
+            app = quote(app),
+        )
+    }
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
+    use super::authenticode::{self, Signature};
 
-    /// "Valid|<signer subject>" for a file's Authenticode signature.
-    fn signature(path: &Path) -> Option<(bool, String)> {
-        let script = format!(
-            "$s = Get-AuthenticodeSignature -LiteralPath '{}'; \"$($s.Status)|$($s.SignerCertificate.Subject)\"",
-            path.display().to_string().replace('\'', "''")
-        );
+    fn signature(path: &Path) -> Option<Signature> {
+        use std::os::windows::process::CommandExt;
         let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &authenticode::script(path),
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            // CREATE_NO_WINDOW: no console flashing up.
+            .creation_flags(0x0800_0000)
             .output()
             .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let (status, subject) = text.split_once('|')?;
-        Some((status == "Valid", subject.to_string()))
+        authenticode::parse(&String::from_utf8_lossy(&output.stdout))
     }
 
     pub fn start(_dir: &Path, setup: &Path) -> Result<Value> {
-        let ours = std::env::current_exe()?;
-        let (valid, signer) = signature(&ours).unwrap_or((false, String::new()));
-        if !valid || signer.is_empty() {
+        let ours = signature(&std::env::current_exe()?).unwrap_or_default();
+        if !authenticode::usable(&ours) {
             bail!("This RealTimeX Link isn't signed, so it can't update itself");
         }
-        match signature(setup) {
-            Some((true, subject)) if subject == signer => {}
-            _ => bail!("the downloaded installer isn't signed by the same publisher"),
+        let theirs = signature(setup).unwrap_or_default();
+        if !authenticode::same_publisher(&ours, &theirs) {
+            bail!("the downloaded installer isn't signed by the same publisher");
         }
-        // The installer asks for administrator and stops this Link itself.
-        Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(setup)
+        // The installer asks for administrator and stops this Link itself; it installs where
+        // RealTimeX looks for Link, and the helper starts that one again afterwards.
+        let installed = crate::paths::install_dirs_for(
+            "windows",
+            &|name| std::env::var(name).ok(),
+            &crate::paths::home_dir(),
+        );
+        let app = Path::new(&installed[0]).join("rtx-link.exe");
+        use std::os::windows::process::CommandExt;
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &authenticode::helper_script(setup, &app),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW: outlives this daemon, which the
+            // installer stops, without a console window.
+            .creation_flags(0x0000_0200 | 0x0800_0000)
             .spawn()?;
         Ok(json!({ "started": true }))
     }
@@ -431,6 +601,98 @@ mod tests {
         assert!(!newer("0.0.1"));
         assert_eq!(release.assets[0].0, "SHA256SUMS");
         assert!(parse_release(&json!({ "message": "Not Found" })).is_none());
+    }
+
+    #[test]
+    fn the_macos_requirement_pins_apple_and_the_team() {
+        let requirement = codesign_requirement("ABCDE12345").unwrap();
+        assert!(requirement.starts_with("anchor apple generic and "));
+        assert!(requirement.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists"));
+        assert!(requirement.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] exists"));
+        assert!(requirement.ends_with("certificate leaf[subject.OU] = \"ABCDE12345\""));
+        assert!(!requirement.contains('\n'));
+        for team in ["", "not set", "abcde12345", "ABCDE1234", "ABCDE\"1234", "ABCDE 1234"] {
+            assert!(codesign_requirement(team).is_none(), "{team}");
+        }
+    }
+
+    #[test]
+    fn the_macos_helper_opens_link_even_when_installing_fails() {
+        assert!(MACOS_HELPER.contains(r#""$1" install "$2"; /usr/bin/open"#));
+        assert!(!MACOS_HELPER.contains("&&"));
+    }
+
+    fn signed(subject: &str, root: &str, ekus: &str) -> authenticode::Signature {
+        authenticode::parse(
+            &json!({
+                "status": "Valid",
+                "subject": subject,
+                "root": root,
+                "rootSubject": "CN=Microsoft Identity Verification Root Certificate Authority 2020, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+                "ekus": ekus,
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn windows_publishers_match_by_root_subject_and_profile() {
+        let profile = "1.3.6.1.5.5.7.3.3,1.3.6.1.4.1.311.97.1.0,1.3.6.1.4.1.311.97.123.456";
+        let ours = signed("CN=RealTimeX, O=RealTimeX", "AB12", profile);
+        assert!(authenticode::usable(&ours));
+        assert_eq!(
+            ours.profile,
+            ["1.3.6.1.4.1.311.97.1.0", "1.3.6.1.4.1.311.97.123.456"]
+        );
+        // A renewed leaf (another thumbprint, same profile) is the same publisher.
+        assert!(authenticode::same_publisher(
+            &ours,
+            &signed("CN=RealTimeX, O=RealTimeX", "ab12", profile)
+        ));
+        // Same subject, another profile: someone else's Trusted Signing account.
+        assert!(!authenticode::same_publisher(
+            &ours,
+            &signed(
+                "CN=RealTimeX, O=RealTimeX",
+                "AB12",
+                "1.3.6.1.5.5.7.3.3,1.3.6.1.4.1.311.97.1.0,1.3.6.1.4.1.311.97.999.1"
+            )
+        ));
+        // Same subject under another root: any CA can write a subject.
+        assert!(!authenticode::same_publisher(
+            &ours,
+            &signed("CN=RealTimeX, O=RealTimeX", "CD34", profile)
+        ));
+        assert!(!authenticode::same_publisher(
+            &ours,
+            &signed("CN=Someone, O=Else", "AB12", profile)
+        ));
+        let mut invalid = signed("CN=RealTimeX, O=RealTimeX", "AB12", profile);
+        invalid.valid = false;
+        assert!(!authenticode::same_publisher(&ours, &invalid));
+        // Without a profile of its own, this Link can't vouch for anything.
+        let plain = signed("CN=RealTimeX, O=RealTimeX", "AB12", "1.3.6.1.5.5.7.3.3");
+        assert!(!authenticode::usable(&plain));
+        assert!(!authenticode::same_publisher(&plain, &plain));
+        assert!(authenticode::parse("not json").is_none());
+    }
+
+    #[test]
+    fn windows_scripts_quote_paths() {
+        let script = authenticode::script(Path::new(r"C:\Temp\it's\setup.exe"));
+        assert!(script.starts_with(r"$s = Get-AuthenticodeSignature -LiteralPath 'C:\Temp\it''s\setup.exe'"));
+        assert!(!script.contains("{path}"));
+        let helper = authenticode::helper_script(
+            Path::new(r"C:\Temp\setup.exe"),
+            Path::new(r"C:\Program Files\RealTimeX Link\rtx-link.exe"),
+        );
+        assert!(helper.starts_with(
+            r"try { Start-Process -FilePath 'C:\Temp\setup.exe' -Wait -ErrorAction Stop } catch { };"
+        ));
+        assert!(helper.contains(
+            r"Start-Process -FilePath 'C:\Program Files\RealTimeX Link\rtx-link.exe' -ArgumentList '--background'"
+        ));
     }
 
     #[test]
