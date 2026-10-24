@@ -48,3 +48,19 @@ pub fn name_process() {
         NSProcessInfo::processInfo().setProcessName(&NSString::from_str("RealTimeX Link"));
     }
 }
+
+/// macOS: whether "Double-click a window's title bar to" is Minimize (the header's double-click,
+/// app.rs). Zoom, the default, and "Do Nothing" leave the window as it is.
+pub fn double_click_minimizes() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let answer = std::process::Command::new("/usr/bin/defaults")
+            .args(["read", "-g", "AppleActionOnDoubleClick"])
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(answer) = answer {
+            return String::from_utf8_lossy(&answer.stdout).trim() == "Minimize";
+        }
+    }
+    false
+}

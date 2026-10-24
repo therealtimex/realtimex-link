@@ -1,6 +1,6 @@
 //! RealTimeX's look in the window: its typeface (Plus Jakarta Sans) and its theme tokens
 //! (realtimex-ai-app frontend/src/index.css, `--theme-*`), for both the dark and the light theme.
-//! The window follows the system's theme, as eframe does by default.
+//! The window follows RealTimeX's theme when RealTimeX set one (app.rs), else the system's.
 
 use std::sync::Arc;
 
@@ -29,8 +29,11 @@ struct Tokens {
     border: Color32,
     /// --theme-sidebar-item-hover: a plain button under the pointer.
     hover: Color32,
-    /// The links' colour.
+    /// The links' colour, also the keyboard focus ring (RealTimeX's focus-visible outline).
     link: Color32,
+    /// A selected tab or option: --theme-status-info-surface with its -border.
+    selected_fill: Color32,
+    selected_border: Color32,
 }
 
 const DARK: Tokens = Tokens {
@@ -44,6 +47,8 @@ const DARK: Tokens = Tokens {
     hover: Color32::from_rgb(0x3f, 0x3f, 0x42),
     // --theme-button-primary.
     link: PRIMARY,
+    selected_fill: Color32::from_rgb(0x1b, 0x2d, 0x35),
+    selected_border: Color32::from_rgb(0x4a, 0x7d, 0x95),
 };
 
 const LIGHT: Tokens = Tokens {
@@ -51,12 +56,27 @@ const LIGHT: Tokens = Tokens {
     bg_secondary: Color32::WHITE,
     input_bg: Color32::from_rgb(0xf9, 0xf9, 0xf9),
     text: Color32::from_rgb(0x0e, 0x0f, 0x0f),
-    text_secondary: Color32::from_rgb(0x7a, 0x7d, 0x7e),
+    // --theme-home-text-secondary: --theme-text-secondary (#7a7d7e) is below 4.5:1 for captions.
+    text_secondary: Color32::from_rgb(0x6f, 0x6f, 0x71),
     border: Color32::from_rgb(0xd3, 0xd3, 0xd3),
     hover: Color32::from_rgb(0xe0, 0xef, 0xf4),
     // --theme-status-info-fg: --theme-button-primary is too faint for text on white.
     link: Color32::from_rgb(0x07, 0x6e, 0x9e),
+    selected_fill: Color32::from_rgb(0xd9, 0xf0, 0xfb),
+    selected_border: Color32::from_rgb(0x3b, 0x8e, 0xb5),
 };
+
+fn tokens(ui: &egui::Ui) -> &'static Tokens {
+    if ui.visuals().dark_mode {
+        &DARK
+    } else {
+        &LIGHT
+    }
+}
+
+/// The keyboard focus ring (and a pressed control's border): 2 px, at least 3:1 against what is
+/// next to it in both themes.
+const FOCUS_WIDTH: f32 = 2.0;
 
 /// --theme-button-primary, with --theme-button-primary-text on it.
 pub const PRIMARY: Color32 = Color32::from_rgb(0x36, 0xbf, 0xfa);
@@ -110,8 +130,10 @@ fn visuals(visuals: &mut egui::Visuals, tokens: &Tokens) {
     visuals.faint_bg_color = tokens.bg_secondary;
     visuals.hyperlink_color = tokens.link;
     visuals.weak_text_color = Some(tokens.text_secondary);
-    visuals.selection.bg_fill = PRIMARY;
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    // A selected tab or option is tinted (selectable_value() adds its border and semibold
+    // text); a focused text field is outlined with selection.stroke, the focus ring.
+    visuals.selection.bg_fill = tokens.selected_fill;
+    visuals.selection.stroke = Stroke::new(FOCUS_WIDTH, tokens.link);
     let widgets = &mut visuals.widgets;
     widgets.noninteractive.bg_fill = tokens.bg_primary;
     widgets.noninteractive.weak_bg_fill = tokens.bg_primary;
@@ -130,6 +152,8 @@ fn visuals(visuals: &mut egui::Visuals, tokens: &Tokens) {
         state.fg_stroke = Stroke::new(1.0, tokens.text);
         state.expansion = 0.0;
     }
+    // Focused (and pressed): egui draws a control in its active state.
+    widgets.active.bg_stroke = Stroke::new(FOCUS_WIDTH, tokens.link);
     // Text fields and the switch's track.
     widgets.inactive.bg_fill = tokens.input_bg;
     for state in [
@@ -150,6 +174,7 @@ pub fn semibold(text: impl Into<String>) -> RichText {
 
 /// RealTimeX's primary button: white semibold text on --theme-button-primary.
 pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let ring = tokens(ui).text;
     // Through the widget visuals rather than Button::fill, which would also be the hover fill.
     ui.scope(|ui| {
         let widgets = &mut ui.visuals_mut().widgets;
@@ -162,12 +187,74 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             state.bg_stroke = Stroke::NONE;
             state.fg_stroke = Stroke::new(1.0, Color32::WHITE);
         }
+        // Focused: a ring in the text colour (blue on blue would not show).
+        widgets.active.bg_stroke = Stroke::new(FOCUS_WIDTH, ring);
         ui.add(
             egui::Button::new(semibold(text).color(Color32::WHITE))
                 .min_size(egui::vec2(0.0, PRIMARY_HEIGHT)),
         )
     })
     .inner
+}
+
+/// A tab or an option: when selected, tinted with a border and semibold text in the text colour
+/// (egui's own selected text would be the focus colour).
+pub fn selectable_value<V: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut V,
+    value: V,
+    text: &str,
+) -> egui::Response {
+    let selected = *current == value;
+    let tokens = tokens(ui);
+    let mut response = ui
+        .scope(|ui| {
+            if selected {
+                let widgets = &mut ui.visuals_mut().widgets;
+                widgets.inactive.bg_stroke = Stroke::new(1.0, tokens.selected_border);
+                widgets.hovered.bg_stroke = Stroke::new(1.0, tokens.selected_border);
+            }
+            let label = if selected {
+                semibold(text).color(tokens.text)
+            } else {
+                RichText::new(text)
+            };
+            ui.add(egui::Button::selectable(selected, label))
+        })
+        .inner;
+    if response.clicked() && !selected {
+        *current = value;
+        response.mark_changed();
+    }
+    response
+}
+
+/// The on/off switch, as RealTimeX draws it: a --theme-button-primary track with a white knob when
+/// on, a bordered field-coloured one when off, and the focus ring around it.
+pub fn paint_switch(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, t: f32, on: bool) {
+    let tokens = tokens(ui);
+    let radius = 0.5 * rect.height();
+    let (track, border, knob) = if on {
+        (PRIMARY, Stroke::NONE, Color32::WHITE)
+    } else {
+        (
+            tokens.input_bg,
+            Stroke::new(1.0, tokens.border),
+            tokens.text_secondary,
+        )
+    };
+    let painter = ui.painter();
+    painter.rect(rect, radius, track, border, egui::StrokeKind::Inside);
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.expand(FOCUS_WIDTH + 1.0),
+            radius + FOCUS_WIDTH + 1.0,
+            Stroke::new(FOCUS_WIDTH, tokens.link),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
+    painter.circle_filled(egui::pos2(x, rect.center().y), 0.75 * radius, knob);
 }
 
 /// A card: --theme-bg-secondary with a --theme-modal-border border.

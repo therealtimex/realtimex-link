@@ -373,7 +373,7 @@ fn caption(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(RichText::new(text.into()).small().weak());
 }
 
-/// The switch from egui's demo: a pill with a knob.
+/// The switch: a pill with a knob (theme.rs paints it).
 fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let size = egui::vec2(2.2, 1.2) * ui.spacing().interact_size.y;
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -391,22 +391,7 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
-        let visuals = ui.style().interact_selectable(&response, *on);
-        let radius = 0.5 * rect.height();
-        ui.painter().rect(
-            rect,
-            radius,
-            visuals.bg_fill,
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
-        ui.painter().circle(
-            egui::pos2(x, rect.center().y),
-            0.75 * radius,
-            visuals.fg_stroke.color,
-            visuals.fg_stroke,
-        );
+        theme::paint_switch(ui, &response, rect, t, *on);
     }
     response
 }
@@ -484,20 +469,9 @@ impl eframe::App for LinkApp {
         ctx.request_repaint_after(Duration::from_millis(500));
 
         egui::Panel::top("header").show(ui, |ui| {
-            // macOS: the title bar is hidden (main.rs) and its buttons sit over this space, which
-            // moves the window as the title bar would.
+            // macOS: the title bar is hidden (main.rs) and its buttons sit over this space.
             if cfg!(target_os = "macos") {
-                let (_, drag) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), TRAFFIC_LIGHTS),
-                    egui::Sense::click_and_drag(),
-                );
-                if drag.drag_started() {
-                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-                }
-                if drag.double_clicked() {
-                    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-                }
+                ui.add_space(TRAFFIC_LIGHTS);
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -514,6 +488,22 @@ impl eframe::App for LinkApp {
                 });
             });
             ui.add_space(8.0);
+            // macOS: the whole header (it has no controls) moves the window, as the title bar
+            // would. A double-click minimizes when the system says so ("Double-click a window's
+            // title bar to"); zooming would fight the height that follows the content.
+            if cfg!(target_os = "macos") {
+                let header = ui.interact(
+                    ui.min_rect(),
+                    ui.scope_id().with("move"),
+                    egui::Sense::click_and_drag(),
+                );
+                if header.drag_started() {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                if header.double_clicked() && crate::dock::double_click_minimizes() {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                }
+            }
         });
 
         egui::Panel::bottom("footer").show(ui, |ui| {
@@ -580,15 +570,21 @@ impl eframe::App for LinkApp {
                     self.requests_ui(ui, ctx, &requests);
                     self.session_ui(ui, overview);
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.tab, Tab::ThisComputer, "This computer");
+                        theme::selectable_value(
+                            ui,
+                            &mut self.tab,
+                            Tab::ThisComputer,
+                            "This computer",
+                        );
                         let count = overview
                             .get("clients")
                             .and_then(Value::as_array)
                             .map_or(0, Vec::len);
-                        ui.selectable_value(
+                        theme::selectable_value(
+                            ui,
                             &mut self.tab,
                             Tab::Computers,
-                            format!("Computers · {count}"),
+                            &format!("Computers · {count}"),
                         );
                     });
                     ui.separator();
@@ -1071,7 +1067,7 @@ impl LinkApp {
                 .selected_text(current)
                 .show_ui(ui, |ui| {
                     for (id, label, help) in policies {
-                        ui.selectable_value(&mut chosen, id.to_string(), label)
+                        theme::selectable_value(ui, &mut chosen, id.to_string(), label)
                             .on_hover_text(help);
                     }
                 });
@@ -1091,11 +1087,10 @@ impl LinkApp {
                 .width(ui.available_width())
                 .selected_text(if control { "Full access" } else { "View only" })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut access, true, "Full access")
-                        .on_hover_text(
-                            "See the screen, use the mouse, keyboard, clipboard and files",
-                        );
-                    ui.selectable_value(&mut access, false, "View only")
+                    theme::selectable_value(ui, &mut access, true, "Full access").on_hover_text(
+                        "See the screen, use the mouse, keyboard, clipboard and files",
+                    );
+                    theme::selectable_value(ui, &mut access, false, "View only")
                         .on_hover_text("See the screen only");
                 });
             if access != control {
@@ -1160,8 +1155,8 @@ impl LinkApp {
                         .width(ui.available_width())
                         .selected_text(if control { "Full access" } else { "View only" })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut access, true, "Full access");
-                            ui.selectable_value(&mut access, false, "View only");
+                            theme::selectable_value(ui, &mut access, true, "Full access");
+                            theme::selectable_value(ui, &mut access, false, "View only");
                         });
                 });
                 if access != control {
