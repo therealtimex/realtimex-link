@@ -1,0 +1,44 @@
+# RealTimeX Link's pipeline. Code lives here; GitHub (github.com/therealtimex/realtimex-link, a
+# public push mirror of this repository) has the build machines, and realtimex-ai-app holds the
+# signing credentials. So:
+#
+# - build: every push builds on GitHub Actions (ci/github_build.py starts the run for this
+#   commit and waits for it); a vX.Y.Z tag builds every platform into a draft release.
+# - sign: on a vX.Y.Z tag, realtimex-ai-app's Link release pipeline (LINK_VERSION) signs and
+#   notarizes the macOS and Windows builds, makes the .dmg and the Windows installer, and
+#   publishes the release. LINK_SIGN_BRANCH picks the realtimex-ai-app branch it runs from.
+#
+# Needs GITHUB_LINK_TOKEN (Settings → CI/CD → Variables, masked): a GitHub token for the mirror
+# with Actions read/write. The push mirror (Settings → Repository) needs one with Contents write.
+
+stages:
+  - build
+  - sign
+
+variables:
+  LINK_SIGN_BRANCH: realtimex-dev
+  LINK_CI_RUNNER_TAG: office-linux-80
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+    - if: '$CI_COMMIT_BRANCH'
+
+build:
+  stage: build
+  tags:
+    - $LINK_CI_RUNNER_TAG
+  timeout: 3h
+  script:
+    - python3 ci/github_build.py
+
+sign:
+  stage: sign
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+  variables:
+    LINK_VERSION: $CI_COMMIT_TAG
+  trigger:
+    project: rtlab/rtwebteam/realtimex-ai-app
+    branch: $LINK_SIGN_BRANCH
+    strategy: depend

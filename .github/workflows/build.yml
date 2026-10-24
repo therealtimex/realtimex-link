@@ -1,7 +1,8 @@
-# Build RealTimeX Link for every platform RealTimeX ships for. Started by hand (Actions → Build →
-# Run workflow) or by a version tag (v0.1.0): a tag also opens a draft release with the unsigned
-# builds and their SHA-256 sums, which RealTimeX's signing job (Windows: Azure Trusted Signing,
-# macOS: Developer ID and notarization) downloads, checks, signs and uploads again.
+# Build RealTimeX Link for every platform RealTimeX ships for. This repository is a mirror; Link's
+# GitLab pipeline (.gitlab-ci.yml, ci/github_build.py) starts this for each push and waits for it.
+# On a version tag (v0.1.0) it also opens a draft release with the unsigned builds, the Linux
+# packages and their SHA-256 sums, which RealTimeX's GitLab then signs (Windows: Azure Trusted
+# Signing, macOS: Developer ID and notarization) and publishes.
 name: Build
 
 on:
@@ -12,10 +13,6 @@ on:
         type: choice
         options: [test, all]
         default: test
-  push:
-    tags: ["v*"]
-    # Work in progress builds here, not on a developer's machine.
-    branches-ignore: [main]
 
 permissions:
   contents: write
