@@ -20,7 +20,9 @@ stages:
   - publish
 
 variables:
-  LINK_CI_RUNNER_TAG: office-linux-80
+  # The build job only waits on GitHub: the shared pool that runs several jobs at once, not a
+  # release build runner (which runs one, and builds RealTimeX releases).
+  LINK_CI_RUNNER_TAG: check-mr-realtimex-ai
 
 workflow:
   rules:
