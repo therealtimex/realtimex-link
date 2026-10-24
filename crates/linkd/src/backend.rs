@@ -2,6 +2,10 @@
 //! (crates/control/src/control.rs). The session
 //! starts on first use and stops after IDLE_STOP_MS without requests, which also removes GNOME's
 //! screen-sharing indicator. Lines without an id are events (peer_state, peer_message).
+//!
+//! A helper that exits (it crashed, or its screen capture stalled for good: see
+//! CONTROL_EXIT_CAPTURE_STALLED) fails the requests it had not answered, and the next request
+//! starts a new one.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,6 +30,12 @@ const IN_USE_WINDOW: Duration = Duration::from_secs(60);
 const BOOKKEEPING_OPS: [&str; 2] = ["peer_close", "peer_send"];
 /// The JSON-lines protocol this daemon speaks with rtx-control.
 pub const CONTROL_PROTOCOL: u64 = 1;
+/// rtx-control's exit code when a ScreenCaptureKit request it gave up on never answered, which
+/// leaves its screenshots and live view refused until it ends (crates/control/src/main.rs,
+/// EXIT_CAPTURE_STALLED). Nothing to do but start a new one, which the next request does.
+const CONTROL_EXIT_CAPTURE_STALLED: i32 = 75;
+/// How long an exited helper (its stdout closed) may take to be reaped before it is killed.
+const EXIT_REAP: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct Detected {
@@ -501,17 +511,22 @@ impl Backend {
         let _ = reply.send(result);
     }
 
+    /// The helper's stdout closed: it is gone. Its unanswered requests fail; with `running`
+    /// empty, the next request starts a new helper.
     fn on_exit(&self, generation: u64) {
-        let peers: Vec<u64> = {
+        let (exited, peers): (Option<Running>, Vec<u64>) = {
             let mut inner = self.inner();
             if inner.running.as_ref().map(|r| r.generation) != Some(generation) {
                 return;
             }
-            inner.running = None;
+            let exited = inner.running.take();
             inner.started = false;
             inner.idle_deadline = None;
-            inner.open_peers.iter().copied().collect()
+            (exited, inner.open_peers.iter().copied().collect())
         };
+        if let Some(exited) = exited {
+            tokio::spawn(report_exit(exited.child));
+        }
         let stderr = self.inner().last_stderr.clone();
         let message = format!(
             "Remote Control helper exited{}",
@@ -753,9 +768,90 @@ impl Backend {
     }
 }
 
+/// Reap a helper whose stdout closed, and say so when it exited because its screen capture
+/// stalled (the log otherwise shows only that it exited).
+async fn report_exit(mut child: Child) {
+    let waited = tokio::time::timeout(EXIT_REAP, child.wait()).await;
+    let status = match waited {
+        Ok(status) => status,
+        // It closed stdout but keeps running: it is no use any more.
+        Err(_) => {
+            let _ = child.start_kill();
+            child.wait().await
+        }
+    };
+    if let Ok(status) = status {
+        if status.code() == Some(CONTROL_EXIT_CAPTURE_STALLED) {
+            eprintln!(
+                "[remote-control] helper exited: its screen capture stalled; the next request starts a new one"
+            );
+        }
+    }
+}
+
 fn session_closed(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("session is not started")
         || lower.contains("session closed")
         || lower.contains("session is closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for rtx-control: answers every request, and exits with rtx-control's stall
+    /// code on op "stall". Each start is counted in `spawns` next to it.
+    #[cfg(unix)]
+    fn fake_helper(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("rtx-control");
+        let spawns = dir.join("spawns");
+        let script = format!(
+            r#"#!/bin/sh
+echo started >> '{spawns}'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"op":"stall"'*) exit {code} ;;
+  esac
+  printf '{{"id":%s,"ok":true}}\n' "$id"
+done
+"#,
+            spawns = spawns.display(),
+            code = CONTROL_EXIT_CAPTURE_STALLED,
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_exits_is_started_again_by_the_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Backend::with_detected(Detected {
+            binary: Some(fake_helper(dir.path())),
+            reason: None,
+            code: None,
+        });
+        backend.call("screenshot", json!({})).await.unwrap();
+        assert!(backend.started());
+
+        // The helper exits while answering (as rtx-control does when its capture stalls): that
+        // request fails at once, not after the request timeout, and the session is over.
+        let at = Instant::now();
+        let error = backend.call("stall", json!({})).await.unwrap_err();
+        assert_eq!(error.status, 502, "{}", error.message);
+        assert!(error.message.contains("exited"), "{}", error.message);
+        assert!(at.elapsed() < REQUEST_TIMEOUT);
+        assert!(!backend.started());
+
+        // The next request starts a new helper and is answered by it; so is the one after.
+        backend.call("screenshot", json!({})).await.unwrap();
+        backend.call("screenshot", json!({})).await.unwrap();
+        assert!(backend.started());
+        let spawns = std::fs::read_to_string(dir.path().join("spawns")).unwrap();
+        assert_eq!(spawns.lines().count(), 2, "{spawns}");
+    }
 }

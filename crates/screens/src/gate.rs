@@ -18,6 +18,10 @@
 //! nothing; one that finds it held by a request still within its budget waits for it, so normal
 //! concurrent use (Remote Control's screenshot and live view) is never refused.
 //!
+//! A request that never answers (a lost callback) holds the permit for the life of the process.
+//! [`Gate::stalled`] reports one held long past its budget, so a long-lived process can end and
+//! be started again rather than refuse every request from then on.
+//!
 //! Platform-independent, so the lifecycle is tested everywhere with a fake native call. The gate
 //! covers the requests made through this package (listing and still images), not continuous
 //! stream frames, and only this process: other processes still compete in the OS.
@@ -273,9 +277,16 @@ impl Gate {
         }
     }
 
-    /// The budget ran out: the request is abandoned, unless it was answered meanwhile (its answer
-    /// is then in `rx`, sent before the release).
+    /// The budget ran out: the request is abandoned, unless it was answered meanwhile.
+    ///
+    /// The answer is sent before the permit is released, so it can already be in `rx` while the
+    /// request still holds the permit: it is looked for first, and an answer that arrived is
+    /// returned rather than thrown away as a timeout (and counted late). If the request is no
+    /// longer outstanding when it is abandoned, its answer arrived in between.
     fn expire<T>(&self, id: u64, op: &'static str, rx: &mpsc::Receiver<T>) -> anyhow::Result<T> {
+        if let Ok(value) = rx.try_recv() {
+            return Ok(value);
+        }
         if self.abandon(id, op, true) {
             return Err(TimedOut {
                 what: op.to_string(),
@@ -328,6 +339,20 @@ impl Gate {
             .current
             .as_ref()
             .map(|r| (r.op, r.submitted.elapsed()))
+    }
+
+    /// The request holding the permit if its caller gave up on it and it has been outstanding
+    /// for longer than `after`, and how long it has been outstanding.
+    ///
+    /// Nothing cancels a native request, so such a request may never answer (a lost
+    /// ScreenCaptureKit callback), and every later request in this process is then refused as
+    /// [`Busy`]. Only the process ending frees the permit; the caller decides when to do that.
+    /// A request still within its budget is never reported, however long `after` is.
+    pub fn stalled(&self, after: Duration) -> Option<(&'static str, Duration)> {
+        let s = self.lock();
+        let r = s.current.as_ref().filter(|r| r.abandoned)?;
+        let held = r.submitted.elapsed();
+        (held > after).then_some((r.op, held))
     }
 
     /// Counts per operation since the start.
@@ -482,6 +507,63 @@ mod tests {
         assert!(g.outstanding().is_none());
         let s = g.stats()[0].1;
         assert_eq!((s.completed, s.timed_out, s.late), (2, 1, 1));
+    }
+
+    #[test]
+    fn an_answer_sent_before_the_deadline_is_returned_even_while_it_holds_the_permit() {
+        // The completion has sent its answer but not yet released the permit (it is between the
+        // two) when the caller's budget runs out: the answer counts, nothing is abandoned.
+        let g = gate(1000);
+        let native = Native::default();
+        let (id, rx) = g.begin("capture", None, native.submit()).unwrap();
+        let done = native.pending.lock().unwrap().remove(0);
+        let tx = done.tx.lock().unwrap().take().unwrap();
+        tx.send(Ok(9)).unwrap();
+        assert_eq!(g.expire(id, "capture", &rx).unwrap(), Ok(9));
+        let s = g.stats()[0].1;
+        assert_eq!((s.timed_out, s.late), (0, 0), "not counted as a timeout");
+        // The release that follows the send frees the permit as usual.
+        g.release(id);
+        drop(done);
+        assert!(g.outstanding().is_none());
+        assert!(g.stalled(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn only_an_abandoned_request_held_past_the_limit_is_stalled() {
+        let g = gate(30);
+        let native = Native::default();
+
+        // Within its budget: outstanding, not stalled, however short the limit.
+        let (id, rx) = g.begin("capture", None, native.submit()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(g.stalled(Duration::ZERO).is_none());
+
+        // Abandoned, but not held for longer than the limit yet.
+        assert!(g.expire(id, "capture", &rx).is_err());
+        assert!(g.stalled(Duration::from_secs(60)).is_none());
+
+        // Held past the limit: reported with its operation and age.
+        std::thread::sleep(Duration::from_millis(60));
+        let (op, held) = g.stalled(Duration::from_millis(50)).expect("stalled");
+        assert_eq!(op, "capture");
+        assert!(held > Duration::from_millis(50), "{held:?}");
+
+        // The late answer frees the permit: nothing is stalled any more.
+        native.answer(Ok(1));
+        assert!(g.stalled(Duration::ZERO).is_none());
+        assert_eq!(g.run("list", None, answered(2)).unwrap(), Ok(2));
+    }
+
+    #[test]
+    fn a_cancelled_request_that_never_answers_is_stalled_too() {
+        let g = gate(5000);
+        let native = Native::default();
+        let stop = AtomicBool::new(true);
+        let e = g.run("capture", Some(&stop), native.submit()).unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e}");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(g.stalled(Duration::from_millis(10)).is_some());
     }
 
     #[test]

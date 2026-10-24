@@ -20,6 +20,10 @@ use clap::Parser;
 /// The JSON-lines protocol `control.rs` speaks. The host checks it before spawning, so an
 /// executable from another release says "incompatible" instead of misreading requests.
 const PROTOCOL: u32 = 1;
+/// The exit code when screen capture stalled for good ([`control::CaptureStalled`]). rtx-linkd
+/// knows it (`CONTROL_EXIT_CAPTURE_STALLED` in its backend.rs) and starts a new rtx-control with
+/// the next request. 75 is EX_TEMPFAIL: try again later.
+const EXIT_CAPTURE_STALLED: i32 = 75;
 
 #[derive(Parser)]
 #[command(
@@ -42,7 +46,12 @@ fn main() {
     }
     if let Err(e) = control::run() {
         eprintln!("error: {e:#}");
-        std::process::exit(1);
+        let code = if e.is::<control::CaptureStalled>() {
+            EXIT_CAPTURE_STALLED
+        } else {
+            1
+        };
+        std::process::exit(code);
     }
 }
 

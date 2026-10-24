@@ -39,6 +39,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
 use std::sync::mpsc::{self, Sender};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -48,6 +49,32 @@ use crate::platform::{self, Button, Input};
 
 /// Screenshots are at most this wide unless the request asks otherwise.
 const DEFAULT_MAX_WIDTH: u32 = 1920;
+/// How often the stall watch looks for a capture request that will never answer.
+const STALL_CHECK: Duration = Duration::from_secs(5);
+
+/// A screenshot or window list request this process gave up on never answered (a lost
+/// ScreenCaptureKit callback), so every later screenshot and the live view are refused until
+/// the process ends. `run` ends with it, and `main` exits with its own code so rtx-linkd knows
+/// why; rtx-linkd starts a new rtx-control with the next request. Without this, the 5-minute
+/// idle stop never comes while a viewer keeps retrying, and Remote Control stays blank.
+#[derive(Debug)]
+pub struct CaptureStalled {
+    op: &'static str,
+    held: Duration,
+}
+
+impl std::fmt::Display for CaptureStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "screen capture stalled: a {} request has not answered for {:.0} s; exiting so a new rtx-control can capture again",
+            self.op,
+            self.held.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for CaptureStalled {}
 
 struct Controller {
     input: Option<Input>,
@@ -68,11 +95,13 @@ struct Controller {
     window_server: bool,
 }
 
-/// What the control loop waits for: a request line, stdin closing, or a peer session.
+/// What the control loop waits for: a request line, stdin closing, a peer session, or the
+/// stall watch.
 enum Msg {
     Line(String),
     Eof,
     Peer(ToMain),
+    Stalled(CaptureStalled),
 }
 
 impl Controller {
@@ -457,6 +486,17 @@ pub fn run() -> Result<()> {
         &mut out,
         &json!({ "id": null, "ok": true, "ready": true, "backend": platform::PLATFORM }),
     );
+    // Only macOS captures through the one-request gate a lost callback can hold for good.
+    if cfg!(target_os = "macos") {
+        let watch = to_main.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(STALL_CHECK);
+            if let Some((op, held)) = rtx_screens::stalled_request() {
+                let _ = watch.send(Msg::Stalled(CaptureStalled { op, held }));
+                return;
+            }
+        });
+    }
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -470,6 +510,13 @@ pub fn run() -> Result<()> {
         let line = match message {
             Msg::Line(line) => line,
             Msg::Eof => break,
+            Msg::Stalled(stalled) => {
+                // Release held keys and buttons and end the live views before exiting, as when
+                // stdin closes.
+                controller.peers.clear();
+                controller.end_session();
+                return Err(stalled.into());
+            }
             Msg::Peer(event) => {
                 controller.on_peer(event, &mut out);
                 continue;
