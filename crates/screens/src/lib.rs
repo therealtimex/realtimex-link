@@ -82,6 +82,19 @@ pub mod x11;
 
 #[cfg(target_os = "macos")]
 pub use macos::{capture_display, capture_display_frame, init_window_server};
+
+/// A native capture request this process gave up on that has not answered for so long that it
+/// never will, and how long it has been outstanding. While there is one, this process's
+/// screenshots are refused; only ending the process frees them.
+#[cfg(target_os = "macos")]
+pub use macos::stalled_request;
+
+/// Never on other platforms: their captures do not go through the gate.
+#[cfg(not(target_os = "macos"))]
+pub fn stalled_request() -> Option<(&'static str, std::time::Duration)> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 pub use x11::{capture_display, capture_display_frame};
 

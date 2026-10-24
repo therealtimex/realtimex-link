@@ -49,6 +49,11 @@ extern "C" {}
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// One window list or screenshot request at a time in this process (see [`crate::gate`]).
 static GATE: Gate = Gate::new(TIMEOUT);
+/// A request its caller gave up on that still has not answered after this long has most likely
+/// lost its callback: it will never answer, and every screenshot of this process is refused
+/// until the process ends (see [`stalled_request`]). Six budgets, so a request that is only very
+/// late still gets the chance to answer.
+pub const STALLED_AFTER: Duration = Duration::from_secs(6 * TIMEOUT.as_secs());
 /// A window list this recent is reused by the screenshot that follows it, so a tick asks
 /// ScreenCaptureKit twice (list, capture) instead of three times.
 const REUSE_LIST: Duration = Duration::from_secs(2);
@@ -164,9 +169,18 @@ pub fn request_stats() -> Vec<(&'static str, OpStats)> {
     GATE.stats()
 }
 
-/// Debug builds only, for the live stall check (#2737): with `RTX_CAPTURE_TEST_STALL_SCREENSHOT=n`,
-/// the n-th screenshot request of the process never answers.
-#[cfg(debug_assertions)]
+/// The request that has held the permit for longer than [`STALLED_AFTER`] after its caller gave
+/// up on it, and for how long. Nothing in this process can free that permit: a long-lived
+/// process that sees one should exit and be started again, as RealTimeX's recorder recovers
+/// from a stall (its `screensRecovered`), or its screenshots stay refused for good.
+pub fn stalled_request() -> Option<(&'static str, Duration)> {
+    GATE.stalled(STALLED_AFTER)
+}
+
+/// For the live stall check (#2737, and QA of the stall exit): with
+/// `RTX_CAPTURE_TEST_STALL_SCREENSHOT=n`, the n-th screenshot request of the process never
+/// answers, like a lost callback. In release builds too, so QA can check an installed build; it
+/// only ever makes this process's own screenshots fail, and nothing sets it but a tester.
 fn test_stall() -> bool {
     static SCREENSHOTS: AtomicU64 = AtomicU64::new(0);
     let n = SCREENSHOTS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -386,7 +400,6 @@ fn capture_image(
             "screenshot",
             stop,
             |done: Completion<Result<CFRetained<CGImage>, String>>| {
-                #[cfg(debug_assertions)]
                 if test_stall() {
                     // Never answered, like a lost callback: the permit stays held.
                     std::mem::forget(done);
