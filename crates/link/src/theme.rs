@@ -5,14 +5,30 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke,
-    TextStyle, Theme,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, FontTweak,
+    RichText, Stroke, TextStyle, Theme,
 };
 
 /// Plus Jakarta Sans (OFL, fonts/OFL.txt), RealTimeX's typeface: one variable font, regular by
 /// default and semibold through its weight axis (semibold()).
 const FONT: &[u8] = include_bytes!("../fonts/PlusJakartaSans.ttf");
 const SEMIBOLD: f32 = 600.0;
+
+/// Russian's letters, which Plus Jakarta Sans lacks: Noto Sans (OFL, fonts/OFL-NotoSans.txt) cut
+/// to U+0400–045F and №, its weight axis kept so semibold() works here too (scripts: fonttools
+/// varLib.instancer wdth=100, then pyftsubset). Punctuation and digits stay Plus Jakarta Sans'.
+const CYRILLIC: &[u8] = include_bytes!("../fonts/NotoSansCyrillic.ttf");
+
+/// The Cyrillic subset, matched to Plus Jakarta Sans. Its x-height is the same (536/1000 em in
+/// both; caps 714 vs 745), so it keeps its size. egui sets each font on its own ascent (1.069 em
+/// vs 1.038), which puts Noto's baseline 0.031 em lower: lifted by that, mixed lines such as
+/// "RealTimeX Link" in Russian text share one baseline.
+fn cyrillic_font() -> FontData {
+    FontData::from_static(CYRILLIC).tweak(FontTweak {
+        y_offset_factor: -0.031,
+        ..Default::default()
+    })
+}
 
 /// One theme's tokens.
 struct Tokens {
@@ -90,18 +106,24 @@ pub const CARD_RADIUS: u8 = 8;
 const CONTROL_HEIGHT: f32 = 32.0;
 pub const PRIMARY_HEIGHT: f32 = 36.0;
 
-pub fn apply(ctx: &egui::Context) {
+/// Plus Jakarta Sans, then the Cyrillic subset, ahead of egui's own fonts (its icons and emoji).
+fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
         "plus-jakarta-sans".into(),
         Arc::new(FontData::from_static(FONT)),
     );
     fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, "plus-jakarta-sans".into());
-    ctx.set_fonts(fonts);
+        .font_data
+        .insert("noto-sans-cyrillic".into(), Arc::new(cyrillic_font()));
+    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    proportional.insert(0, "plus-jakarta-sans".into());
+    proportional.insert(1, "noto-sans-cyrillic".into());
+    fonts
+}
+
+pub fn apply(ctx: &egui::Context) {
+    ctx.set_fonts(fonts());
     for (theme, tokens) in [(Theme::Dark, &DARK), (Theme::Light, &LIGHT)] {
         ctx.style_mut_of(theme, |style| {
             style.text_styles = [
@@ -344,5 +366,37 @@ mod tests {
             portal_theme("Error org.freedesktop.DBus.Error.ServiceUnknown"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{offered_languages, strings, Script};
+    use skrifa::{FontRef, MetadataProvider};
+
+    /// Every character of every locale shown with the bundled fonts, and their names, is in Plus
+    /// Jakarta Sans or the Cyrillic subset: never egui's fallback font or a missing glyph.
+    #[test]
+    fn the_bundled_fonts_draw_every_offered_string() {
+        let (latin, cyrillic) = (FontRef::new(FONT).unwrap(), FontRef::new(CYRILLIC).unwrap());
+        let (latin, cyrillic) = (latin.charmap(), cyrillic.charmap());
+        for locale in offered_languages() {
+            if !matches!(locale.script, Script::Latin | Script::Cyrillic) {
+                continue;
+            }
+            let mut texts = strings(locale);
+            texts.push(locale.endonym);
+            for text in texts {
+                for c in text.chars().filter(|c| *c != '\n') {
+                    assert!(
+                        latin.map(c).is_some() || cyrillic.map(c).is_some(),
+                        "{}: {c:?} (U+{:04X}) in {text:?}",
+                        locale.code,
+                        c as u32
+                    );
+                }
+            }
+        }
     }
 }

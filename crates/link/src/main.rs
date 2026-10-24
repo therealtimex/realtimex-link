@@ -11,6 +11,7 @@ mod api;
 mod app;
 mod desktop;
 mod dock;
+mod i18n;
 #[cfg(target_os = "linux")]
 mod icon;
 mod theme;

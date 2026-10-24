@@ -15,6 +15,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::app::{act, lock, start_update, Shared};
 use crate::desktop;
+use crate::i18n::{t, tf};
 
 /// What the icon's menu does for the process showing it.
 pub struct Actions {
@@ -43,7 +44,22 @@ pub struct Tray {
     status: MenuItem,
     toggle: MenuItem,
     update: MenuItem,
+    copy: MenuItem,
+    open: MenuItem,
+    realtimex: MenuItem,
+    quit: MenuItem,
     last: std::cell::RefCell<(String, String, String)>,
+    /// The locale the fixed items are in (they change only with the language).
+    language: std::cell::Cell<&'static str>,
+}
+
+/// "Open RealTimeX", or "Get RealTimeX" when it is not on this computer.
+fn realtimex_label() -> String {
+    if desktop::realtimex_app().is_some() {
+        t("footer.openRealtimex")
+    } else {
+        t("footer.getRealtimex")
+    }
 }
 
 /// The menu bar / tray icon, the app icon without its navy square (made by scripts/icons.py): on
@@ -67,21 +83,13 @@ impl Tray {
         ctx: egui::Context,
         actions: Actions,
     ) -> anyhow::Result<Self> {
-        let status = MenuItem::new("Remote control", false, None);
-        let toggle = MenuItem::new("Turn off remote control", true, None);
-        let copy = MenuItem::new("Copy App ID and password", true, None);
-        let open = MenuItem::new("Open RealTimeX Link…", true, None);
-        let update = MenuItem::new("Check for updates", true, None);
-        let realtimex = MenuItem::new(
-            if desktop::realtimex_app().is_some() {
-                "Open RealTimeX"
-            } else {
-                "Get RealTimeX"
-            },
-            true,
-            None,
-        );
-        let quit = MenuItem::new("Quit (other computers can't connect)", true, None);
+        let status = MenuItem::new(t("tray.remoteControl"), false, None);
+        let toggle = MenuItem::new(t("tray.turnOff"), true, None);
+        let copy = MenuItem::new(t("tray.copy"), true, None);
+        let open = MenuItem::new(t("tray.open"), true, None);
+        let update = MenuItem::new(t("tray.checkUpdates"), true, None);
+        let realtimex = MenuItem::new(realtimex_label(), true, None);
+        let quit = MenuItem::new(t("tray.quit"), true, None);
         let menu = Menu::new();
         menu.append_items(&[
             &status,
@@ -142,29 +150,34 @@ impl Tray {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let text = format!("App ID: {app_id}\nPassword: {}", state.password);
+                let text = tf(
+                    "tray.copyText",
+                    &[
+                        ("appId", app_id.as_str()),
+                        ("password", state.password.as_str()),
+                    ],
+                );
                 drop(state);
                 (actions.copy)(text);
-                lock(&shared).notice =
-                    Some(("App ID and password copied.".into(), true, Instant::now()));
+                lock(&shared).notice = Some((t("tray.copied"), true, Instant::now()));
             } else if id == toggle {
                 let on = lock(&shared)
                     .overview
                     .as_ref()
                     .and_then(|o| o.get("allowIncoming"))
                     == Some(&Value::Bool(true));
-                let done = if on {
-                    "Remote control is off. No other computer can connect."
+                let done = t(if on {
+                    "host.turnedOff"
                 } else {
-                    "Remote control is on."
-                };
+                    "host.turnedOn"
+                });
                 act(
                     &shared,
                     &refresh,
                     &ctx,
                     "/v1/host/settings",
                     json!({ "allowIncoming": !on }),
-                    done,
+                    &done,
                 );
             } else if id == quit {
                 // Quit is all of RealTimeX Link: hosting stops too, and any other window.
@@ -183,12 +196,25 @@ impl Tray {
             status,
             toggle,
             update,
+            copy,
+            open,
+            realtimex,
+            quit,
             last: Default::default(),
+            language: std::cell::Cell::new(crate::i18n::current().code),
         })
     }
 
-    /// The status line, the switch's and the update item's labels, from the latest state.
+    /// The status line, the switch's and the update item's labels, from the latest state; every
+    /// label when the language changed.
     pub fn update(&self, overview: Option<&Value>, update: Option<&Value>) {
+        let language = crate::i18n::current().code;
+        if self.language.replace(language) != language {
+            self.copy.set_text(t("tray.copy"));
+            self.open.set_text(t("tray.open"));
+            self.realtimex.set_text(realtimex_label());
+            self.quit.set_text(t("tray.quit"));
+        }
         let on = overview.and_then(|o| o.get("allowIncoming")) == Some(&Value::Bool(true));
         let holder = overview
             .and_then(|o| o.get("session"))
@@ -196,24 +222,19 @@ impl Tray {
             .and_then(|s| s.get("clientName"))
             .and_then(Value::as_str);
         let status = match (overview, on, holder) {
-            (None, ..) => "RealTimeX Link is starting…".to_string(),
-            (_, false, _) => "Remote control is off".to_string(),
-            (_, true, Some(name)) => format!("{name} is controlling this computer"),
-            (_, true, None) => "Remote control is on".to_string(),
+            (None, ..) => t("tray.starting"),
+            (_, false, _) => t("tray.off"),
+            (_, true, Some(name)) => tf("session.controlling", &[("name", name)]),
+            (_, true, None) => t("tray.on"),
         };
-        let toggle = if on {
-            "Turn off remote control"
-        } else {
-            "Turn on remote control"
-        }
-        .to_string();
+        let toggle = t(if on { "tray.turnOff" } else { "tray.turnOn" });
         let latest = update
             .filter(|u| u.get("available") == Some(&Value::Bool(true)))
             .and_then(|u| u.get("latest"))
             .and_then(Value::as_str);
         let update_label = match latest {
-            Some(version) => format!("Update to RealTimeX Link {version}…"),
-            None => "Check for updates".to_string(),
+            Some(version) => tf("tray.updateTo", &[("version", version)]),
+            None => t("tray.checkUpdates"),
         };
         let mut last = self.last.borrow_mut();
         if last.2 != update_label {

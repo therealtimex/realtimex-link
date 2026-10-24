@@ -26,6 +26,10 @@ ring = "0.17"
 # (D-Bus, its own thread): no GTK; GNOME shows it with the AppIndicator extension (Ubuntu's default).
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 
+[dev-dependencies]
+# The fonts' character maps (theme.rs tests); epaint's own font reader, same version.
+skrifa = "0.44.0"
+
 # macOS: in the Dock only while the window is open (dock.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

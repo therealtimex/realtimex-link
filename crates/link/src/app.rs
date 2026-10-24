@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::api::Api;
 use crate::desktop;
+use crate::i18n::{t, tf};
 use crate::theme::{self, primary_button, semibold, tone_colors, Tone};
 
 const POLL: Duration = Duration::from_millis(1500);
@@ -63,7 +64,7 @@ pub fn act(
         let api = lock(&shared).api.clone();
         let result = match api {
             Some(api) => api.post(&path, body),
-            None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+            None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
         };
         let notice = match result {
             Ok(_) => (done, true),
@@ -85,7 +86,7 @@ pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) 
         let api = lock(&shared).api.clone();
         let answer = match api {
             Some(api) => api.post("/v1/update/install", json!({})),
-            None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+            None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
         };
         match answer {
             Ok(answer) => {
@@ -155,6 +156,14 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
                     .map_or(egui::ThemePreference::System, egui::ThemePreference::from),
                 preference => preference,
             };
+            // RealTimeX's language, or the one chosen in Settings; an older daemon has none.
+            let language = status
+                .as_ref()
+                .and_then(|status| status["language"].as_str())
+                .unwrap_or("system");
+            if crate::i18n::set_language(language) {
+                ctx.request_repaint();
+            }
             if appearance != Some(preference) {
                 ctx.set_theme(preference);
                 // The title bar too (the Linux one is drawn by winit, Windows' by the system).
@@ -396,7 +405,7 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
             egui::Role::CheckBox,
             ui.is_enabled(),
             *on,
-            "Allow remote control",
+            t("host.allowRemoteControl"),
         )
     });
     if ui.is_rect_visible(rect) {
@@ -404,6 +413,15 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         theme::paint_switch(ui, &response, rect, t, *on);
     }
     response
+}
+
+/// "Full access" or "View only".
+fn access_label(control: bool) -> String {
+    t(if control {
+        "access.full"
+    } else {
+        "access.view"
+    })
 }
 
 fn text(value: &Value, key: &str) -> String {
@@ -420,20 +438,22 @@ fn expires_in(iso: &str) -> String {
         return String::new();
     };
     let left = (at.timestamp() - chrono::Utc::now().timestamp()).max(0);
-    format!("Expires in {}:{:02}", left / 60, left % 60)
+    let time = format!("{}:{:02}", left / 60, left % 60);
+    tf("request.expiresIn", &[("time", time.as_str())])
 }
 
 fn ago(iso: &str) -> String {
     let Ok(at) = chrono::DateTime::parse_from_rfc3339(iso) else {
-        return "never".into();
+        return t("time.never");
     };
     let seconds = (chrono::Utc::now().timestamp() - at.timestamp()).max(0);
-    match seconds {
-        0..=59 => "just now".into(),
-        60..=3599 => format!("{} min ago", seconds / 60),
-        3600..=86_399 => format!("{} h ago", seconds / 3600),
-        _ => format!("{} days ago", seconds / 86_400),
-    }
+    let (key, count) = match seconds {
+        0..=59 => return t("time.justNow"),
+        60..=3599 => ("time.minutesAgo", seconds / 60),
+        3600..=86_399 => ("time.hoursAgo", seconds / 3600),
+        _ => ("time.daysAgo", seconds / 86_400),
+    };
+    tf(key, &[("count", count.to_string().as_str())])
 }
 
 // --- the window -------------------------------------------------------------------------
@@ -523,18 +543,18 @@ impl eframe::App for LinkApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Link on its own is the whole point here: RealTimeX is a quiet link.
                     if installed {
-                        if primary_button(ui, "Open RealTimeX").clicked() {
+                        if primary_button(ui, &t("footer.openRealtimex")).clicked() {
                             desktop::open_realtimex();
                         }
-                    } else if ui.link("Get RealTimeX").clicked() {
+                    } else if ui.link(t("footer.getRealtimex")).clicked() {
                         desktop::open_realtimex();
                     }
                     ui.add(
                         egui::Label::new(
                             RichText::new(if installed {
-                                "Control your other computers from RealTimeX."
+                                t("footer.installedHint")
                             } else {
-                                "Control this computer from RealTimeX on another computer."
+                                t("footer.notInstalledHint")
                             })
                             .small()
                             .weak(),
@@ -561,15 +581,12 @@ impl eframe::App for LinkApp {
                     }
                     let Some(overview) = overview.as_ref() else {
                         match &error {
-                            Some(error) => alert(
-                                ui,
-                                Tone::Warning,
-                                "RealTimeX Link's service isn't running",
-                                |ui| {
+                            Some(error) => {
+                                alert(ui, Tone::Warning, &t("service.notRunningTitle"), |ui| {
                                     ui.label(error);
-                                    caption(ui, "Trying again…");
-                                },
-                            ),
+                                    caption(ui, t("service.retrying"));
+                                })
+                            }
                             None => {
                                 ui.spinner();
                             }
@@ -584,7 +601,7 @@ impl eframe::App for LinkApp {
                             ui,
                             &mut self.tab,
                             Tab::ThisComputer,
-                            "This computer",
+                            &t("tabs.thisComputer"),
                         );
                         let count = overview
                             .get("clients")
@@ -594,7 +611,7 @@ impl eframe::App for LinkApp {
                             ui,
                             &mut self.tab,
                             Tab::Computers,
-                            &format!("Computers · {count}"),
+                            &tf("tabs.computers", &[("count", count.to_string().as_str())]),
                         );
                     });
                     ui.separator();
@@ -634,26 +651,32 @@ impl LinkApp {
         alert(
             ui,
             Tone::Info,
-            &format!("RealTimeX Link {latest} is available"),
+            &tf("update.available", &[("version", latest.as_str())]),
             |ui| {
                 ui.horizontal(|ui| {
-                    caption(ui, format!("You have {}.", text(update, "current")));
+                    caption(
+                        ui,
+                        tf(
+                            "update.current",
+                            &[("version", text(update, "current").as_str())],
+                        ),
+                    );
                     let page = text(update, "page");
-                    if !page.is_empty() && ui.link("What's new").clicked() {
+                    if !page.is_empty() && ui.link(t("update.whatsNew")).clicked() {
                         desktop::open_url(&page);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         match update.get("busy").and_then(Value::as_str) {
                             Some(busy) => {
                                 ui.label(if busy == "downloading" {
-                                    "Downloading…"
+                                    t("update.downloading")
                                 } else {
-                                    "Installing…"
+                                    t("update.installing")
                                 });
                                 ui.spinner();
                             }
                             None => {
-                                if primary_button(ui, "Update").clicked() {
+                                if primary_button(ui, &t("update.update")).clicked() {
                                     start_update(&self.shared, &self.refresh, ctx);
                                 }
                             }
@@ -674,9 +697,9 @@ impl LinkApp {
         let signing_in = account.get("signingIn") == Some(&Value::Bool(true));
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(semibold("Account").size(15.0));
+                ui.label(semibold(t("account.title")).size(15.0));
                 if signed_in {
-                    badge(ui, "Signed in", Tone::Success);
+                    badge(ui, &t("account.signedIn"), Tone::Success);
                 }
             });
             if let Some(error) = account.get("error").and_then(Value::as_str) {
@@ -687,44 +710,47 @@ impl LinkApp {
                     let email = text(account, "email");
                     ui.label(&email);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Sign out").clicked() {
+                        if ui.button(t("account.signOut")).clicked() {
                             self.confirm = Some(Confirm::SignOut);
                         }
                     });
                 });
                 if text(account, "via") == "realtimex" {
-                    caption(ui, "Signed in through RealTimeX on this computer.");
+                    caption(ui, t("account.viaRealtimex"));
                 }
                 return;
             }
-            caption(ui, "Sign in to your RealTimeX account, so other computers can reach this one through RealTimeX's relay and your own computers can connect without asking.");
+            caption(ui, t("account.pitch"));
             if signing_in {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Finish signing in in your browser…");
+                    ui.label(t("account.finishInBrowser"));
                 });
             }
             ui.horizontal_wrapped(|ui| {
                 let label = if signing_in {
-                    "Open the browser again"
+                    t("account.openBrowserAgain")
                 } else {
-                    "Sign in"
+                    t("account.signIn")
                 };
-                if primary_button(ui, label).clicked() {
+                if primary_button(ui, &label).clicked() {
                     self.sign_in(ctx);
                 }
                 if let Some(offer) = account.get("offer").and_then(Value::as_str) {
                     let who = if offer.is_empty() {
-                        "RealTimeX's account"
+                        t("account.realtimexAccount")
                     } else {
-                        offer
+                        offer.to_string()
                     };
-                    if ui.button(format!("Continue as {who}")).clicked() {
+                    if ui
+                        .button(tf("account.continueAs", &[("name", who.as_str())]))
+                        .clicked()
+                    {
                         self.act(
                             ctx,
                             "/v1/account/use-realtimex",
                             json!({}),
-                            "Signed in with RealTimeX's account.",
+                            &t("account.signedInWithRealtimex"),
                         );
                     }
                 }
@@ -739,7 +765,7 @@ impl LinkApp {
             let api = lock(&shared).api.clone();
             let answer = match api {
                 Some(api) => api.post("/v1/account/sign-in", json!({})),
-                None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+                None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
             };
             match answer.map(|answer| text(&answer, "url")) {
                 Ok(url) if !url.is_empty() => desktop::open_url(&url),
@@ -759,43 +785,53 @@ impl LinkApp {
             let name = text(request, "clientName");
             let reference = text(request, "ref");
             let same = request.pointer("/account/sameAccount") == Some(&Value::Bool(true));
-            alert(ui, Tone::Info, &format!("{name} wants to connect"), |ui| {
-                let mut detail = vec!["New computer".to_string()];
+            let title = tf("request.wantsToConnect", &[("name", name.as_str())]);
+            alert(ui, Tone::Info, &title, |ui| {
+                let mut detail = vec![t("request.newComputer")];
                 let machine = text(request, "machine");
                 if !machine.is_empty() {
                     detail.push(machine);
                 }
                 detail.push(if same {
-                    "your account".into()
+                    t("request.yourAccount")
                 } else {
-                    "not your account".into()
+                    t("request.notYourAccount")
                 });
                 if let Some(login) = request.get("tailnetLogin").and_then(Value::as_str) {
-                    detail.push(format!("Tailscale user {login}"));
+                    detail.push(tf("request.tailscaleUser", &[("login", login)]));
                 }
                 ui.label(detail.join(" · "));
                 if !same {
-                    ui.label(RichText::new("This computer belongs to someone else. Only allow it if you expect it.").color(tone_colors(ui, Tone::Warning).2));
+                    ui.label(
+                        RichText::new(t("request.someoneElse"))
+                            .color(tone_colors(ui, Tone::Warning).2),
+                    );
                 }
+                let expires = expires_in(&text(request, "expiresAt"));
                 caption(
                     ui,
-                    format!(
-                        "{} · Once allowed, it connects without asking next time.",
-                        expires_in(&text(request, "expiresAt"))
-                    ),
+                    tf("request.remembered", &[("expires", expires.as_str())]),
                 );
                 ui.horizontal_wrapped(|ui| {
                     let decide = |decision: &str, done: String| {
-                        act(&self.shared, &self.refresh, ctx, "/v1/host/connection-requests/decide", json!({ "requestRef": reference, "decision": decision }), &done);
+                        act(
+                            &self.shared,
+                            &self.refresh,
+                            ctx,
+                            "/v1/host/connection-requests/decide",
+                            json!({ "requestRef": reference, "decision": decision }),
+                            &done,
+                        );
                     };
-                    if primary_button(ui, "Allow control").clicked() {
-                        decide("allow-control", format!("{name} can now control this computer. It connects without asking next time."));
+                    let named = [("name", name.as_str())];
+                    if primary_button(ui, &t("request.allowControl")).clicked() {
+                        decide("allow-control", tf("request.allowedControl", &named));
                     }
-                    if ui.button("View only").clicked() {
-                        decide("allow-view", format!("{name} can now view this computer. It connects without asking next time."));
+                    if ui.button(t("request.viewOnly")).clicked() {
+                        decide("allow-view", tf("request.allowedView", &named));
                     }
-                    if ui.button("Deny").clicked() {
-                        decide("deny", format!("Denied. {name} was not let in."));
+                    if ui.button(t("request.deny")).clicked() {
+                        decide("deny", tf("request.denied", &named));
                     }
                 });
             });
@@ -812,12 +848,13 @@ impl LinkApp {
         alert(
             ui,
             Tone::Warning,
-            &format!("{name} is controlling this computer"),
+            &tf("session.controlling", &[("name", name.as_str())]),
             |ui| {
                 ui.horizontal(|ui| {
-                    caption(ui, format!("Since {}", ago(&text(&session, "since"))));
+                    let since = ago(&text(&session, "since"));
+                    caption(ui, tf("session.since", &[("time", since.as_str())]));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Stop").clicked() {
+                        if ui.button(t("session.stop")).clicked() {
                             self.confirm = Some(Confirm::StopSession(name.clone()));
                         }
                     });
@@ -845,49 +882,24 @@ impl LinkApp {
             .pointer("/publicExposure/state")
             .and_then(Value::as_str)
             == Some("ready");
+        // The badge (host.state.*) and the line under it (host.description.*).
         let (label, tone, description) = match state.as_str() {
-            "off" => ("Off", Tone::Neutral, ""),
-            "unsupported" => (
-                "Not supported",
-                Tone::Neutral,
-                "Remote control isn't available on this desktop.",
-            ),
-            "error" => (
-                "Error",
-                Tone::Danger,
-                "Something went wrong. Details below.",
-            ),
-            "waiting-tailscale" if relayed && missing.is_empty() => (
-                "Ready",
-                Tone::Success,
-                "Other computers can connect through RealTimeX's relay (Tailscale isn't running).",
-            ),
-            "waiting-tailscale" => (
-                "Waiting",
-                Tone::Warning,
-                "No other computer can connect until Tailscale runs.",
-            ),
-            "starting" => ("Starting", Tone::Neutral, "Getting ready…"),
-            _ if !missing.is_empty() => (
-                "Needs setup",
-                Tone::Warning,
-                "Allow the macOS permissions below, then other computers can connect.",
-            ),
-            _ if relayed => (
-                "Ready",
-                Tone::Success,
-                "Other computers can connect over Tailscale or through RealTimeX's relay.",
-            ),
-            _ => (
-                "Ready",
-                Tone::Success,
-                "Other computers on your Tailscale network can connect.",
-            ),
+            "off" => ("off", Tone::Neutral, ""),
+            "unsupported" => ("unsupported", Tone::Neutral, "unsupported"),
+            "error" => ("error", Tone::Danger, "error"),
+            "waiting-tailscale" if relayed && missing.is_empty() => {
+                ("ready", Tone::Success, "relayOnly")
+            }
+            "waiting-tailscale" => ("waiting", Tone::Warning, "waitingTailscale"),
+            "starting" => ("starting", Tone::Neutral, "starting"),
+            _ if !missing.is_empty() => ("needsSetup", Tone::Warning, "needsPermissions"),
+            _ if relayed => ("ready", Tone::Success, "tailscaleOrRelay"),
+            _ => ("ready", Tone::Success, "tailscale"),
         };
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(semibold("This computer").size(15.0));
-                badge(ui, label, tone);
+                ui.label(semibold(t("host.title")).size(15.0));
+                badge(ui, &t(&format!("host.state.{label}")), tone);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if toggle(ui, &mut allow).changed() {
                         if allow {
@@ -895,20 +907,20 @@ impl LinkApp {
                                 ctx,
                                 "/v1/host/settings",
                                 json!({ "allowIncoming": true }),
-                                "Remote control is on.",
+                                &t("host.turnedOn"),
                             );
                         } else {
                             self.confirm = Some(Confirm::TurnOff);
                         }
                     }
-                    ui.label("Allow remote control");
+                    ui.label(t("host.allowRemoteControl"));
                 });
             });
             if state == "off" {
-                ui.label("Remote control is off. No other computer can see or use this screen. Turn it on to give another computer this App ID and password.");
+                ui.label(t("host.offExplained"));
                 return;
             }
-            caption(ui, description);
+            caption(ui, t(&format!("host.description.{description}")));
             if state == "unsupported" || state == "error" {
                 let detail = text(overview, "stateDetail");
                 if !detail.is_empty() {
@@ -916,94 +928,90 @@ impl LinkApp {
                 }
             }
             if !missing.is_empty() {
-                alert(
-                    ui,
-                    Tone::Warning,
-                    "Allow RealTimeX Link to see and control this Mac",
-                    |ui| {
-                        ui.label("macOS asks for this once. Open each setting, turn on RealTimeX Link, then check again.");
-                        for (name, title) in [
-                            ("screenRecording", "Screen Recording"),
-                            ("accessibility", "Accessibility"),
-                        ] {
-                            ui.horizontal(|ui| {
-                                ui.label(title);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if missing.contains(&name) {
-                                            if ui.button("Open Settings").clicked() {
-                                                self.act(
-                                                    ctx,
-                                                    "/v1/host/permissions/request",
-                                                    json!({ "name": name }),
-                                                    "",
-                                                );
-                                                desktop::open_privacy_settings(name);
-                                            }
-                                        } else {
-                                            badge(ui, "Granted", Tone::Success);
+                alert(ui, Tone::Warning, &t("permissions.title"), |ui| {
+                    ui.label(t("permissions.explain"));
+                    for (name, title) in [
+                        ("screenRecording", t("permissions.screenRecording")),
+                        ("accessibility", t("permissions.accessibility")),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(title);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if missing.contains(&name) {
+                                        if ui.button(t("permissions.openSettings")).clicked() {
+                                            self.act(
+                                                ctx,
+                                                "/v1/host/permissions/request",
+                                                json!({ "name": name }),
+                                                "",
+                                            );
+                                            desktop::open_privacy_settings(name);
                                         }
-                                    },
-                                );
-                            });
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            if ui.button("Check again").clicked() {
-                                let _ = self.refresh.send(());
-                            }
+                                    } else {
+                                        badge(ui, &t("permissions.granted"), Tone::Success);
+                                    }
+                                },
+                            );
                         });
-                    },
-                );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui.button(t("permissions.checkAgain")).clicked() {
+                            let _ = self.refresh.send(());
+                        }
+                    });
+                });
             }
             if state == "waiting-tailscale" {
-                alert(ui, Tone::Info, "Tailscale isn't running", |ui| {
-                    ui.label("Other computers reach this one over your Tailscale network. Start Tailscale and sign in.");
+                alert(ui, Tone::Info, &t("tailscale.notRunningTitle"), |ui| {
+                    ui.label(t("tailscale.notRunning"));
                 });
             }
             ui.add_space(4.0);
-            caption(ui, "App ID");
+            caption(ui, t("host.appId"));
             ui.horizontal(|ui| {
                 let app_id = text(overview, "appId");
                 ui.label(RichText::new(&app_id).monospace().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Copy").clicked() {
+                    if ui.button(t("common.copy")).clicked() {
                         ctx.copy_text(app_id.clone());
                         lock(&self.shared).notice =
-                            Some(("App ID copied.".into(), true, Instant::now()));
+                            Some((t("host.appIdCopied"), true, Instant::now()));
                     }
                 });
             });
-            caption(ui, "Password");
+            caption(ui, t("host.password"));
             match self.editing_password.as_mut() {
                 Some(draft) => {
                     ui.add(
                         egui::TextEdit::singleline(draft)
-                            .hint_text("New password, at least 8 characters")
+                            .hint_text(t("password.newHint"))
                             .desired_width(f32::INFINITY),
                     );
                     ui.label(
-                        RichText::new(
-                            "Every computer is signed out and must use the new password.",
-                        )
-                        .small()
-                        .color(tone_colors(ui, Tone::Warning).2),
+                        RichText::new(t("password.signsOutAll"))
+                            .small()
+                            .color(tone_colors(ui, Tone::Warning).2),
                     );
                     let short = draft.chars().count() < 8;
                     let mut done = false;
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(!short, egui::Button::new("Save")).clicked() {
+                        if ui
+                            .add_enabled(!short, egui::Button::new(t("common.save")))
+                            .clicked()
+                        {
                             act(
                                 &self.shared,
                                 &self.refresh,
                                 ctx,
                                 "/v1/host/password/set",
                                 json!({ "password": draft.clone() }),
-                                "Password changed. Every computer must sign in again.",
+                                &t("password.changed"),
                             );
                             done = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(t("common.cancel")).clicked() {
                             done = true;
                         }
                     });
@@ -1020,13 +1028,17 @@ impl LinkApp {
                         };
                         ui.label(RichText::new(shown).monospace().size(17.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Copy").clicked() {
+                            if ui.button(t("common.copy")).clicked() {
                                 ctx.copy_text(password.to_string());
                                 lock(&self.shared).notice =
-                                    Some(("Password copied.".into(), true, Instant::now()));
+                                    Some((t("password.copied"), true, Instant::now()));
                             }
                             if ui
-                                .button(if self.show_password { "Hide" } else { "Show" })
+                                .button(if self.show_password {
+                                    t("common.hide")
+                                } else {
+                                    t("common.show")
+                                })
                                 .clicked()
                             {
                                 self.show_password = !self.show_password;
@@ -1034,50 +1046,49 @@ impl LinkApp {
                         });
                     });
                     ui.horizontal(|ui| {
-                        if ui.link("New password").clicked() {
+                        if ui.link(t("password.new")).clicked() {
                             self.confirm = Some(Confirm::NewPassword);
                         }
-                        if ui.link("Set my own").clicked() {
+                        if ui.link(t("password.setOwn")).clicked() {
                             self.editing_password = Some(String::new());
                         }
                         let changed = text(overview, "passwordChangedAt");
                         if !changed.is_empty() {
-                            caption(ui, format!("Changed {}", ago(&changed)));
+                            caption(
+                                ui,
+                                tf("password.changedAgo", &[("time", ago(&changed).as_str())]),
+                            );
                         }
                     });
                 }
             }
             ui.separator();
-            ui.label(semibold("When a new computer asks to connect"));
+            ui.label(semibold(t("policy.title")));
             let policy = text(overview, "newComputerPolicy");
             let policies = [
-                (
-                    "ask",
-                    "Ask me",
-                    "You allow or deny each one here; it expires after a minute",
-                ),
+                ("ask", t("policy.ask"), t("policy.askHelp")),
                 (
                     "own-account",
-                    "Allow my own computers without asking",
-                    "New computers on your account are let in at once; others ask",
+                    t("policy.ownAccount"),
+                    t("policy.ownAccountHelp"),
                 ),
                 (
                     "password-only",
-                    "Password only",
-                    "New computers need the App ID and password; no requests",
+                    t("policy.passwordOnly"),
+                    t("policy.passwordOnlyHelp"),
                 ),
             ];
             let mut chosen = policy.clone();
             let current = policies
                 .iter()
                 .find(|(id, ..)| *id == policy)
-                .map_or("Ask me", |(_, label, _)| label);
+                .map_or_else(|| t("policy.ask"), |(_, label, _)| label.clone());
             egui::ComboBox::from_id_salt("policy")
                 .width(ui.available_width())
                 .selected_text(current)
                 .show_ui(ui, |ui| {
                     for (id, label, help) in policies {
-                        theme::selectable_value(ui, &mut chosen, id.to_string(), label)
+                        theme::selectable_value(ui, &mut chosen, id.to_string(), &label)
                             .on_hover_text(help);
                     }
                 });
@@ -1086,36 +1097,35 @@ impl LinkApp {
                     ctx,
                     "/v1/host/settings",
                     json!({ "newComputerPolicy": chosen }),
-                    "Saved.",
+                    &t("common.saved"),
                 );
             }
-            ui.label(semibold("Access for new computers"));
+            ui.label(semibold(t("access.title")));
             let control =
                 overview.pointer("/defaultPermissions/control") == Some(&Value::Bool(true));
             let mut access = control;
             egui::ComboBox::from_id_salt("access")
                 .width(ui.available_width())
-                .selected_text(if control { "Full access" } else { "View only" })
+                .selected_text(access_label(control))
                 .show_ui(ui, |ui| {
-                    theme::selectable_value(ui, &mut access, true, "Full access").on_hover_text(
-                        "See the screen, use the mouse, keyboard, clipboard and files",
-                    );
-                    theme::selectable_value(ui, &mut access, false, "View only")
-                        .on_hover_text("See the screen only");
+                    theme::selectable_value(ui, &mut access, true, &access_label(true))
+                        .on_hover_text(t("access.fullHelp"));
+                    theme::selectable_value(ui, &mut access, false, &access_label(false))
+                        .on_hover_text(t("access.viewHelp"));
                 });
             if access != control {
                 self.act(
                     ctx,
                     "/v1/host/settings",
                     json!({ "defaultPermissions": { "view": true, "control": access } }),
-                    "New computers get this access. Computers already here keep theirs.",
+                    &t("access.defaultsSaved"),
                 );
             }
         });
     }
 
     fn computers_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, overview: &Value) {
-        caption(ui, "Each one signed in with the password, or you allowed it. Changing the password signs them all out.");
+        caption(ui, t("computers.explain"));
         let clients = overview
             .get("clients")
             .and_then(Value::as_array)
@@ -1123,9 +1133,7 @@ impl LinkApp {
             .unwrap_or_default();
         if clients.is_empty() {
             card(ui, |ui| {
-                ui.label(
-                    "No computers yet. Give another computer this App ID and password to connect.",
-                );
+                ui.label(t("computers.none"));
             });
         }
         for client in clients {
@@ -1138,11 +1146,11 @@ impl LinkApp {
                     ui.label(semibold(&name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if revoked {
-                            badge(ui, "Blocked", Tone::Danger);
+                            badge(ui, &t("computers.blocked"), Tone::Danger);
                         } else if control {
-                            badge(ui, "Full access", Tone::Info);
+                            badge(ui, &access_label(true), Tone::Info);
                         } else {
-                            badge(ui, "View only", Tone::Neutral);
+                            badge(ui, &access_label(false), Tone::Neutral);
                         }
                     });
                 });
@@ -1151,11 +1159,12 @@ impl LinkApp {
                 if !machine.is_empty() {
                     detail.push(machine);
                 }
-                detail.push(format!("last used {}", ago(&text(&client, "lastUsedAt"))));
+                let used = ago(&text(&client, "lastUsedAt"));
+                detail.push(tf("computers.lastUsed", &[("time", used.as_str())]));
                 match text(&client, "admittedBy").as_str() {
-                    "password" => detail.push("added with the password".into()),
-                    "request" => detail.push("you allowed it".into()),
-                    "account" => detail.push("your account".into()),
+                    "password" => detail.push(t("computers.addedWithPassword")),
+                    "request" => detail.push(t("computers.youAllowed")),
+                    "account" => detail.push(t("request.yourAccount")),
                     _ => {}
                 }
                 caption(ui, detail.join(" · "));
@@ -1163,17 +1172,19 @@ impl LinkApp {
                 ui.add_enabled_ui(!revoked, |ui| {
                     egui::ComboBox::from_id_salt(("access", &id))
                         .width(ui.available_width())
-                        .selected_text(if control { "Full access" } else { "View only" })
+                        .selected_text(access_label(control))
                         .show_ui(ui, |ui| {
-                            theme::selectable_value(ui, &mut access, true, "Full access");
-                            theme::selectable_value(ui, &mut access, false, "View only");
+                            theme::selectable_value(ui, &mut access, true, &access_label(true));
+                            theme::selectable_value(ui, &mut access, false, &access_label(false));
                         });
                 });
                 if access != control {
-                    let done = format!(
-                        "{name} now has {}.",
-                        if access { "full access" } else { "view only" }
-                    );
+                    let key = if access {
+                        "computers.nowFull"
+                    } else {
+                        "computers.nowView"
+                    };
+                    let done = tf(key, &[("name", name.as_str())]);
                     self.act(
                         ctx,
                         "/v1/host/clients/permissions",
@@ -1181,20 +1192,43 @@ impl LinkApp {
                         &done,
                     );
                 }
+                let named = [("name", name.as_str())];
                 ui.horizontal(|ui| {
-                    if !revoked && ui.button("Disconnect").clicked() {
-                        self.act(ctx, "/v1/host/clients/disconnect", json!({ "id": id }), &format!("{name} was disconnected. It can connect again; block it to stop that."));
+                    if !revoked && ui.button(t("computers.disconnect")).clicked() {
+                        self.act(
+                            ctx,
+                            "/v1/host/clients/disconnect",
+                            json!({ "id": id }),
+                            &tf("computers.disconnected", &named),
+                        );
                     }
                     if revoked {
-                        if ui.button("Allow again").clicked() {
-                            self.act(ctx, "/v1/host/clients/allow", json!({ "id": id }), &format!("{name} can connect again."));
+                        if ui.button(t("computers.allowAgain")).clicked() {
+                            self.act(
+                                ctx,
+                                "/v1/host/clients/allow",
+                                json!({ "id": id }),
+                                &tf("computers.allowedAgain", &named),
+                            );
                         }
-                    } else if ui.button("Block").clicked() {
-                        self.act(ctx, "/v1/host/clients/revoke", json!({ "id": id }), &format!("{name} can't connect until you allow it again."));
+                    } else if ui.button(t("computers.block")).clicked() {
+                        self.act(
+                            ctx,
+                            "/v1/host/clients/revoke",
+                            json!({ "id": id }),
+                            &tf("computers.blockedDone", &named),
+                        );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Remove").on_hover_text(format!("Remove {name}")).clicked() {
-                            self.confirm = Some(Confirm::Remove { id: id.clone(), name: name.clone() });
+                        if ui
+                            .button(t("computers.remove"))
+                            .on_hover_text(tf("computers.removeHover", &named))
+                            .clicked()
+                        {
+                            self.confirm = Some(Confirm::Remove {
+                                id: id.clone(),
+                                name: name.clone(),
+                            });
                         }
                     });
                 });
@@ -1205,33 +1239,16 @@ impl LinkApp {
     /// Changes that end someone's access ask first.
     fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(confirm) = &self.confirm else { return };
-        let (title, message, action) = match confirm {
-            Confirm::TurnOff => (
-                "Turn off remote control?".to_string(),
-                "No other computer can see or use this screen until you turn it on again. Any session ends now.".to_string(),
-                "Turn off",
-            ),
-            Confirm::NewPassword => (
-                "Make a new password?".to_string(),
-                "Every computer is signed out and must use the new password.".to_string(),
-                "New password",
-            ),
-            Confirm::StopSession(name) => (
-                format!("Stop {name}'s session?"),
-                "It stops seeing and controlling this computer now. It can connect again unless you block it.".to_string(),
-                "Stop",
-            ),
-            Confirm::Remove { name, .. } => (
-                "Remove computer".to_string(),
-                format!("Remove {name}? Its session ends. With the password it can connect again as a new computer."),
-                "Remove",
-            ),
-            Confirm::SignOut => (
-                "Sign out?".to_string(),
-                "Your own computers ask before connecting again, and the relay can't be set up again until you sign in. Computers already here keep their access.".to_string(),
-                "Sign out",
-            ),
+        // confirm.<which>.title, .message and .action; {name} where there is one.
+        let (which, name) = match confirm {
+            Confirm::TurnOff => ("turnOff", ""),
+            Confirm::NewPassword => ("newPassword", ""),
+            Confirm::StopSession(name) => ("stop", name.as_str()),
+            Confirm::Remove { name, .. } => ("remove", name.as_str()),
+            Confirm::SignOut => ("signOut", ""),
         };
+        let part = |part: &str| tf(&format!("confirm.{which}.{part}"), &[("name", name)]);
+        let (title, message, action) = (part("title"), part("message"), part("action"));
         let mut close = false;
         let mut confirmed = false;
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
@@ -1246,7 +1263,7 @@ impl LinkApp {
                 {
                     confirmed = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t("common.cancel")).clicked() {
                     close = true;
                 }
             });
@@ -1257,29 +1274,32 @@ impl LinkApp {
                     ctx,
                     "/v1/host/settings",
                     json!({ "allowIncoming": false }),
-                    "Remote control is off. No other computer can connect.",
+                    &t("host.turnedOff"),
                 ),
                 Some(Confirm::NewPassword) => self.act(
                     ctx,
                     "/v1/host/password/regenerate",
                     json!({}),
-                    "New password. Every computer must sign in again.",
+                    &t("password.regenerated"),
                 ),
                 Some(Confirm::StopSession(name)) => self.act(
                     ctx,
                     "/v1/host/stop-session",
                     json!({}),
-                    &format!("{name}'s session ended."),
+                    &tf("session.ended", &[("name", name.as_str())]),
                 ),
                 Some(Confirm::Remove { id, name }) => self.act(
                     ctx,
                     "/v1/host/clients/remove",
                     json!({ "id": id }),
-                    &format!("{name} was removed."),
+                    &tf("computers.removed", &[("name", name.as_str())]),
                 ),
-                Some(Confirm::SignOut) => {
-                    self.act(ctx, "/v1/account/sign-out", json!({}), "Signed out.")
-                }
+                Some(Confirm::SignOut) => self.act(
+                    ctx,
+                    "/v1/account/sign-out",
+                    json!({}),
+                    &t("account.signedOut"),
+                ),
                 None => {}
             }
         } else if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

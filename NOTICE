@@ -6,3 +6,8 @@ This product includes software developed by RealTimeX (https://realtimex.ai).
 The window uses the Plus Jakarta Sans typeface (crates/link/fonts/PlusJakartaSans.ttf),
 Copyright 2020 The Plus Jakarta Sans Project Authors, under the SIL Open Font License 1.1
 (crates/link/fonts/OFL.txt).
+
+Its Russian text uses a Cyrillic subset of the Noto Sans typeface
+(crates/link/fonts/NotoSansCyrillic.ttf), Copyright 2022 The Noto Project Authors
+(https://github.com/notofonts/latin-greek-cyrillic), under the SIL Open Font License 1.1
+(crates/link/fonts/OFL-NotoSans.txt).

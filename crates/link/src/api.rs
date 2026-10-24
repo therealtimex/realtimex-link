@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
+use crate::i18n::{t, tf};
+
 const PROTOCOL: u64 = 1;
 /// rtx-linkd's local_api::HELLO_CONTEXT.
 const HELLO_CONTEXT: &str = "linkd-hello";
@@ -86,7 +88,7 @@ impl Api {
         };
         let version = api.get("/v1/version")?;
         if version.get("protocol").and_then(Value::as_u64) != Some(PROTOCOL) {
-            bail!("RealTimeX Link's service is from another version; reinstall RealTimeX Link");
+            bail!(t("errors.otherVersion"));
         }
         api.version = version
             .get("version")
@@ -102,8 +104,7 @@ impl Api {
         if let Ok(api) = Self::connect(&dir) {
             return Ok(api);
         }
-        let binary = daemon_binary()
-            .ok_or_else(|| anyhow!("rtx-linkd is not installed next to RealTimeX Link"))?;
+        let binary = daemon_binary().ok_or_else(|| anyhow!(t("errors.daemonMissing")))?;
         let mut command = Command::new(binary);
         command
             .arg("--data-dir")
@@ -123,13 +124,15 @@ impl Api {
             // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
             command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
         }
-        command.spawn().context("could not start rtx-linkd")?;
+        command
+            .spawn()
+            .with_context(|| t("errors.daemonStartFailed"))?;
         let started = Instant::now();
         loop {
             match Self::connect(&dir) {
                 Ok(api) => return Ok(api),
                 Err(error) if started.elapsed() > START_TIMEOUT => {
-                    return Err(error.context("rtx-linkd did not start"))
+                    return Err(error.context(t("errors.daemonDidNotStart")))
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(150)),
             }
@@ -137,15 +140,19 @@ impl Api {
     }
 
     fn answer(response: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value> {
-        let mut response = response
-            .map_err(|error| anyhow!("RealTimeX Link's service is not answering ({error})"))?;
+        let mut response = response.map_err(|error| {
+            anyhow!(tf(
+                "errors.notAnswering",
+                &[("error", error.to_string().as_str())]
+            ))
+        })?;
         let status = response.status();
         let body: Value = response.body_mut().read_json().unwrap_or(Value::Null);
         if !status.is_success() {
             let message = body
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("Request failed");
+                .map_or_else(|| t("errors.requestFailed"), str::to_string);
             bail!("{message}");
         }
         Ok(body)
@@ -194,7 +201,7 @@ fn verify_daemon(agent: &ureq::Agent, base: &str, port: u16, token: &str) -> Res
         .ok_or_else(|| anyhow!("not running"))?;
     proves(token, port, &nonce, &proof)
         .then_some(())
-        .ok_or_else(|| anyhow!("RealTimeX Link's service could not prove itself; restart RealTimeX Link"))
+        .ok_or_else(|| anyhow!(t("errors.cannotProve")))
 }
 
 /// Constant-time check of a /v1/hello proof (ring::hmac::verify compares in constant time).
