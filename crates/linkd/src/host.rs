@@ -337,12 +337,14 @@ impl Host {
     // --- sign-in ------------------------------------------------------------
 
     /// POST /connect (ADR-2611 §1.3), first match wins: client key, password, password-only
-    /// refusal, else a pending request.
+    /// refusal, else a pending request. `password_blocked`: too many wrong passwords lately
+    /// (router.rs), which refuses the password branch only.
     pub async fn admit(
         &self,
         body: &Value,
         address: &str,
         via: &str,
+        password_blocked: bool,
     ) -> Result<Admitted, ApiError> {
         if !self.state().allow_incoming {
             return Ok(Admitted::refuse(
@@ -414,6 +416,15 @@ impl Host {
         }
         let supplied = text("password");
         if !supplied.is_empty() {
+            if password_blocked {
+                // As the router's other 429s say it.
+                return Ok(Admitted {
+                    status: 429,
+                    body: json!({ "error": "Too many failed attempts" }),
+                    wrong_password: false,
+                    retry_after: None,
+                });
+            }
             if !password::same(&self.password(), &supplied) {
                 let mut refused =
                     Admitted::refuse(401, "wrong-password", "Wrong App ID or password");

@@ -262,9 +262,14 @@ impl RequestStore {
         if new.same_account {
             return Ok(());
         }
+        // Per IPv4 address or IPv6 /64, as the router counts failed sign-ins.
         let source = new
             .remote_address
-            .clone()
+            .as_deref()
+            .map(|address| match address.parse::<std::net::IpAddr>() {
+                Ok(ip) => crate::router::source_of(ip),
+                Err(_) => address.to_string(),
+            })
             .unwrap_or_else(|| "unknown".into());
         state.other_total.retain(|t| now - t < TOTAL_WINDOW_MS);
         let recent: Vec<i64> = state
