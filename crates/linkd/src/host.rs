@@ -112,6 +112,8 @@ pub struct Host {
     listener: tokio::sync::Mutex<Option<Listener>>,
     /// This computer's own Public Exposure (relay.rs).
     pub relay: Arc<Relay>,
+    /// Link's own sign-in to the account (signin.rs).
+    pub signin: Arc<crate::signin::SignIn>,
     identity: IdentityVerifier,
     reconciling: tokio::sync::Mutex<()>,
     last_active: Mutex<HashMap<String, i64>>,
@@ -173,6 +175,7 @@ impl Host {
                 }),
                 listener: tokio::sync::Mutex::new(None),
                 relay: Relay::new(me.clone()),
+                signin: Arc::new(crate::signin::SignIn::new(me.clone())),
                 identity: IdentityVerifier::new(),
                 reconciling: tokio::sync::Mutex::new(()),
                 last_active: Mutex::new(HashMap::new()),

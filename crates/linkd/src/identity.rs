@@ -60,9 +60,14 @@ fn json_part(part: &str) -> Option<Value> {
     serde_json::from_slice(&b64url(part)?).ok()
 }
 
+/// A JWT's claims, unchecked (the token came straight from the account's sign-in).
+pub fn claims_of(token: &str) -> Option<Value> {
+    json_part(token.split('.').nth(1)?)
+}
+
 /// The `sub` and `email` of a JWT, unchecked: the token RealTimeX handed over names the account.
 pub fn account_of(token: &str) -> Option<Value> {
-    let claims = json_part(token.split('.').nth(1)?)?;
+    let claims = claims_of(token)?;
     let subject = claims.get("sub")?.as_str().filter(|s| !s.is_empty())?;
     Some(json!({ "subject": subject, "email": claims.get("email") }))
 }

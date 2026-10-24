@@ -3,8 +3,9 @@
 //! closed too. Link enrolls its own exposure (its own install ID, only Remote Control's surface
 //! `d`), so it never contends with RealTimeX's for the one connector an exposure may have.
 //!
-//! Enrolling (and recovering a lost credential) needs the signed-in account's access token, which
-//! RealTimeX hands over (POST /v1/account/token); the tunnel itself needs only the connector
+//! Enrolling (and recovering a lost credential) needs the signed-in account's access token: Link's
+//! own sign-in (signin.rs), else the one RealTimeX hands over (POST /v1/account/token); the tunnel
+//! itself needs only the connector
 //! credential enrollment returns, kept sealed in the store. The wire protocol is rtx-relay/1, as
 //! RealTimeX's own connector speaks it (server/utils/publicExposure/relayConnector.cjs there):
 //! binary frames over one WebSocket, HTTP streams forwarded into the public Remote Control routes
@@ -85,7 +86,7 @@ mod frame {
     pub const GOAWAY: u8 = 15;
 }
 
-/// The account's access token as RealTimeX last handed it over, and its API base.
+/// An access token for the account, and the Marketplace API base.
 #[derive(Clone)]
 struct Account {
     token: String,
@@ -104,6 +105,8 @@ struct Status {
 pub struct Relay {
     host: Weak<Host>,
     account: Mutex<Option<Account>>,
+    /// The Marketplace API base RealTimeX last named.
+    api_base: Mutex<Option<String>>,
     status: Mutex<Status>,
     /// Woken when something that decides the relay changed (a token, settings, a stop).
     changed: Notify,
@@ -121,6 +124,7 @@ impl Relay {
         Arc::new(Self {
             host,
             account: Mutex::new(None),
+            api_base: Mutex::new(None),
             status: Mutex::new(Status {
                 state: "off",
                 ..Default::default()
@@ -155,16 +159,32 @@ impl Relay {
         self.changed.notify_one();
     }
 
-    /// RealTimeX hands over the signed-in account's access token (and its API base).
-    pub fn set_account(&self, token: &str, api_base: Option<&str>) -> Result<()> {
+    /// RealTimeX hands over the signed-in account's access token (and its API base). It signs
+    /// Link in only when Link has no sign-in of its own (signin.rs); the API base always counts.
+    /// Ok(false): kept as an offer only.
+    pub fn handover(&self, token: &str, api_base: Option<&str>) -> Result<bool> {
         let token = token.trim();
         if token.is_empty() || token.contains(char::is_whitespace) {
             bail!("token must be the account's access token");
         }
         let api_base = api_base
             .map(|base| base.trim().trim_end_matches('/').to_string())
-            .filter(|base| base.starts_with("https://") || base.starts_with("http://127.0.0.1"))
-            .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+            .filter(|base| base.starts_with("https://") || base.starts_with("http://127.0.0.1"));
+        if let Some(base) = &api_base {
+            *lock(&self.api_base) = Some(base.clone());
+        }
+        let takes = self
+            .host
+            .upgrade()
+            .is_some_and(|host| host.signin.takes_handover(token));
+        if takes {
+            self.set_account(token)?;
+        }
+        Ok(takes)
+    }
+
+    /// Sign in with this access token: this computer's account from now on.
+    pub fn set_account(&self, token: &str) -> Result<()> {
         // This computer's account, for "Allow my own computers" (identity.rs), kept across restarts.
         if let (Some(host), Some(account)) =
             (self.host.upgrade(), crate::identity::account_of(token))
@@ -175,22 +195,37 @@ impl Relay {
         }
         *lock(&self.account) = Some(Account {
             token: token.to_string(),
-            api_base,
+            api_base: self.api_base(),
             expires_at: jwt_expiry(token),
         });
         self.wake();
         Ok(())
     }
 
+    /// Signed out: forget the handed-over token.
+    pub fn forget_account(&self) {
+        *lock(&self.account) = None;
+    }
+
     /// The Marketplace API base RealTimeX named (also the identity tokens' issuer).
     pub fn api_base(&self) -> String {
-        lock(&self.account)
-            .as_ref()
-            .map(|account| account.api_base.clone())
+        lock(&self.api_base)
+            .clone()
             .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
     }
 
-    fn account(&self) -> Option<Account> {
+    /// A current access token: Link's own sign-in first, else RealTimeX's unexpired handover.
+    async fn account(&self) -> Option<Account> {
+        let signin = self.host.upgrade().map(|host| host.signin.clone());
+        if let Some(signin) = signin {
+            if let Some(token) = signin.access_token().await {
+                return Some(Account {
+                    expires_at: jwt_expiry(&token),
+                    token,
+                    api_base: self.api_base(),
+                });
+            }
+        }
         let account = lock(&self.account).clone()?;
         let expired = account
             .expires_at
@@ -246,11 +281,11 @@ impl Relay {
             }
             let needs = lock(&self.status).needs_enrollment || self.connection(&host).is_none();
             if needs {
-                match self.account() {
+                match self.account().await {
                     None => {
                         self.set_status(
                             "not-set-up",
-                            Some("Waiting for RealTimeX to sign this computer in".into()),
+                            Some("Sign in to your RealTimeX account to use the relay".into()),
                         );
                         drop(host);
                         self.changed.notified().await;

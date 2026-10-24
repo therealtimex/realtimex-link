@@ -50,7 +50,11 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/autostart", get(autostart).post(set_autostart))
         .route("/v1/window/open", post(open_window))
+        .route("/v1/account", get(account))
         .route("/v1/account/token", post(account_token))
+        .route("/v1/account/sign-in", post(sign_in))
+        .route("/v1/account/sign-out", post(sign_out))
+        .route("/v1/account/use-realtimex", post(use_realtimex))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/overview", get(host_overview))
         .route("/v1/host/settings", post(host_settings))
@@ -235,19 +239,56 @@ async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answe
     Ok(Json(json!({ "owner": owner, "tray": tray })))
 }
 
-/// The signed-in account's access token, from RealTimeX: { token, apiBase }. This computer's own
-/// Public Exposure (relay.rs) needs it to enroll; the tunnel itself does not.
+/// The account Link is signed in to (signin.rs): { signedIn, via, email, name, signingIn, error,
+/// offer }.
+async fn account(State(state): State<Shared>) -> Answer {
+    Ok(Json(state.host.signin.status()))
+}
+
+/// The signed-in account's access token, from RealTimeX: { token, apiBase }. It signs Link in
+/// unless Link has its own sign-in or was signed out here (then { accepted: false }: offered).
 async fn account_token(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let token = body
         .get("token")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("token is required"))?;
-    state
+    let accepted = state
         .host
         .relay
-        .set_account(token, body.get("apiBase").and_then(Value::as_str))
+        .handover(token, body.get("apiBase").and_then(Value::as_str))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    Ok(Json(json!({ "accepted": true })))
+    Ok(Json(json!({ "accepted": accepted })))
+}
+
+/// Start Link's own sign-in: { url } for the browser, which comes back to a one-time local port.
+async fn sign_in(State(state): State<Shared>) -> Answer {
+    let url = state
+        .host
+        .signin
+        .begin()
+        .await
+        .map_err(|error| ApiError::new(500, error.to_string()))?;
+    Ok(Json(json!({ "url": url })))
+}
+
+async fn sign_out(State(state): State<Shared>) -> Answer {
+    state
+        .host
+        .signin
+        .sign_out()
+        .await
+        .map_err(|error| ApiError::new(500, error.to_string()))?;
+    Ok(Json(json!({})))
+}
+
+/// "Continue as …": sign in with the account RealTimeX offered.
+async fn use_realtimex(State(state): State<Shared>) -> Answer {
+    state
+        .host
+        .signin
+        .use_handover()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(Json(json!({})))
 }
 
 /// Start at login (autostart.rs): { enabled, available }. Available: rtx-link is installed next to

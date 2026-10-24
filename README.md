@@ -39,8 +39,14 @@ also be installed on its own from [Releases](https://github.com/therealtimex/rea
 - **At login:** `GET/POST /v1/autostart` on the local API adds or removes a per-user login item
   (LaunchAgent, Run key, XDG autostart) that starts `rtx-link --background`. RealTimeX turns it on
   with its Remote Control plugin and off without it.
-- **Public Exposure:** RealTimeX hands Link the signed-in account's access token
-  (`POST /v1/account/token`); Link enrolls its own exposure with it (only Remote Control's route),
+- **Account:** Link signs in to the RealTimeX account itself: Sign in opens the browser at
+  accounts.realtimex.ai (Keycloak client `realtimex-link`, Authorization Code with PKCE, answered on
+  a one-time `127.0.0.1` port), and Link keeps the offline refresh token sealed and renews its own
+  access tokens (`GET /v1/account`, `POST /v1/account/sign-in`, `/sign-out`). RealTimeX's handover
+  (`POST /v1/account/token`) is the quick way in: it signs Link in only while Link has no sign-in of
+  its own, and after Sign out it is only offered (`POST /v1/account/use-realtimex`).
+  `RTX_LINK_AUTH_ISSUER` points at another realm for development.
+- **Public Exposure:** Link enrolls its own exposure with the account's access token (only Remote Control's route),
   and its App ID becomes that exposure's ID. `/hello` lists the App IDs it had before
   (`formerAppIds`), and RealTimeX moves a computer saved under one to the new one. The tunnel
   runs on Link's own credential, so it stays up while RealTimeX is closed.

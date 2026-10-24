@@ -24,6 +24,8 @@ pub struct Snapshot {
     pub overview: Option<Value>,
     pub requests: Vec<Value>,
     pub password: String,
+    /// The account Link is signed in to (GET /v1/account).
+    pub account: Option<Value>,
     pub error: Option<String>,
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
@@ -121,7 +123,9 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let overview = api.get("/v1/host/overview");
             let requests = api.get("/v1/host/connection-requests");
             let password = api.get("/v1/host/password");
+            let account = api.get("/v1/account").ok();
             let mut state = lock(&shared);
+            state.account = account;
             match overview {
                 Ok(overview) => {
                     state.overview = Some(overview);
@@ -185,6 +189,7 @@ enum Confirm {
     NewPassword,
     StopSession(String),
     Remove { id: String, name: String },
+    SignOut,
 }
 
 pub struct LinkApp {
@@ -424,7 +429,7 @@ impl eframe::App for LinkApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        let (overview, requests, password, error, notice) = {
+        let (overview, requests, password, account, error, notice) = {
             let mut state = lock(&self.shared);
             if state
                 .notice
@@ -437,6 +442,7 @@ impl eframe::App for LinkApp {
                 state.overview.clone(),
                 state.requests.clone(),
                 state.password.clone(),
+                state.account.clone(),
                 state.error.clone(),
                 state.notice.clone(),
             )
@@ -537,7 +543,10 @@ impl eframe::App for LinkApp {
                     });
                     ui.separator();
                     match self.tab {
-                        Tab::ThisComputer => self.this_computer_ui(ui, ctx, overview, &password),
+                        Tab::ThisComputer => {
+                            self.this_computer_ui(ui, ctx, overview, &password);
+                            self.account_ui(ui, ctx, account.as_ref());
+                        }
                         Tab::Computers => self.computers_ui(ui, ctx, overview),
                     }
                 });
@@ -549,6 +558,92 @@ impl eframe::App for LinkApp {
 }
 
 impl LinkApp {
+    /// The RealTimeX account: Link signs in itself in the browser, or takes RealTimeX's.
+    fn account_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, account: Option<&Value>) {
+        let Some(account) = account else { return };
+        let signed_in = account.get("signedIn") == Some(&Value::Bool(true));
+        let signing_in = account.get("signingIn") == Some(&Value::Bool(true));
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Account").strong().size(15.0));
+                if signed_in {
+                    badge(ui, "Signed in", Tone::Success);
+                }
+            });
+            if let Some(error) = account.get("error").and_then(Value::as_str) {
+                ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).1));
+            }
+            if signed_in {
+                ui.horizontal(|ui| {
+                    let email = text(account, "email");
+                    ui.label(&email);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Sign out").clicked() {
+                            self.confirm = Some(Confirm::SignOut);
+                        }
+                    });
+                });
+                if text(account, "via") == "realtimex" {
+                    caption(ui, "Signed in through RealTimeX on this computer.");
+                }
+                return;
+            }
+            caption(ui, "Sign in to your RealTimeX account, so other computers can reach this one through RealTimeX's relay and your own computers can connect without asking.");
+            if signing_in {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Finish signing in in your browser…");
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                let label = if signing_in {
+                    "Open the browser again"
+                } else {
+                    "Sign in"
+                };
+                if ui.button(RichText::new(label).strong()).clicked() {
+                    self.sign_in(ctx);
+                }
+                if let Some(offer) = account.get("offer").and_then(Value::as_str) {
+                    let who = if offer.is_empty() {
+                        "RealTimeX's account"
+                    } else {
+                        offer
+                    };
+                    if ui.button(format!("Continue as {who}")).clicked() {
+                        self.act(
+                            ctx,
+                            "/v1/account/use-realtimex",
+                            json!({}),
+                            "Signed in with RealTimeX's account.",
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    /// Start the sign-in in the daemon, then open its page in the browser.
+    fn sign_in(&self, ctx: &egui::Context) {
+        let (shared, refresh, ctx) = (self.shared.clone(), self.refresh.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let api = lock(&shared).api.clone();
+            let answer = match api {
+                Some(api) => api.post("/v1/account/sign-in", json!({})),
+                None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+            };
+            match answer.map(|answer| text(&answer, "url")) {
+                Ok(url) if !url.is_empty() => desktop::open_url(&url),
+                Ok(_) => {}
+                Err(error) => {
+                    lock(&shared).notice = Some((error.to_string(), false, Instant::now()));
+                }
+            }
+            let _ = refresh.send(());
+            ctx.request_repaint();
+        });
+    }
+
     /// A new computer asks: Allow control, View only or Deny, before it expires.
     fn requests_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, requests: &[Value]) {
         for request in requests {
@@ -1023,6 +1118,11 @@ impl LinkApp {
                 format!("Remove {name}? Its session ends. With the password it can connect again as a new computer."),
                 "Remove",
             ),
+            Confirm::SignOut => (
+                "Sign out?".to_string(),
+                "Your own computers ask before connecting again, and the relay can't be set up again until you sign in. Computers already here keep their access.".to_string(),
+                "Sign out",
+            ),
         };
         let mut close = false;
         let mut confirmed = false;
@@ -1073,6 +1173,9 @@ impl LinkApp {
                     json!({ "id": id }),
                     &format!("{name} was removed."),
                 ),
+                Some(Confirm::SignOut) => {
+                    self.act(ctx, "/v1/account/sign-out", json!({}), "Signed out.")
+                }
                 None => {}
             }
         } else if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

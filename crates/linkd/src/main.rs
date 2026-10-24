@@ -27,6 +27,7 @@ mod relay;
 mod requests;
 mod router;
 mod secret_box;
+mod signin;
 mod store;
 mod tailscale;
 mod transfers;
