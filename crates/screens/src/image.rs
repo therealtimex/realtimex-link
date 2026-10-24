@@ -176,6 +176,11 @@ mod tests {
         assert_eq!((w, h), (2560, 1440), "never upscaled");
     }
 
+    /// A thumbnail of one gray level.
+    fn thumb(level: u8) -> Vec<u8> {
+        vec![level; THUMB_WIDTH * THUMB_HEIGHT]
+    }
+
     #[test]
     fn diff_bounds() {
         assert_eq!(thumb_diff(&thumb(0), &thumb(0)), 0.0);

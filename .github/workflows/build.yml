@@ -72,10 +72,11 @@ jobs:
       - name: Build (macOS, Linux)
         if: matrix.script == 'unix'
         run: scripts/build.sh ${{ matrix.arch }} dist/${{ matrix.name }}
-      # The daemon's unit tests, once (Linux): autostart, install, the local API.
-      - name: Test rtx-linkd (Linux)
+      # Unit tests, once (Linux): the daemon (autostart, install, the local API) and the screen
+      # capture crate (its one-request-at-a-time gate, image helpers).
+      - name: Test rtx-linkd and rtx-screens (Linux)
         if: matrix.name == 'linux-x86_64'
-        run: cargo test --locked -p rtx-linkd
+        run: cargo test --locked -p rtx-linkd -p rtx-screens
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh

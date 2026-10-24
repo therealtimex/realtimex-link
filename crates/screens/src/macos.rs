@@ -7,7 +7,8 @@
 //! and then the display is shot instead.
 
 use std::ptr::NonNull;
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::image::{THUMB_HEIGHT, THUMB_WIDTH};
@@ -35,6 +36,7 @@ use objc2_vision::{
     VNRequestTextRecognitionLevel,
 };
 
+use crate::gate::{Busy, Cancelled, Completion, Gate, OpStats, TimedOut};
 use crate::Shot;
 
 #[link(name = "AppKit", kind = "framework")]
@@ -42,8 +44,11 @@ extern "C" {}
 
 /// A ScreenCaptureKit request that hasn't answered by then has stalled. In a 2-hour Zoom meeting
 /// (dogfood run 7), 9% of requests at a 5 s interval never answered within 10 s while the others
-/// took about 0.1 s; a shorter wait loses less of the next interval.
+/// took about 0.1 s; a shorter wait loses less of the next interval. The request itself is not
+/// cancelled, so [`GATE`] keeps it from being followed by more (#2737).
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// One window list or screenshot request at a time in this process (see [`crate::gate`]).
+static GATE: Gate = Gate::new(TIMEOUT);
 /// A window list this recent is reused by the screenshot that follows it, so a tick asks
 /// ScreenCaptureKit twice (list, capture) instead of three times.
 const REUSE_LIST: Duration = Duration::from_secs(2);
@@ -105,36 +110,74 @@ fn shareable_windows() -> Result<Vec<Retained<SCWindow>>> {
 }
 
 fn shareable_content() -> Result<SendContent> {
+    shareable_content_until(None)
+}
+
+/// A fresh window list; `stop` ends the wait early. A late answer is dropped, so it never
+/// replaces a newer list.
+fn shareable_content_until(stop: Option<&AtomicBool>) -> Result<SendContent> {
     if !supported() {
         bail!("window screenshots need macOS 14 or later");
     }
-    let (tx, rx) = mpsc::channel::<Result<SendContent, String>>();
-    let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
-        let result = match unsafe { content.as_ref() } {
-            Some(c) => Ok(SendContent(
-                unsafe { c.windows() }.to_vec(),
-                unsafe { c.displays() }.to_vec(),
-            )),
-            None => Err(error_text(err)),
-        };
-        let _ = tx.send(result);
-    });
-    unsafe {
-        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            true, false, &block,
-        )
-    };
-    match rx.recv_timeout(TIMEOUT) {
-        Ok(Ok(content)) => {
+    let answer = GATE.run(
+        "listing windows",
+        stop,
+        |done: Completion<Result<SendContent, String>>| {
+            let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
+                done.complete(match unsafe { content.as_ref() } {
+                    Some(c) => Ok(SendContent(
+                        unsafe { c.windows() }.to_vec(),
+                        unsafe { c.displays() }.to_vec(),
+                    )),
+                    None => Err(error_text(err)),
+                });
+            });
+            unsafe {
+                SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+                    true, false, &block,
+                )
+            };
+            Ok(())
+        },
+    )?;
+    match answer {
+        Ok(content) => {
             *LAST_LIST.lock().unwrap() = Some((Instant::now(), content.clone()));
             Ok(content)
         }
         // Transient too: "The user declined TCCs" once in dogfood run 7, with the permission on.
-        Ok(Err(e)) => bail!(
+        Err(e) => bail!(
             "cannot list windows ({e}); if this persists, allow Screen Recording for the app that started rtx-capture"
         ),
-        Err(_) => bail!("listing windows timed out"),
     }
+}
+
+/// The window list or screenshot request that still holds the permit, and for how long: a
+/// request past its 5 s budget that never answered stalls screenshots (#2737).
+pub fn outstanding_request() -> Option<(&'static str, Duration)> {
+    GATE.outstanding()
+}
+
+/// Window list and screenshot requests so far, per operation (diagnostics).
+pub fn request_stats() -> Vec<(&'static str, OpStats)> {
+    GATE.stats()
+}
+
+/// Debug builds only, for the live stall check (#2737): with `RTX_CAPTURE_TEST_STALL_SCREENSHOT=n`,
+/// the n-th screenshot request of the process never answers.
+#[cfg(debug_assertions)]
+fn test_stall() -> bool {
+    static SCREENSHOTS: AtomicU64 = AtomicU64::new(0);
+    let n = SCREENSHOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    std::env::var("RTX_CAPTURE_TEST_STALL_SCREENSHOT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        == Some(n)
+}
+
+/// Whether `e` is a request that is still pending (busy, timed out or stopped), not an answer.
+pub fn is_pending(e: &anyhow::Error) -> bool {
+    e.is::<Busy>() || e.is::<TimedOut>() || e.is::<Cancelled>()
 }
 
 /// Every window of these processes, at any layer and size, on screen or not, one line each: for
@@ -306,22 +349,29 @@ fn recognize_text(image: &CGImage) -> Vec<TextLine> {
 
 /// One screenshot through `filter`, at most `max_width` pixels wide, with its text.
 fn shoot(filter: &SCContentFilter, max_width: u32, what: &str, title: String) -> Result<Shot> {
-    let image = capture_image(filter, max_width, what)?;
+    let image = capture_image(filter, max_width, what, None)?;
+    shot_of(&image, title)
+}
+
+/// The JPEG, thumbnail and text of a captured picture.
+fn shot_of(image: &CGImage, title: String) -> Result<Shot> {
     Ok(Shot {
-        jpeg: encode_jpeg(&image)?,
-        thumb: thumbnail(&image)?,
-        width: CGImage::width(Some(&image)) as u32,
-        height: CGImage::height(Some(&image)) as u32,
+        jpeg: encode_jpeg(image)?,
+        thumb: thumbnail(image)?,
+        width: CGImage::width(Some(image)) as u32,
+        height: CGImage::height(Some(image)) as u32,
         title,
-        text: recognize_text(&image),
+        text: recognize_text(image),
     })
 }
 
 /// The picture through `filter`, at most `max_width` pixels wide (scaled by ScreenCaptureKit).
+/// A late picture is dropped: it never answers a later request.
 fn capture_image(
     filter: &SCContentFilter,
     max_width: u32,
     what: &str,
+    stop: Option<&AtomicBool>,
 ) -> Result<CFRetained<CGImage>> {
     let (width, height) = fit(filter, max_width, what)?;
     let config = unsafe { SCStreamConfiguration::new() };
@@ -330,27 +380,41 @@ fn capture_image(
         config.setHeight(height);
         config.setShowsCursor(false);
     }
-
-    let (tx, rx) = mpsc::channel::<Result<CFRetained<CGImage>, String>>();
-    let block = RcBlock::new(move |image: *mut CGImage, err: *mut NSError| {
-        let result = match NonNull::new(image) {
-            Some(p) => Ok(unsafe { CFRetained::retain(p) }),
-            None => Err(error_text(err)),
-        };
-        let _ = tx.send(result);
-    });
-    unsafe {
-        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-            filter,
-            &config,
-            Some(&block),
+    let answer = GATE
+        .run(
+            "screenshot",
+            stop,
+            |done: Completion<Result<CFRetained<CGImage>, String>>| {
+                #[cfg(debug_assertions)]
+                if test_stall() {
+                    // Never answered, like a lost callback: the permit stays held.
+                    std::mem::forget(done);
+                    return Ok(());
+                }
+                let block = RcBlock::new(move |image: *mut CGImage, err: *mut NSError| {
+                    done.complete(match NonNull::new(image) {
+                        Some(p) => Ok(unsafe { CFRetained::retain(p) }),
+                        None => Err(error_text(err)),
+                    });
+                });
+                unsafe {
+                    SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+                        filter,
+                        &config,
+                        Some(&block),
+                    )
+                };
+                Ok(())
+            },
         )
-    };
-    match rx.recv_timeout(TIMEOUT) {
-        Ok(Ok(image)) => Ok(image),
-        Ok(Err(e)) => bail!("screenshot of {what} failed: {e}"),
-        Err(_) => bail!("screenshot of {what} timed out"),
-    }
+        .map_err(|e| match e.downcast::<TimedOut>() {
+            Ok(_) => TimedOut {
+                what: format!("screenshot of {what}"),
+            }
+            .into(),
+            Err(e) => e,
+        })?;
+    answer.map_err(|e| anyhow!("screenshot of {what} failed: {e}"))
 }
 
 /// The size of `filter`'s picture scaled to at most `max_width` pixels wide.
@@ -368,6 +432,106 @@ fn fit(filter: &SCContentFilter, max_width: u32, what: &str) -> Result<(usize, u
 pub(crate) fn fit_filter(filter: &SCContentFilter, max_width: u32) -> Result<(usize, usize)> {
     let (width, height) = fit(filter, max_width, "the display")?;
     Ok(((width & !1).max(2), (height & !1).max(2)))
+}
+
+/// The window [`capture_listed_window`] shot last, reused while the window list says it is the
+/// same window: same id, owner and frame. A tick then asks ScreenCaptureKit once (the capture)
+/// instead of listing every window of every app first (#2737).
+struct Binding {
+    id: u32,
+    pid: i32,
+    frame: [f64; 4],
+    window: Retained<SCWindow>,
+}
+
+// An SCWindow is an immutable description (see SendContent).
+unsafe impl Send for Binding {}
+
+static BOUND: Mutex<Option<Binding>> = Mutex::new(None);
+static BINDS_LISTED: AtomicU64 = AtomicU64::new(0);
+static BINDS_REUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Windows bound by listing them, and captures that reused a binding (diagnostics).
+pub fn binding_stats() -> (u64, u64) {
+    (
+        BINDS_LISTED.load(Ordering::Relaxed),
+        BINDS_REUSED.load(Ordering::Relaxed),
+    )
+}
+
+/// Screenshot window `id`, which the window list (`CGWindowListCopyWindowInfo`) says belongs to
+/// process `pid` with `frame` (x, y, width, height in points) and `title`, at most `max_width`
+/// pixels wide. `stop` ends the waits early.
+///
+/// ScreenCaptureKit's description of the window is listed once and reused while id, owner and
+/// frame stay the same; a different owner is refused, never shot. A move or resize, or a
+/// capture that answers with an error, lists it again; a timeout does not (the request is
+/// still outstanding, and listing now would only queue behind it).
+pub fn capture_listed_window(
+    id: u32,
+    pid: i32,
+    frame: [f64; 4],
+    title: &str,
+    max_width: u32,
+    stop: &AtomicBool,
+) -> Result<Shot> {
+    let window = bound_window(id, pid, frame, stop)?;
+    let filter = unsafe {
+        SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window)
+    };
+    let image = capture_image(&filter, max_width, &format!("window {id}"), Some(stop))
+        .inspect_err(|e| {
+            if !is_pending(e) {
+                unbind(id);
+            }
+        })?;
+    shot_of(&image, title.to_string())
+}
+
+fn bound_window(
+    id: u32,
+    pid: i32,
+    frame: [f64; 4],
+    stop: &AtomicBool,
+) -> Result<Retained<SCWindow>> {
+    if let Some(b) = BOUND.lock().unwrap().as_ref() {
+        if b.id == id && b.pid == pid && same_frame(&b.frame, &frame) {
+            BINDS_REUSED.fetch_add(1, Ordering::Relaxed);
+            return Ok(b.window.clone());
+        }
+    }
+    BINDS_LISTED.fetch_add(1, Ordering::Relaxed);
+    let window = shareable_content_until(Some(stop))?
+        .0
+        .into_iter()
+        .find(|w| unsafe { w.windowID() } == id)
+        .ok_or_else(|| anyhow!("window {id} is gone"))?;
+    // Some windows are listed without an owning application; one that names another process is
+    // not the window the list described.
+    if let Some(owner) = unsafe { window.owningApplication() }.map(|a| unsafe { a.processID() }) {
+        if owner != pid {
+            bail!("window {id} belongs to process {owner} now, not {pid}");
+        }
+    }
+    *BOUND.lock().unwrap() = Some(Binding {
+        id,
+        pid,
+        frame,
+        window: window.clone(),
+    });
+    Ok(window)
+}
+
+fn unbind(id: u32) {
+    let mut bound = BOUND.lock().unwrap();
+    if bound.as_ref().is_some_and(|b| b.id == id) {
+        *bound = None;
+    }
+}
+
+/// Frames within half a point: the same position, size and display.
+fn same_frame(a: &[f64; 4], b: &[f64; 4]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.5)
 }
 
 /// Screenshot one window at most `max_width` pixels wide.

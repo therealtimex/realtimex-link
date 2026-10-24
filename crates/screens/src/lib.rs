@@ -59,6 +59,10 @@ impl Frame {
     }
 }
 
+/// One native capture request at a time (#2737); used by the macOS backend, tested everywhere.
+pub mod gate;
+pub use gate::{Busy, Cancelled, TimedOut};
+
 /// ScreenCaptureKit (window and display screenshots, Vision OCR).
 #[cfg(target_os = "macos")]
 pub mod macos;
