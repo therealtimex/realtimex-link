@@ -130,8 +130,10 @@ jobs:
             IFS=: read -r name deb rpm <<<"$pair"
             for packager in deb rpm; do
               arch=$([ "$packager" = deb ] && echo "$deb" || echo "$rpm")
+              # nfpm doesn't expand variables in file paths: the config is filled in first.
               (cd ../source && ARCH="$arch" VERSION="$VERSION" PAYLOAD="$PWD/../dist/realtimex-link-linux-$name" \
-                ../dist/nfpm package --config packaging/linux/nfpm.yaml --packager "$packager" \
+                envsubst '${ARCH} ${VERSION} ${PAYLOAD}' < packaging/linux/nfpm.yaml > nfpm.yaml && \
+                ../dist/nfpm package --config nfpm.yaml --packager "$packager" \
                 --target "../dist/realtimex-link_${VERSION}_${arch}.${packager}")
             done
           done

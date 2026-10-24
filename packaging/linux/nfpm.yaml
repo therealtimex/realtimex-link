@@ -1,7 +1,8 @@
 # RealTimeX Link's .deb and .rpm (nfpm): the release binaries go to a payload folder, and the
 # package's post-install script installs them with Link's own installer into /opt/RealTimeX Link,
 # where RealTimeX's own package puts it too (never a downgrade; a running Link is stopped first).
-# Built by the release workflow: VERSION, ARCH (amd64|arm64) and PAYLOAD (the binaries) from the env.
+# Built by the release workflow, which fills in VERSION, ARCH (amd64|arm64) and PAYLOAD (the binaries)
+# with envsubst first: nfpm itself does not expand variables in file paths.
 name: realtimex-link
 arch: ${ARCH}
 platform: linux
