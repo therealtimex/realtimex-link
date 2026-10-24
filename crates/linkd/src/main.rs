@@ -31,6 +31,7 @@ mod signin;
 mod store;
 mod tailscale;
 mod transfers;
+mod update;
 mod util;
 
 use std::path::PathBuf;

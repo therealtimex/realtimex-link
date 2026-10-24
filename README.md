@@ -42,7 +42,10 @@ account in its window and turn on **Allow remote control**.
 | Linux | `realtimex-link_<version>_<arch>.deb` / `.rpm` | `/opt/RealTimeX Link` |
 
 RealTimeX installs Link in the same places, so either one installs or updates it, never a
-downgrade. **Releases:** GitHub Actions builds every tag (unsigned archives, Linux packages);
+downgrade. Link also updates itself (`crates/linkd/src/update.rs`): it looks for a newer release at
+start and every six hours, and the window and tray offer Update. On macOS it installs the signed
+archive once codesign confirms the same Team ID, then reopens; on Windows it starts the signed
+installer once Authenticode confirms the same publisher; on Linux it opens the release page. **Releases:** GitHub Actions builds every tag (unsigned archives, Linux packages);
 RealTimeX's GitLab then signs and notarizes the macOS and Windows builds, adds the `.dmg` and the
 Windows installer, and publishes the release. This repository is a mirror of
 `rtgit.rta.vn/rtlab/rtwebteam/realtimex-link`; send changes there.

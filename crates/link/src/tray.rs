@@ -1,5 +1,6 @@
 //! The menu bar (macOS) / tray (Windows, Linux) icon: whether remote control is on and who is in
-//! control, Copy App ID and password, turn it off or on, open the window or RealTimeX, and Quit,
+//! control, Copy App ID and password, turn it off or on, open the window or RealTimeX, update
+//! Link, and Quit,
 //! which stops hosting (closing the window does not). How the window opens and text is copied is
 //! up to the process that shows the icon (Actions): the window's own on macOS and Windows, a
 //! separate window process on Linux (icon.rs).
@@ -12,7 +13,7 @@ use serde_json::{json, Value};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::app::{act, lock, Shared};
+use crate::app::{act, lock, start_update, Shared};
 use crate::desktop;
 
 /// What the icon's menu does for the process showing it.
@@ -41,7 +42,8 @@ pub struct Tray {
     _icon: TrayIcon,
     status: MenuItem,
     toggle: MenuItem,
-    last: std::cell::RefCell<(String, String)>,
+    update: MenuItem,
+    last: std::cell::RefCell<(String, String, String)>,
 }
 
 /// The menu bar / tray icon (assets/tray.svg and the app icon, made by scripts/icons.py): on
@@ -69,6 +71,7 @@ impl Tray {
         let toggle = MenuItem::new("Turn off remote control", true, None);
         let copy = MenuItem::new("Copy App ID and password", true, None);
         let open = MenuItem::new("Open RealTimeX Link…", true, None);
+        let update = MenuItem::new("Check for updates", true, None);
         let realtimex = MenuItem::new(
             if desktop::realtimex_app().is_some() {
                 "Open RealTimeX"
@@ -88,6 +91,7 @@ impl Tray {
             &PredefinedMenuItem::separator(),
             &open,
             &realtimex,
+            &update,
             &PredefinedMenuItem::separator(),
             &quit,
         ])?;
@@ -106,16 +110,29 @@ impl Tray {
             toggle.id().clone(),
             open.id().clone(),
             realtimex.id().clone(),
+            update.id().clone(),
             quit.id().clone(),
         );
         // Handled here, not in the window: the window may be hidden and not drawing.
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            let (copy, toggle, open, realtimex, quit) = &ids;
+            let (copy, toggle, open, realtimex, update, quit) = &ids;
             let id = &event.id;
             if id == open {
                 (actions.open)();
             } else if id == realtimex {
                 desktop::open_realtimex();
+            } else if id == update {
+                let available = lock(&shared)
+                    .update
+                    .as_ref()
+                    .and_then(|u| u.get("available"))
+                    == Some(&Value::Bool(true));
+                if available {
+                    (actions.open)();
+                    start_update(&shared, &refresh, &ctx);
+                } else {
+                    act(&shared, &refresh, &ctx, "/v1/update/check", json!({}), "");
+                }
             } else if id == copy {
                 let state = lock(&shared);
                 let app_id = state
@@ -165,12 +182,13 @@ impl Tray {
             _icon: icon,
             status,
             toggle,
+            update,
             last: Default::default(),
         })
     }
 
-    /// The status line and the switch's label, from the latest overview.
-    pub fn update(&self, overview: Option<&Value>) {
+    /// The status line, the switch's and the update item's labels, from the latest state.
+    pub fn update(&self, overview: Option<&Value>, update: Option<&Value>) {
         let on = overview.and_then(|o| o.get("allowIncoming")) == Some(&Value::Bool(true));
         let holder = overview
             .and_then(|o| o.get("session"))
@@ -189,7 +207,19 @@ impl Tray {
             "Turn on remote control"
         }
         .to_string();
+        let latest = update
+            .filter(|u| u.get("available") == Some(&Value::Bool(true)))
+            .and_then(|u| u.get("latest"))
+            .and_then(Value::as_str);
+        let update_label = match latest {
+            Some(version) => format!("Update to RealTimeX Link {version}…"),
+            None => "Check for updates".to_string(),
+        };
         let mut last = self.last.borrow_mut();
+        if last.2 != update_label {
+            self.update.set_text(&update_label);
+            last.2 = update_label;
+        }
         if last.0 != status {
             self.status.set_text(&status);
             last.0 = status;

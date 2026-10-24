@@ -55,6 +55,9 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/account/sign-in", post(sign_in))
         .route("/v1/account/sign-out", post(sign_out))
         .route("/v1/account/use-realtimex", post(use_realtimex))
+        .route("/v1/update", get(update_status))
+        .route("/v1/update/check", post(update_check))
+        .route("/v1/update/install", post(update_install))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/overview", get(host_overview))
         .route("/v1/host/settings", post(host_settings))
@@ -279,6 +282,33 @@ async fn sign_out(State(state): State<Shared>) -> Answer {
         .await
         .map_err(|error| ApiError::new(500, error.to_string()))?;
     Ok(Json(json!({})))
+}
+
+/// Link's own updates (update.rs): { current, latest, available, page, busy, error, checkedAt }.
+async fn update_status(State(state): State<Shared>) -> Answer {
+    Ok(Json(state.host.updater.status()))
+}
+
+async fn update_check(State(state): State<Shared>) -> Answer {
+    let status = state
+        .host
+        .updater
+        .check()
+        .await
+        .map_err(|error| ApiError::new(500, error.to_string()))?;
+    Ok(Json(status))
+}
+
+/// Update now: { started } (the new Link starts itself), or { open } with the release page for
+/// the window to open (Linux).
+async fn update_install(State(state): State<Shared>) -> Answer {
+    let answer = state
+        .host
+        .updater
+        .install()
+        .await
+        .map_err(|error| ApiError::new(500, error.to_string()))?;
+    Ok(Json(answer))
 }
 
 /// "Continue as …": sign in with the account RealTimeX offered.
