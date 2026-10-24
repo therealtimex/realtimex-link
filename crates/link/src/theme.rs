@@ -106,8 +106,9 @@ pub const CARD_RADIUS: u8 = 8;
 const CONTROL_HEIGHT: f32 = 32.0;
 pub const PRIMARY_HEIGHT: f32 = 36.0;
 
-/// Plus Jakarta Sans, then the Cyrillic subset, ahead of egui's own fonts (its icons and emoji).
-fn fonts() -> FontDefinitions {
+/// Plus Jakarta Sans, then the Cyrillic subset, ahead of egui's own fonts (its icons and emoji);
+/// with a CJK language in effect, its system font too (cjk.rs).
+fn fonts(locale: &crate::i18n::Locale) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
         "plus-jakarta-sans".into(),
@@ -119,11 +120,21 @@ fn fonts() -> FontDefinitions {
     let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
     proportional.insert(0, "plus-jakarta-sans".into());
     proportional.insert(1, "noto-sans-cyrillic".into());
+    let active = match locale.script {
+        crate::i18n::Script::Cjk(region) => Some(region),
+        _ => None,
+    };
+    crate::cjk::add_fonts(&mut fonts, active);
     fonts
 }
 
+/// The fonts for this locale, before its text is shown (app.rs, when the language changes).
+pub fn apply_fonts(ctx: &egui::Context, locale: &crate::i18n::Locale) {
+    ctx.set_fonts(fonts(locale));
+}
+
 pub fn apply(ctx: &egui::Context) {
-    ctx.set_fonts(fonts());
+    apply_fonts(ctx, crate::i18n::current());
     for (theme, tokens) in [(Theme::Dark, &DARK), (Theme::Light, &LIGHT)] {
         ctx.style_mut_of(theme, |style| {
             style.text_styles = [
@@ -227,6 +238,17 @@ pub fn selectable_value<V: PartialEq>(
     value: V,
     text: &str,
 ) -> egui::Response {
+    selectable_value_in(ui, current, value, text, None)
+}
+
+/// selectable_value() with its text in a font family of its own (a language's name in Settings).
+pub fn selectable_value_in<V: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut V,
+    value: V,
+    text: &str,
+    family: Option<FontFamily>,
+) -> egui::Response {
     let selected = *current == value;
     let tokens = tokens(ui);
     let mut response = ui
@@ -236,11 +258,14 @@ pub fn selectable_value<V: PartialEq>(
                 widgets.inactive.bg_stroke = Stroke::new(1.0, tokens.selected_border);
                 widgets.hovered.bg_stroke = Stroke::new(1.0, tokens.selected_border);
             }
-            let label = if selected {
+            let mut label = if selected {
                 semibold(text).color(tokens.text)
             } else {
                 RichText::new(text)
             };
+            if let Some(family) = family {
+                label = label.family(family);
+            }
             ui.add(egui::Button::selectable(selected, label))
         })
         .inner;

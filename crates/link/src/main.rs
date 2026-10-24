@@ -9,6 +9,7 @@ use rtx_glibc_compat as _;
 
 mod api;
 mod app;
+mod cjk;
 mod desktop;
 mod dock;
 mod i18n;

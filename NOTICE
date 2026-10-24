@@ -11,3 +11,7 @@ Its Russian text uses a Cyrillic subset of the Noto Sans typeface
 (crates/link/fonts/NotoSansCyrillic.ttf), Copyright 2022 The Noto Project Authors
 (https://github.com/notofonts/latin-greek-cyrillic), under the SIL Open Font License 1.1
 (crates/link/fonts/OFL-NotoSans.txt).
+
+Language names in Chinese, Japanese and Korean use subsets of the Noto Sans SC, TC, JP and KR
+typefaces (crates/link/fonts/endonym-*.ttf), Copyright 2014-2021 Adobe (http://www.adobe.com/),
+under the SIL Open Font License 1.1 (crates/link/fonts/OFL-NotoSansCJK.txt).

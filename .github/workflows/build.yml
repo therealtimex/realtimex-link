@@ -108,10 +108,13 @@ jobs:
       - name: Clippy (Linux)
         if: matrix.name == 'linux-x86_64'
         run: cargo clippy --locked -p rtx-linkd -p rtx-link -p rtx-screens
-      # The macOS key mapping (which key, and Shift, types each character), once (Apple silicon).
-      - name: Test macOS key mapping
+      # The macOS key mapping (which key, and Shift, types each character) and the window's tests
+      # on macOS (its CJK font candidates are on the runner), once (Apple silicon).
+      - name: Test macOS key mapping and fonts
         if: matrix.name == 'macos-arm64'
-        run: cargo test --locked -p rtx-control -- platform::macos
+        run: |
+          cargo test --locked -p rtx-control -- platform::macos
+          cargo test --locked -p rtx-link
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh

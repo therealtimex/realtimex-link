@@ -178,6 +178,9 @@ fn theme_preference(status: Option<&Value>) -> egui::ThemePreference {
 }
 
 pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
+    // Which CJK languages this computer can show: found off this thread, picked up by a later
+    // poll (the window shows English until then).
+    std::thread::spawn(crate::cjk::scan);
     let mut appearance = None;
     loop {
         let api = lock(&shared).api.clone();
@@ -213,6 +216,11 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
                 (field("appearance"), field("language"))
             });
             if let Some((_, language)) = &stored {
+                // The fonts first (a CJK language's), so its text never shows without them.
+                let next = crate::i18n::effective_locale(language);
+                if !std::ptr::eq(next, crate::i18n::current()) {
+                    theme::apply_fonts(&ctx, next);
+                }
                 if crate::i18n::set_language(language) {
                     ctx.request_repaint();
                 }
@@ -1434,11 +1442,12 @@ impl LinkApp {
                 .show_ui(ui, |ui| {
                     theme::selectable_value(ui, &mut chosen, "system".to_string(), &system_default);
                     for locale in crate::i18n::offered_languages() {
-                        theme::selectable_value(
+                        theme::selectable_value_in(
                             ui,
                             &mut chosen,
                             locale.code.to_string(),
                             locale.endonym,
+                            crate::cjk::endonym_family(locale.code),
                         );
                     }
                 });

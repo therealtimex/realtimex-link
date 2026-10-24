@@ -25,10 +25,10 @@ ring = "0.17"
 # The menu bar (macOS) and tray (Windows, Linux) icon. On Linux the StatusNotifierItem backend
 # (D-Bus, its own thread): no GTK; GNOME shows it with the AppIndicator extension (Ubuntu's default).
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
-
-[dev-dependencies]
-# The fonts' character maps (theme.rs tests); epaint's own font reader, same version.
+# Chinese, Japanese and Korean (cjk.rs): a system font's faces and characters, with epaint's own
+# font reader (same version), mapped from disk rather than copied.
 skrifa = "0.44.0"
+memmap2 = "0.9.12"
 
 # macOS: in the Dock only while the window is open (dock.rs).
 [target.'cfg(target_os = "macos")'.dependencies]

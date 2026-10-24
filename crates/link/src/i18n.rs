@@ -14,6 +14,8 @@ pub enum Script {
     Latin,
     /// The bundled Noto Sans Cyrillic subset (theme.rs).
     Cyrillic,
+    /// A system font found by cjk.rs: offered only where there is one.
+    Cjk(crate::cjk::Region),
     /// Right to left: never offered until egui lays out bidirectional text (0.37 can't), so it
     /// resolves to English. The translations are kept for then.
     Rtl,
@@ -30,12 +32,18 @@ pub struct Locale {
 }
 
 macro_rules! locale {
+    ($code:literal, $endonym:literal, $english:literal, Cjk($region:ident)) => {
+        locale!(@ $code, $endonym, $english, Script::Cjk(crate::cjk::Region::$region))
+    };
     ($code:literal, $endonym:literal, $english:literal, $script:ident) => {
+        locale!(@ $code, $endonym, $english, Script::$script)
+    };
+    (@ $code:literal, $endonym:literal, $english:literal, $script:expr) => {
         Locale {
             code: $code,
             endonym: $endonym,
             english: $english,
-            script: Script::$script,
+            script: $script,
             source: include_str!(concat!("../locales/", $code, ".json")),
         }
     };
@@ -45,9 +53,18 @@ macro_rules! locale {
 pub static LOCALES: [Locale; COUNT] = [
     locale!("en", "English", "English", Latin),
     locale!("vi", "Tiếng Việt", "Vietnamese", Latin),
+    locale!("zh", "简体中文", "Chinese (Simplified)", Cjk(Simplified)),
+    locale!(
+        "zh-tw",
+        "繁體中文",
+        "Chinese (Traditional)",
+        Cjk(Traditional)
+    ),
     locale!("es", "Español", "Spanish", Latin),
     locale!("fr", "Français", "French", Latin),
     locale!("de", "Deutsch", "German", Latin),
+    locale!("ja", "日本語", "Japanese", Cjk(Japanese)),
+    locale!("ko", "한국어", "Korean", Cjk(Korean)),
     locale!("pt", "Português (Brasil)", "Portuguese (Brazil)", Latin),
     locale!("ru", "Русский", "Russian", Cyrillic),
     locale!("ar", "العربية", "Arabic", Rtl),
@@ -63,7 +80,7 @@ pub static LOCALES: [Locale; COUNT] = [
     locale!("tr", "Türkçe", "Turkish", Latin),
 ];
 
-const COUNT: usize = 18;
+const COUNT: usize = 22;
 const ENGLISH: usize = 0;
 
 /// Each locale's strings, parsed the first time they are needed.
@@ -95,6 +112,7 @@ fn index_of(locale: &Locale) -> usize {
 fn offered(locale: &Locale) -> bool {
     match locale.script {
         Script::Latin | Script::Cyrillic => true,
+        Script::Cjk(region) => crate::cjk::available(region),
         Script::Rtl => false,
     }
 }
@@ -105,11 +123,22 @@ pub fn offered_languages() -> Vec<&'static Locale> {
 }
 
 /// The locale for a tag ("vi", "pt-BR", "de_AT", any case), or None when Link has none. Its
-/// language decides: Brazilian Portuguese is RealTimeX's only Portuguese.
+/// language decides (Brazilian Portuguese is RealTimeX's only Portuguese), except Chinese:
+/// Taiwan, Hong Kong, Macau and Hant are traditional, the rest simplified.
 fn locale_for(tag: &str) -> Option<&'static Locale> {
     let tag = tag.trim().replace('_', "-").to_ascii_lowercase();
-    let language = tag.split('-').next().unwrap_or("");
-    LOCALES.iter().find(|l| l.code == language)
+    let mut subtags = tag.split('-');
+    let language = subtags.next().unwrap_or("");
+    let code = if language == "zh" {
+        if subtags.any(|subtag| matches!(subtag, "tw" | "hk" | "mo" | "hant")) {
+            "zh-tw"
+        } else {
+            "zh"
+        }
+    } else {
+        language
+    };
+    LOCALES.iter().find(|l| l.code == code)
 }
 
 /// The locale in effect for a requested language: the only place that falls back. "system" (or
@@ -134,14 +163,9 @@ fn resolve(
 }
 
 /// Use the language RealTimeX or Settings asked for (GET /v1/status "language"). True when the
-/// locale in effect changed, so the window and the tray redraw their text.
+/// locale in effect changed, so the window and the tray redraw their text. Worked out again each
+/// time: a CJK language becomes available once its font is found.
 pub fn set_language(requested: &str) -> bool {
-    {
-        let current = CURRENT.read().unwrap_or_else(|p| p.into_inner());
-        if current.requested == requested && !current.requested.is_empty() {
-            return false;
-        }
-    }
     let effective = index_of(effective_locale(requested));
     let mut current = CURRENT.write().unwrap_or_else(|p| p.into_inner());
     current.requested = requested.to_string();
@@ -304,8 +328,26 @@ mod tests {
         // System default: the system's language, through the same rules.
         assert_eq!(code("system", Some("vi_VN")), "vi");
         assert_eq!(code("system", Some("fr-CA")), "fr");
-        assert_eq!(code("system", Some("ja-JP")), "en");
+        assert_eq!(code("system", Some("sv-SE")), "en");
         assert_eq!(code("system", None), "en");
+    }
+
+    #[test]
+    fn chinese_tags_pick_simplified_or_traditional_and_cjk_needs_a_font() {
+        let all = |tag: &str| resolve(tag, || None, |_| true).code;
+        assert_eq!(all("zh"), "zh");
+        assert_eq!(all("zh-CN"), "zh");
+        assert_eq!(all("zh-Hans-CN"), "zh");
+        assert_eq!(all("zh-TW"), "zh-tw");
+        assert_eq!(all("zh_HK"), "zh-tw");
+        assert_eq!(all("zh-Hant"), "zh-tw");
+        assert_eq!(all("ja-JP"), "ja");
+        assert_eq!(all("ko"), "ko");
+        // Without a font (or before the scan), English.
+        let latin = |tag: &str| resolve(tag, || None, |l| !matches!(l.script, Script::Cjk(_))).code;
+        for tag in ["zh", "zh-TW", "ja", "ko"] {
+            assert_eq!(latin(tag), "en", "{tag}");
+        }
     }
 
     #[test]
@@ -313,7 +355,12 @@ mod tests {
         for tag in ["ar", "fa", "he", "ar-EG", "he_IL"] {
             assert_eq!(code(tag, None), "en", "{tag}");
         }
-        let offered: Vec<_> = offered_languages().iter().map(|l| l.code).collect();
+        // Always the 15; Chinese, Japanese and Korean where this computer has their fonts.
+        let offered: Vec<_> = offered_languages()
+            .iter()
+            .filter(|l| !matches!(l.script, Script::Cjk(_)))
+            .map(|l| l.code)
+            .collect();
         assert_eq!(
             offered,
             [
