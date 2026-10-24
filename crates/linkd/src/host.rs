@@ -698,6 +698,9 @@ impl Host {
     pub async fn set_allow_incoming(&self, allow: bool) -> Result<(), ApiError> {
         self.state().allow_incoming = allow;
         self.save_settings()?;
+        if allow {
+            self.start_at_login();
+        }
         if !allow {
             // Viewers are cut off first, then capture stops.
             self.end_streams(|_| true).await;
@@ -710,6 +713,24 @@ impl Host {
         Ok(())
     }
 
+    /// Hosting on means this computer should be reachable after a restart too: Link starts at
+    /// login. RealTimeX turns this on as well; on its own, Link has to. A copy with its own data
+    /// folder (development, tests) leaves the login item alone.
+    fn start_at_login(&self) {
+        if !crate::paths::is_standard()
+            || crate::autostart::app_binary().is_none()
+            || crate::autostart::enabled()
+        {
+            return;
+        }
+        match crate::autostart::set(true) {
+            Ok(()) => (self.log)("[remote-control] RealTimeX Link starts at login"),
+            Err(error) => (self.log)(&format!(
+                "[remote-control] couldn't start at login: {error:#}"
+            )),
+        }
+    }
+
     // --- lifecycle ----------------------------------------------------------
 
     pub async fn start(self: &Arc<Self>) {
@@ -718,6 +739,9 @@ impl Host {
             self.state().last_error = Some(error.message);
         }
         self.reconcile().await;
+        if self.state().allow_incoming {
+            self.start_at_login();
+        }
         self.relay.start();
         self.updater.start();
         let weak = Arc::downgrade(self);

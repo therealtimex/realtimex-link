@@ -61,6 +61,7 @@ pub struct Daemon {
 
 pub async fn start(options: Options) -> Result<Daemon> {
     let lock = InstanceLock::acquire(&options.data_dir)?;
+    crate::paths::remember(&options.data_dir);
     let store = Arc::new(Store::open(&options.data_dir)?);
     let secrets = SecretBox::new(&options.data_dir);
     let backend = options.backend.clone().unwrap_or_else(Backend::new);

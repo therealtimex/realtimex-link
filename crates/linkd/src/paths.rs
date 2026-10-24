@@ -2,7 +2,8 @@
 //! (server/utils/remoteHost/paths.js), per user, shared by the standalone app and the one
 //! RealTimeX installs, so there is one daemon and one App ID.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const APP_NAME: &str = "RealTimeX Link";
 
@@ -40,6 +41,32 @@ pub fn default_data_dir() -> PathBuf {
         &|name| std::env::var(name).ok(),
         &home,
     ))
+}
+
+/// The folder this daemon runs on, set once at start (daemon.rs).
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn remember(dir: &Path) {
+    let _ = DATA_DIR.set(dir.to_path_buf());
+}
+
+/// This computer's Link: the standard folder, not a copy with a folder of its own (development,
+/// tests). Only it changes things outside its folder, such as starting at login.
+pub fn is_standard() -> bool {
+    let standard = PathBuf::from(default_data_dir_for(
+        std::env::consts::OS,
+        &|name| {
+            (name != "RTX_LINK_DATA_DIR")
+                .then(|| std::env::var(name).ok())
+                .flatten()
+        },
+        &home_dir(),
+    ));
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    DATA_DIR.get().is_some_and(|dir| same(dir, &standard))
 }
 
 pub fn home_dir() -> String {
