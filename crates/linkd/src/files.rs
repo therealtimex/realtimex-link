@@ -4,9 +4,17 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-/// The folder, made private (0700) where it is new.
+/// The folder, private (0700): made so where it is new, and set so again where it exists, in case
+/// something left it open to other users.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     if dir.is_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(dir)?.permissions().mode() & 0o777 != 0o700 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            }
+        }
         return Ok(());
     }
     let mut builder = fs::DirBuilder::new();

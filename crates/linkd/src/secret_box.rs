@@ -37,17 +37,25 @@ impl SecretBox {
         }
         files::ensure_private_dir(&self.data_dir)?;
         let file = self.data_dir.join(KEY_FILE);
-        let fresh: [u8; 32] = random_bytes();
-        let key = match files::create_new(&file, &base64(&fresh)) {
-            Ok(()) => fresh,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let saved = unbase64(&fs::read_to_string(&file)?).unwrap_or_default();
-                let Ok(key) = <[u8; 32]>::try_from(saved.as_slice()) else {
-                    bail!("{KEY_FILE} is not a 256-bit key");
-                };
+        let key = match fs::read_to_string(&file) {
+            Ok(text) => parse_key(&text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let key = match key {
+            Some(key) => {
+                files::make_private(&file)?;
                 key
             }
-            Err(error) => return Err(error.into()),
+            // Missing, or empty or not a key (a crash while an older version wrote it): nothing
+            // sealed with it can be opened anyway, so a new key replaces it. Written whole, so a
+            // crash now leaves the old file or the new one, never half of it. Only the daemon that
+            // holds the instance lock gets here.
+            None => {
+                let fresh: [u8; 32] = random_bytes();
+                files::write_atomically(&file, &base64(&fresh))?;
+                fresh
+            }
         };
         Ok(*self.key.get_or_init(|| key))
     }
@@ -94,6 +102,11 @@ impl SecretBox {
     }
 }
 
+/// A saved key: base64 of exactly 256 bits.
+fn parse_key(text: &str) -> Option<[u8; 32]> {
+    <[u8; 32]>::try_from(unbase64(text)?.as_slice()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +132,23 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn an_empty_or_broken_key_file_is_replaced() {
+        for broken in ["", "not base64!", "AAAA"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(KEY_FILE), broken).unwrap();
+            let sealed = SecretBox::new(dir.path()).encrypt("pass-1234").unwrap();
+            let saved = fs::read_to_string(dir.path().join(KEY_FILE)).unwrap();
+            assert!(parse_key(&saved).is_some(), "{broken:?} was replaced");
+            assert_eq!(
+                SecretBox::new(dir.path()).decrypt(&sealed).as_deref(),
+                Some("pass-1234")
+            );
+            // Only the key file is left: no temporary file.
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
         }
     }
 

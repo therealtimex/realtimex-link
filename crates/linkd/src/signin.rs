@@ -7,6 +7,7 @@
 //! while Link has no sign-in of its own, and after Sign out it is only offered ("Continue as …")
 //! until the person picks it or signs in again.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -14,8 +15,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::host::Host;
 
@@ -187,54 +188,98 @@ impl SignIn {
         Ok(url)
     }
 
-    /// Wait for the browser on the one-time port, then trade the code for tokens.
+    /// Wait for the browser on the one-time port, then trade the code for tokens. Each connection
+    /// is served on its own, so one that never sends its request holds up nobody; a request that
+    /// isn't this sign-in's answer (another state, no code) gets a 400 and the wait goes on.
     async fn answer(
-        &self,
+        self: &Arc<Self>,
         listener: TcpListener,
         state: &str,
         verifier: &str,
         redirect: &str,
     ) -> Result<()> {
+        // Dropped with this future (a new sign-in, sign out, the time limit): so are the
+        // connections still being served.
+        let mut connections: JoinSet<Option<Result<()>>> = JoinSet::new();
+        // The first real answer finishes the sign-in; a second one (a reload) is turned away.
+        let claimed = Arc::new(AtomicBool::new(false));
         loop {
-            let (mut stream, _) = listener.accept().await?;
-            let Some(target) = request_target(&mut stream).await else {
-                continue;
-            };
-            let Some(query) = target.strip_prefix("/callback?") else {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let me = self.clone();
+                    let (state, verifier, redirect) =
+                        (state.to_string(), verifier.to_string(), redirect.to_string());
+                    let claimed = claimed.clone();
+                    connections.spawn(async move {
+                        me.callback(stream, &state, &verifier, &redirect, &claimed)
+                            .await
+                    });
+                }
+                Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                    if let Ok(Some(outcome)) = joined {
+                        return outcome;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One connection on the sign-in port. Some(outcome) when it ended the sign-in, None when
+    /// the wait goes on.
+    async fn callback(
+        &self,
+        mut stream: TcpStream,
+        state: &str,
+        verifier: &str,
+        redirect: &str,
+        claimed: &AtomicBool,
+    ) -> Option<Result<()>> {
+        let target = request_target(&mut stream).await?;
+        let outcome = match judge(&target, state) {
+            Callback::NotFound => {
                 let _ = stream
                     .write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     )
                     .await;
-                continue;
-            };
-            let params = parse_query(query);
-            let param = |key: &str| {
-                params
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.as_str())
-            };
-            let outcome = if param("state") != Some(state) {
-                Err(anyhow!("The sign-in answer didn't match. Try again."))
-            } else if let Some(error) = param("error") {
-                Err(anyhow!("{}", param("error_description").unwrap_or(error)))
-            } else if let Some(code) = param("code") {
-                self.finish(code, verifier, redirect).await
-            } else {
-                Err(anyhow!("The sign-in answer had no code. Try again."))
-            };
-            let page = match &outcome {
-                Ok(email) => page(
-                    "Signed in",
-                    &format!("RealTimeX Link is signed in as {email}. You can close this tab."),
-                ),
-                Err(error) => page("Sign-in failed", &format!("{error:#}")),
-            };
-            let _ = stream.write_all(page.as_bytes()).await;
-            let _ = stream.shutdown().await;
-            return outcome.map(|_| ());
-        }
+                return None;
+            }
+            Callback::Rejected(message) => {
+                let _ = stream
+                    .write_all(page("400 Bad Request", "Sign-in failed", message).as_bytes())
+                    .await;
+                let _ = stream.shutdown().await;
+                return None;
+            }
+            _ if claimed.swap(true, Ordering::SeqCst) => {
+                let _ = stream
+                    .write_all(
+                        page(
+                            "409 Conflict",
+                            "Sign-in in progress",
+                            "RealTimeX Link is already finishing this sign-in. You can close this tab.",
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+                return None;
+            }
+            Callback::Refused(message) => Err(anyhow!("{message}")),
+            Callback::Code(code) => self.finish(&code, verifier, redirect).await,
+        };
+        let page = match &outcome {
+            Ok(email) => page(
+                "200 OK",
+                "Signed in",
+                &format!("RealTimeX Link is signed in as {email}. You can close this tab."),
+            ),
+            Err(error) => page("200 OK", "Sign-in failed", &format!("{error:#}")),
+        };
+        let _ = stream.write_all(page.as_bytes()).await;
+        let _ = stream.shutdown().await;
+        Some(outcome.map(|_| ()))
     }
 
     async fn finish(&self, code: &str, verifier: &str, redirect: &str) -> Result<String> {
@@ -359,6 +404,9 @@ impl SignIn {
         if let Some(task) = lock(&self.pending).task.take() {
             task.abort();
         }
+        // Held throughout, as a renewal holds it: one in flight would otherwise keep a refresh
+        // token rotated after the one read here, and sign Link back in after this sign-out.
+        let mut access = self.access.lock().await;
         let refresh = host
             .store
             .get(keys::SESSION)
@@ -377,7 +425,7 @@ impl SignIn {
                 (host.log)(&format!("[sign-in] revoking failed: {error:#}"));
             }
         }
-        *self.access.lock().await = None;
+        *access = None;
         host.store.remove(keys::SESSION)?;
         host.store.remove(crate::identity::keys::ACCOUNT)?;
         host.store.set(keys::HANDOVER_OFF, &json!(true))?;
@@ -429,6 +477,41 @@ async fn token_post(url: &str, form: Vec<(&'static str, String)>) -> Result<Valu
         Ok(answer)
     })
     .await?
+}
+
+/// What a request on the sign-in port brought.
+#[derive(Debug, PartialEq)]
+enum Callback {
+    /// Not /callback: 404, and the wait goes on.
+    NotFound,
+    /// Not this sign-in's answer (another state, or no code): 400, and the wait goes on.
+    Rejected(&'static str),
+    /// The account's answer with this state, refusing (the person cancelled): the sign-in ends.
+    Refused(String),
+    Code(String),
+}
+
+fn judge(target: &str, state: &str) -> Callback {
+    let Some(query) = target.strip_prefix("/callback?") else {
+        return Callback::NotFound;
+    };
+    let params = parse_query(query);
+    let param = |key: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    if !param("state").is_some_and(|given| crate::util::same_bytes(given.as_bytes(), state.as_bytes()))
+    {
+        Callback::Rejected("The sign-in answer didn't match. Try again.")
+    } else if let Some(error) = param("error") {
+        Callback::Refused(param("error_description").unwrap_or(error).to_string())
+    } else if let Some(code) = param("code").filter(|code| !code.is_empty()) {
+        Callback::Code(code.to_string())
+    } else {
+        Callback::Rejected("The sign-in answer had no code. Try again.")
+    }
 }
 
 /// The request target of one HTTP request on the sign-in port ("/callback?…").
@@ -503,8 +586,8 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The page the browser shows after coming back.
-fn page(title: &str, message: &str) -> String {
+/// The page the browser shows after coming back, with this HTTP status ("200 OK").
+fn page(status: &str, title: &str, message: &str) -> String {
     let body = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title>\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -515,7 +598,7 @@ fn page(title: &str, message: &str) -> String {
         title = escape(title),
     );
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -531,6 +614,43 @@ mod tests {
         assert_eq!(params[1], ("state".into(), "x y".into()));
         assert_eq!(params[2].1, "no way");
         assert!(decode("%zz").is_none());
+    }
+
+    #[test]
+    fn only_this_sign_ins_answer_counts() {
+        let state = "s-123";
+        assert_eq!(
+            judge("/callback?code=abc&state=s-123", state),
+            Callback::Code("abc".into())
+        );
+        assert_eq!(judge("/favicon.ico", state), Callback::NotFound);
+        // Another state, none, or no code: turned away, and the sign-in keeps waiting.
+        for target in [
+            "/callback?code=abc&state=other",
+            "/callback?code=abc",
+            "/callback?state=s-123",
+            "/callback?state=s-123&code=",
+            "/callback?error=access_denied&state=other",
+        ] {
+            assert!(
+                matches!(judge(target, state), Callback::Rejected(_)),
+                "{target}"
+            );
+        }
+        // The account's own refusal ends it.
+        assert_eq!(
+            judge(
+                "/callback?error=access_denied&error_description=Cancelled&state=s-123",
+                state
+            ),
+            Callback::Refused("Cancelled".into())
+        );
+    }
+
+    #[test]
+    fn pages_carry_their_status() {
+        assert!(page("400 Bad Request", "t", "m").starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(page("200 OK", "<t>", "m").contains("&lt;t&gt;"));
     }
 
     #[test]

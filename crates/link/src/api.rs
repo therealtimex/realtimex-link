@@ -1,5 +1,7 @@
 //! rtx-linkd's local API (crates/linkd/src/local_api.rs), as the window uses it: found through
-//! the data folder's linkd.json and api-token, started when it is not running.
+//! the data folder's linkd.json and api-token, started when it is not running. The port linkd.json
+//! names must prove it holds the token (POST /v1/hello) before the token is sent to it: a daemon
+//! that died leaves its port to whoever takes it next, another user's process too.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +11,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 const PROTOCOL: u64 = 1;
+/// rtx-linkd's local_api::HELLO_CONTEXT.
+const HELLO_CONTEXT: &str = "linkd-hello";
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where the daemon keeps its state: the same folder as rtx-linkd's paths.rs.
@@ -71,8 +75,11 @@ impl Api {
             .timeout_global(Some(Duration::from_secs(8)))
             .build()
             .into();
+        let port = u16::try_from(port).map_err(|_| anyhow!("not running"))?;
+        let base = format!("http://127.0.0.1:{port}");
+        verify_daemon(&agent, &base, port, &token)?;
         let mut api = Self {
-            base: format!("http://127.0.0.1:{port}"),
+            base,
             token,
             agent,
             version: String::new(),
@@ -160,5 +167,69 @@ impl Api {
                 .header("Authorization", format!("Bearer {}", self.token))
                 .send_json(&body),
         )
+    }
+}
+
+/// Ask the port to prove it is the daemon that wrote `token` (HMAC-SHA256 with the token over
+/// "linkd-hello:<port>:<nonce>", local_api::hello_proof), with a fresh nonce, before anything is
+/// sent with the token. An older daemon without /v1/hello can't prove it either: the window then
+/// treats it as not running.
+fn verify_daemon(agent: &ureq::Agent, base: &str, port: u16, token: &str) -> Result<()> {
+    use ring::rand::SecureRandom;
+    let mut nonce = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| anyhow!("no random numbers for the local API"))?;
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let answer = Api::answer(
+        agent
+            .post(format!("{base}/v1/hello"))
+            .send_json(&serde_json::json!({ "nonce": nonce })),
+    )
+    .context("not running")?;
+    let proof = answer
+        .get("hmac")
+        .and_then(Value::as_str)
+        .and_then(unhex)
+        .ok_or_else(|| anyhow!("not running"))?;
+    proves(token, port, &nonce, &proof)
+        .then_some(())
+        .ok_or_else(|| anyhow!("RealTimeX Link's service could not prove itself; restart RealTimeX Link"))
+}
+
+/// Constant-time check of a /v1/hello proof (ring::hmac::verify compares in constant time).
+fn proves(token: &str, port: u16, nonce: &str, proof: &[u8]) -> bool {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    let message = format!("{HELLO_CONTEXT}:{port}:{nonce}");
+    !token.is_empty() && ring::hmac::verify(&key, message.as_bytes(), proof).is_ok()
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_tokens_holder_proves_itself() {
+        // The same proof rtx-linkd's local_api tests pin.
+        let proof =
+            unhex("0951928c6c00bc5c4f3e9628f20424305372b20f170d80b13ee212f402181af6").unwrap();
+        assert!(proves("token", 7000, "nonce-0123456789", &proof));
+        assert!(!proves("other", 7000, "nonce-0123456789", &proof));
+        assert!(!proves("token", 7001, "nonce-0123456789", &proof));
+        assert!(!proves("token", 7000, "another-nonce-01", &proof));
+        assert!(!proves("token", 7000, "nonce-0123456789", &proof[..31]));
+        assert!(!proves("", 7000, "nonce-0123456789", &proof));
+        assert!(unhex("abc").is_none());
+        assert!(unhex("zz").is_none());
     }
 }

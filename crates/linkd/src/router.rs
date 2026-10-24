@@ -7,7 +7,7 @@
 //! /transfer and /stop. RealTimeX's controller (server/utils/remoteControl/computers.js) and agents' CLI speak it.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -43,6 +43,9 @@ const PUBLIC_FAILURES_PER_ADDRESS: usize = 5;
 const PUBLIC_ADDRESS_WINDOW_MS: i64 = 15 * 60 * 1000;
 const PUBLIC_FAILURES_TOTAL: usize = 30;
 const PUBLIC_TOTAL_WINDOW_MS: i64 = 60 * 60 * 1000;
+// Failed passwords across all addresses on the tailnet listener too: another device on the tailnet
+// (or a shared node) can't try passwords without end by changing its address.
+const TAILNET_FAILURES_TOTAL: usize = 30;
 pub const SERVICE: &str = "realtimex-remote-control";
 /// 2 (ADR-2611 §4.5): peer live view, connection requests, client keys, identity tokens.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -336,29 +339,67 @@ fn fail(shared: &Shared, key: &str) {
     let now = now_ms();
     let mut failures = lock(&shared.failures);
     let recent = failures.entry(key.to_string()).or_default();
-    let window = if key.starts_with("public") {
-        PUBLIC_TOTAL_WINDOW_MS
-    } else {
-        AUTH_FAILURE_WINDOW_MS
-    };
+    let window = failure_window(key);
     recent.retain(|at| now - at < window);
     recent.push(now);
 }
 
-/// Public sign-ins: blocked after PUBLIC_FAILURES_PER_ADDRESS failed passwords from one address
-/// (15 minutes) or PUBLIC_FAILURES_TOTAL from all (an hour).
-fn public_blocked(shared: &Shared, address: &str) -> bool {
+/// How long a failure is kept: the longest window it is checked against.
+fn failure_window(key: &str) -> i64 {
+    if key.starts_with("public:") || key == TAILNET_TOTAL {
+        PUBLIC_TOTAL_WINDOW_MS
+    } else {
+        AUTH_FAILURE_WINDOW_MS
+    }
+}
+
+/// Where failed sign-ins are counted: an IPv4 address, or an IPv6 address's /64. One machine
+/// usually has a whole /64 to pick addresses from, so a per-address limit would not hold it.
+pub fn source_of(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
+}
+
+/// The failed passwords of all sources, one count per listener.
+const PUBLIC_TOTAL: &str = "public:*";
+const TAILNET_TOTAL: &str = "tailnet:*";
+
+/// Public sign-ins: blocked after PUBLIC_FAILURES_PER_ADDRESS failed passwords from one source
+/// (15 minutes).
+fn public_blocked(shared: &Shared, source: &str) -> bool {
     blocked_within(
         shared,
-        &format!("public:{address}"),
+        &format!("public:{source}"),
         PUBLIC_ADDRESS_WINDOW_MS,
         PUBLIC_FAILURES_PER_ADDRESS,
-    ) || blocked_within(
-        shared,
-        "public:*",
-        PUBLIC_TOTAL_WINDOW_MS,
-        PUBLIC_FAILURES_TOTAL,
     )
+}
+
+/// Failed passwords from everywhere, in the last hour: PUBLIC_FAILURES_TOTAL on Public Exposure,
+/// TAILNET_FAILURES_TOTAL on the tailnet.
+fn total_key(shared: &Shared) -> &'static str {
+    if shared.public {
+        PUBLIC_TOTAL
+    } else {
+        TAILNET_TOTAL
+    }
+}
+
+fn total_blocked(shared: &Shared) -> bool {
+    let max = if shared.public {
+        PUBLIC_FAILURES_TOTAL
+    } else {
+        TAILNET_FAILURES_TOTAL
+    };
+    blocked_within(shared, total_key(shared), PUBLIC_TOTAL_WINDOW_MS, max)
 }
 
 fn clear(shared: &Shared, key: &str) {
@@ -390,33 +431,38 @@ async fn hello(State(shared): State<Ctx>) -> ApiResult<Json<Value>> {
 
 /// Wrong passwords and refused tokens count separately: a client still polling with a token
 /// from before a password change must not lock itself out of signing in with the new one.
+///
+/// Too many wrong passwords block password sign-ins only (host.admit's password branch): a client
+/// key, an identity token or a connection request still get through, so whoever floods this
+/// computer with wrong passwords can't lock its own clients out.
 async fn connect(
     State(shared): State<Ctx>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Body64(body): Body64,
 ) -> Response {
     let address = peer.ip().to_string();
-    let key = format!("password:{address}");
-    if blocked(&shared, &key) || (shared.public && public_blocked(&shared, &address)) {
-        return too_many();
-    }
+    let source = source_of(peer.ip());
+    let key = format!("password:{source}");
+    let password_blocked = blocked(&shared, &key)
+        || (shared.public && public_blocked(&shared, &source))
+        || total_blocked(&shared);
     let host = match host_of(&shared) {
         Ok(host) => host,
         Err(error) => return error.into_response(),
     };
     let via = if shared.public { "public" } else { "tailnet" };
-    match host.admit(&body, &address, via).await {
+    match host.admit(&body, &address, via, password_blocked).await {
         Ok(admitted) => {
             if admitted.wrong_password {
                 fail(&shared, &key);
                 if shared.public {
-                    fail(&shared, &format!("public:{address}"));
-                    fail(&shared, "public:*");
+                    fail(&shared, &format!("public:{source}"));
                 }
+                fail(&shared, total_key(&shared));
             } else if admitted.status == 200 {
                 clear(&shared, &key);
-                clear(&shared, &format!("public:{address}"));
-                clear(&shared, &format!("token:{address}"));
+                clear(&shared, &format!("public:{source}"));
+                clear(&shared, &format!("token:{source}"));
                 let name = admitted
                     .body
                     .pointer("/client/name")
@@ -451,8 +497,7 @@ async fn poll_request(
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let address = peer.ip().to_string();
-    let key = format!("request:{address}");
+    let key = format!("request:{}", source_of(peer.ip()));
     if blocked(&shared, &key) {
         return too_many();
     }
@@ -493,8 +538,7 @@ async fn cancel_request(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    let address = peer.ip().to_string();
-    let key = format!("request:{address}");
+    let key = format!("request:{}", source_of(peer.ip()));
     if blocked(&shared, &key) {
         return too_many();
     }
@@ -526,7 +570,7 @@ fn signed(
     peer: &SocketAddr,
 ) -> Result<Signed, Box<Response>> {
     let address = peer.ip().to_string();
-    let key = format!("token:{address}");
+    let key = format!("token:{}", source_of(peer.ip()));
     if blocked(shared, &key) {
         return Err(Box::new(too_many()));
     }
@@ -1619,12 +1663,19 @@ async fn transfer(
     }
 }
 
+/// Stop the desktop helper, which ends every live view and session on this computer: that takes
+/// Control. A view-only client stops its own live views only.
 async fn stop(
     State(shared): State<Ctx>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let _signed = signed_with!(shared, headers, peer, "view");
+    let signed = signed_with!(shared, headers, peer, "view");
+    if !signed.client.may("control") {
+        let id = signed.client.id().to_string();
+        end_streams(&shared, &|client_id: &str| client_id == id);
+        return Json(json!({ "stopped": true })).into_response();
+    }
     match shared.backend.stop().await {
         Ok(()) => Json(json!({ "stopped": true })).into_response(),
         Err(error) => error.into_response(),
@@ -1643,6 +1694,29 @@ mod tests {
         );
         assert_eq!(screen_problem("no display").0, "screen-unavailable");
         assert!(matches!(platform_name(), "darwin" | "win32" | "linux"));
+    }
+
+    #[test]
+    fn failures_count_per_ipv4_address_or_ipv6_64() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(source_of(ip("203.0.113.7")), "203.0.113.7");
+        assert_eq!(source_of(ip("::ffff:203.0.113.7")), "203.0.113.7");
+        assert_eq!(
+            source_of(ip("2001:db8:aa:bb:1:2:3:4")),
+            "2001:db8:aa:bb::/64"
+        );
+        assert_eq!(
+            source_of(ip("2001:db8:aa:bb:ffff::9")),
+            source_of(ip("2001:db8:aa:bb::1"))
+        );
+        assert_ne!(
+            source_of(ip("2001:db8:aa:bc::1")),
+            source_of(ip("2001:db8:aa:bb::1"))
+        );
+        // The totals are kept as long as they are checked: an hour.
+        assert_eq!(failure_window(PUBLIC_TOTAL), PUBLIC_TOTAL_WINDOW_MS);
+        assert_eq!(failure_window(TAILNET_TOTAL), PUBLIC_TOTAL_WINDOW_MS);
+        assert_eq!(failure_window("password:1.2.3.4"), AUTH_FAILURE_WINDOW_MS);
     }
 
     #[test]

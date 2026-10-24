@@ -23,20 +23,28 @@ use crate::util::{iso_now, random_bytes};
 pub const TOKEN_FILE: &str = "api-token";
 pub const DISCOVERY_FILE: &str = "linkd.json";
 
-/// The local API's token: made once, then kept, so RealTimeX and the window keep their access.
-fn ensure_token(data_dir: &Path) -> Result<String> {
-    let file = data_dir.join(TOKEN_FILE);
-    let fresh: String = random_bytes::<32>()
+/// The local API's token, new on every start: one that leaked (or that a process listening on
+/// a dead daemon's port was handed) stops working at the next start. RealTimeX and the window read
+/// the file again each time they connect. Written whole (a temporary file renamed over it), so a
+/// reader never sees an empty or half-written token.
+fn rotate_token(data_dir: &Path) -> Result<String> {
+    let token: String = random_bytes::<32>()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    match files::create_new(&file, &fresh) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+    files::write_atomically(&data_dir.join(TOKEN_FILE), &token)?;
+    Ok(token)
+}
+
+/// The data folder and the secret key stay this user's only (0700 and 0600) on every start, also
+/// where an older version or a copy left them more open.
+fn make_data_private(data_dir: &Path) -> Result<()> {
+    files::ensure_private_dir(data_dir)?;
+    let key = data_dir.join(crate::secret_box::KEY_FILE);
+    if key.exists() {
+        files::make_private(&key)?;
     }
-    files::make_private(&file)?;
-    Ok(fs::read_to_string(&file)?.trim().to_string())
+    Ok(())
 }
 
 pub struct Options {
@@ -61,17 +69,22 @@ pub struct Daemon {
 
 pub async fn start(options: Options) -> Result<Daemon> {
     let lock = InstanceLock::acquire(&options.data_dir)?;
+    make_data_private(&options.data_dir)?;
     crate::paths::remember(&options.data_dir);
     let store = Arc::new(Store::open(&options.data_dir)?);
     let secrets = SecretBox::new(&options.data_dir);
     let backend = options.backend.clone().unwrap_or_else(Backend::new);
     let host = Host::new(store, secrets, backend, options.port, options.log.clone());
     host.start().await;
-    let token = ensure_token(&options.data_dir)?;
+    // Bound before the state is made: /v1/hello's proof names the port.
+    let socket = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let port = socket.local_addr()?.port();
+    let token = rotate_token(&options.data_dir)?;
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let started_at = iso_now();
     let state = Arc::new(LocalState {
-        token: token.clone(),
+        token,
+        port,
         version: options.version.clone(),
         started_at: started_at.clone(),
         host: host.clone(),
@@ -79,8 +92,6 @@ pub async fn start(options: Options) -> Result<Daemon> {
         window: Default::default(),
         show_window: Default::default(),
     });
-    let socket = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
-    let port = socket.local_addr()?.port();
     let (stop_api, stopped) = oneshot::channel::<()>();
     let routes = local_api::router(state);
     let api = tokio::spawn(async move {
@@ -122,5 +133,38 @@ impl Daemon {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut self.api).await;
         self.host.stop().await;
         self.lock.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_token_is_new_on_every_start_and_written_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        // An empty file (a crash while it was written by an older version) is simply replaced.
+        fs::write(dir.path().join(TOKEN_FILE), "").unwrap();
+        let first = rotate_token(dir.path()).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(), first);
+        let second = rotate_token(dir.path()).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(dir.path().join(TOKEN_FILE)).unwrap(), second);
+        // No temporary file is left behind.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir.path().join(TOKEN_FILE)), 0o600);
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let key = dir.path().join(crate::secret_box::KEY_FILE);
+            fs::write(&key, "x").unwrap();
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+            make_data_private(dir.path()).unwrap();
+            assert_eq!(mode(dir.path()), 0o700);
+            assert_eq!(mode(&key), 0o600);
+        }
     }
 }
