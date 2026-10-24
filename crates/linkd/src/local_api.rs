@@ -34,6 +34,7 @@ pub const FEATURES: &[&str] = &[
     "relay",
     "hello",
     "appearance",
+    "language",
 ];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
 /// caller's nonce (see `hello_proof`).
@@ -210,6 +211,7 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         "showWindow": state.show_window.load(Ordering::Relaxed),
         // The window follows it (light, dark, system) as it polls.
         "appearance": state.host.appearance(),
+        "language": state.host.language(),
     }))
 }
 
@@ -391,17 +393,45 @@ async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Ans
 }
 
 async fn appearance(State(state): State<Shared>) -> Answer {
-    Ok(Json(json!({ "theme": state.host.appearance() })))
+    Ok(Json(json!({
+        "theme": state.host.appearance(),
+        "language": state.host.language(),
+    })))
 }
 
-/// { theme: "light" | "dark" | "system" }: RealTimeX's theme, posted when it starts and when it
-/// changes, so Link's window matches it; "system" (and no RealTimeX) follows the OS.
+/// { theme?: "light" | "dark" | "system", language?: BCP-47 tag | "system" }, at least one:
+/// RealTimeX's, posted when it starts and when it changes, or the choice in Link's Settings.
+/// "system" follows the OS. Both are checked before either is kept.
 async fn set_appearance(State(state): State<Shared>, Body64(body): Body64) -> Answer {
-    let theme = body
-        .get("theme")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request("theme must be light, dark or system"))?;
-    state.host.set_appearance(theme)?;
+    let field = |name: &str| -> Result<Option<String>, ApiError> {
+        match body.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(ApiError::bad_request(format!("{name} must be a string"))),
+        }
+    };
+    let (theme, language) = (field("theme")?, field("language")?);
+    if theme.is_none() && language.is_none() {
+        return Err(ApiError::bad_request("theme or language is required"));
+    }
+    if let Some(theme) = &theme {
+        if !matches!(theme.as_str(), "light" | "dark" | "system") {
+            return Err(ApiError::bad_request("theme must be light, dark or system"));
+        }
+    }
+    if let Some(language) = &language {
+        if language != "system" && crate::host::language_tag(language).is_none() {
+            return Err(ApiError::bad_request(
+                "language must be a language tag or system",
+            ));
+        }
+    }
+    if let Some(theme) = &theme {
+        state.host.set_appearance(theme)?;
+    }
+    if let Some(language) = &language {
+        state.host.set_language(language)?;
+    }
     appearance(State(state)).await
 }
 

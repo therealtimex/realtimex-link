@@ -42,6 +42,7 @@ const SESSION_GAP_MS: i64 = 10 * 60 * 1000;
 const PERMISSIONS_FOR: Duration = Duration::from_secs(10);
 /// The window's light/dark theme as RealTimeX set it (absent: follow the OS).
 const APPEARANCE_KEY: &str = "appearance";
+const LANGUAGE_KEY: &str = "language";
 
 pub mod keys {
     pub const PASSWORD: &str = "password";
@@ -801,6 +802,16 @@ impl Host {
         set_appearance(&self.store, theme)
     }
 
+    /// The window's language, a BCP-47 tag (vi, zh-cn, pt-br), or system (the OS's, the
+    /// default): RealTimeX's, posted with its theme, or the one chosen in Link's Settings.
+    pub fn language(&self) -> String {
+        language(&self.store)
+    }
+
+    pub fn set_language(&self, tag: &str) -> Result<(), ApiError> {
+        set_language(&self.store, tag)
+    }
+
     // --- lifecycle ----------------------------------------------------------
 
     pub async fn start(self: &Arc<Self>) {
@@ -1204,9 +1215,62 @@ fn set_appearance(store: &Store, theme: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn language(store: &Store) -> String {
+    store
+        .get(LANGUAGE_KEY)
+        .as_ref()
+        .and_then(Value::as_str)
+        .map_or_else(|| "system".to_string(), str::to_string)
+}
+
+fn set_language(store: &Store, tag: &str) -> Result<(), ApiError> {
+    if tag == "system" {
+        store.remove(LANGUAGE_KEY)?;
+        return Ok(());
+    }
+    let tag = language_tag(tag)
+        .ok_or_else(|| ApiError::bad_request("language must be a language tag or system"))?;
+    store.set(LANGUAGE_KEY, &json!(tag))?;
+    Ok(())
+}
+
+/// A BCP-47 tag, lowercase with hyphens ("zh_TW" -> "zh-tw"): a 2–3 letter language, then
+/// subtags of 1–8 letters or digits. The window picks the closest of its translations.
+pub(crate) fn language_tag(tag: &str) -> Option<String> {
+    let tag = tag.trim().replace('_', "-").to_ascii_lowercase();
+    let mut subtags = tag.split('-');
+    let language = subtags.next()?;
+    let language_ok =
+        (2..=3).contains(&language.len()) && language.bytes().all(|b| b.is_ascii_lowercase());
+    let rest_ok = subtags.all(|subtag| {
+        (1..=8).contains(&subtag.len()) && subtag.bytes().all(|b| b.is_ascii_alphanumeric())
+    });
+    (language_ok && rest_ok).then_some(tag)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_is_a_tag_realtimex_or_settings_set_and_system_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(language(&store), "system");
+        set_language(&store, "vi").unwrap();
+        assert_eq!(language(&store), "vi");
+        set_language(&store, "zh_TW").unwrap();
+        assert_eq!(language(&store), "zh-tw");
+        set_language(&store, "pt-BR").unwrap();
+        assert_eq!(language(&store), "pt-br");
+        for bad in ["", "x", "english!", "en--us", "toolong-language", "e1"] {
+            assert!(set_language(&store, bad).is_err(), "{bad}");
+        }
+        assert_eq!(language(&store), "pt-br");
+        set_language(&store, "system").unwrap();
+        assert_eq!(language(&store), "system");
+        assert_eq!(store.get(LANGUAGE_KEY), None);
+    }
 
     #[test]
     fn appearance_is_what_realtimex_set_and_system_by_default() {
