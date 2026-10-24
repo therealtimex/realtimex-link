@@ -146,8 +146,9 @@ fn shareable_content_until(stop: Option<&AtomicBool>) -> Result<SendContent> {
             Ok(content)
         }
         // Transient too: "The user declined TCCs" once in dogfood run 7, with the permission on.
+        // Both the recorder and Remote Control use this, so the hint names neither.
         Err(e) => bail!(
-            "cannot list windows ({e}); if this persists, allow Screen Recording for the app that started rtx-capture"
+            "cannot list windows ({e}); if this persists, check that Screen Recording is allowed for the app that started this process"
         ),
     }
 }

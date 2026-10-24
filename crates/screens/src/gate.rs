@@ -273,9 +273,16 @@ impl Gate {
         }
     }
 
-    /// The budget ran out: the request is abandoned, unless it was answered meanwhile (its answer
-    /// is then in `rx`, sent before the release).
+    /// The budget ran out: the request is abandoned, unless it was answered meanwhile.
+    ///
+    /// The answer is sent before the permit is released, so it can already be in `rx` while the
+    /// request still holds the permit: it is looked for first, and an answer that arrived is
+    /// returned rather than thrown away as a timeout (and counted late). If the request is no
+    /// longer outstanding when it is abandoned, its answer arrived in between.
     fn expire<T>(&self, id: u64, op: &'static str, rx: &mpsc::Receiver<T>) -> anyhow::Result<T> {
+        if let Ok(value) = rx.try_recv() {
+            return Ok(value);
+        }
         if self.abandon(id, op, true) {
             return Err(TimedOut {
                 what: op.to_string(),
@@ -482,6 +489,25 @@ mod tests {
         assert!(g.outstanding().is_none());
         let s = g.stats()[0].1;
         assert_eq!((s.completed, s.timed_out, s.late), (2, 1, 1));
+    }
+
+    #[test]
+    fn an_answer_sent_before_the_deadline_is_returned_even_while_it_holds_the_permit() {
+        // The completion has sent its answer but not yet released the permit (it is between the
+        // two) when the caller's budget runs out: the answer counts, nothing is abandoned.
+        let g = gate(1000);
+        let native = Native::default();
+        let (id, rx) = g.begin("capture", None, native.submit()).unwrap();
+        let done = native.pending.lock().unwrap().remove(0);
+        let tx = done.tx.lock().unwrap().take().unwrap();
+        tx.send(Ok(9)).unwrap();
+        assert_eq!(g.expire(id, "capture", &rx).unwrap(), Ok(9));
+        let s = g.stats()[0].1;
+        assert_eq!((s.timed_out, s.late), (0, 0), "not counted as a timeout");
+        // The release that follows the send frees the permit as usual.
+        g.release(id);
+        drop(done);
+        assert!(g.outstanding().is_none());
     }
 
     #[test]
