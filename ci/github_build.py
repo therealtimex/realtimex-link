@@ -81,6 +81,8 @@ def main():
             "GET",
             f"/repos/{repo}/actions/workflows/build.yml/runs?event=workflow_dispatch&head_sha={sha}&created=>={started}",
         )["workflow_runs"]
+        # The same commit can be built for a branch and a tag at once: this ref's run only.
+        runs = [r for r in runs if r.get("head_branch") == ref]
         if runs:
             run = runs[0]
             break
