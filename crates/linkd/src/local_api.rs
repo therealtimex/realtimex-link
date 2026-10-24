@@ -27,7 +27,14 @@ use crate::util::same_bytes;
 /// The local API's protocol: a caller that speaks another one says so instead of misreading it.
 pub const PROTOCOL: u32 = 1;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-pub const FEATURES: &[&str] = &["host", "autostart", "window", "relay", "hello"];
+pub const FEATURES: &[&str] = &[
+    "host",
+    "autostart",
+    "window",
+    "relay",
+    "hello",
+    "appearance",
+];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
 /// caller's nonce (see `hello_proof`).
 pub const HELLO_CONTEXT: &str = "linkd-hello";
@@ -61,6 +68,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/autostart", get(autostart).post(set_autostart))
+        .route("/v1/appearance", get(appearance).post(set_appearance))
         .route("/v1/window/open", post(open_window))
         .route("/v1/account", get(account))
         .route("/v1/account/token", post(account_token))
@@ -200,6 +208,8 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         "schema": SCHEMA_VERSION,
         "startedAt": state.started_at,
         "showWindow": state.show_window.load(Ordering::Relaxed),
+        // The window follows it (light, dark, system) as it polls.
+        "appearance": state.host.appearance(),
     }))
 }
 
@@ -378,6 +388,21 @@ async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Ans
         .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
     state.host.set_start_at_login(on)?;
     autostart(State(state)).await
+}
+
+async fn appearance(State(state): State<Shared>) -> Answer {
+    Ok(Json(json!({ "theme": state.host.appearance() })))
+}
+
+/// { theme: "light" | "dark" | "system" }: RealTimeX's theme, posted when it starts and when it
+/// changes, so Link's window matches it; "system" (and no RealTimeX) follows the OS.
+async fn set_appearance(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let theme = body
+        .get("theme")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("theme must be light, dark or system"))?;
+    state.host.set_appearance(theme)?;
+    appearance(State(state)).await
 }
 
 /// RealTimeX's hosting state, once: { state: { clients, settings… }, password: { password,

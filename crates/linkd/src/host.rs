@@ -40,6 +40,8 @@ const SESSION_GAP_MS: i64 = 10 * 60 * 1000;
 /// macOS permissions are read in a fresh helper process (a grant reaches only processes started
 /// after it); the window asks for the overview every few seconds, so the answer is kept this long.
 const PERMISSIONS_FOR: Duration = Duration::from_secs(10);
+/// The window's light/dark theme as RealTimeX set it (absent: follow the OS).
+const APPEARANCE_KEY: &str = "appearance";
 
 pub mod keys {
     pub const PASSWORD: &str = "password";
@@ -789,6 +791,16 @@ impl Host {
         crate::autostart::opted_out(&self.store)
     }
 
+    /// Light, dark or system (the OS's, the default): RealTimeX's theme, which it posts on start
+    /// and when it changes (POST /v1/appearance), so Link's window looks like RealTimeX's.
+    pub fn appearance(&self) -> &'static str {
+        appearance(&self.store)
+    }
+
+    pub fn set_appearance(&self, theme: &str) -> Result<(), ApiError> {
+        set_appearance(&self.store, theme)
+    }
+
     // --- lifecycle ----------------------------------------------------------
 
     pub async fn start(self: &Arc<Self>) {
@@ -1172,5 +1184,43 @@ fn desktop_label(available: bool) -> String {
         "macos" => "macOS".into(),
         "windows" => "Windows".into(),
         other => other.into(),
+    }
+}
+
+fn appearance(store: &Store) -> &'static str {
+    match store.get(APPEARANCE_KEY).as_ref().and_then(Value::as_str) {
+        Some("light") => "light",
+        Some("dark") => "dark",
+        _ => "system",
+    }
+}
+
+fn set_appearance(store: &Store, theme: &str) -> Result<(), ApiError> {
+    match theme {
+        "light" | "dark" => store.set(APPEARANCE_KEY, &json!(theme))?,
+        "system" => store.remove(APPEARANCE_KEY)?,
+        _ => return Err(ApiError::bad_request("theme must be light, dark or system")),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appearance_is_what_realtimex_set_and_system_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(appearance(&store), "system");
+        set_appearance(&store, "dark").unwrap();
+        assert_eq!(appearance(&store), "dark");
+        set_appearance(&store, "light").unwrap();
+        assert_eq!(appearance(&store), "light");
+        assert!(set_appearance(&store, "blue").is_err());
+        assert_eq!(appearance(&store), "light");
+        set_appearance(&store, "system").unwrap();
+        assert_eq!(appearance(&store), "system");
+        assert_eq!(store.get(APPEARANCE_KEY), None);
     }
 }
