@@ -131,10 +131,12 @@ jobs:
             for packager in deb rpm; do
               arch=$([ "$packager" = deb ] && echo "$deb" || echo "$rpm")
               # nfpm doesn't expand variables in file paths: the config is filled in first.
-              (cd ../source && ARCH="$arch" VERSION="$VERSION" PAYLOAD="$PWD/../dist/realtimex-link-linux-$name" \
+              # nfpm rejects ".." in a file path: absolute paths only.
+              (cd "$GITHUB_WORKSPACE/source" && ARCH="$arch" VERSION="$VERSION" \
+                PAYLOAD="$GITHUB_WORKSPACE/dist/realtimex-link-linux-$name" \
                 envsubst '${ARCH} ${VERSION} ${PAYLOAD}' < packaging/linux/nfpm.yaml > nfpm.yaml && \
-                ../dist/nfpm package --config nfpm.yaml --packager "$packager" \
-                --target "../dist/realtimex-link_${VERSION}_${arch}.${packager}")
+                "$GITHUB_WORKSPACE/dist/nfpm" package --config nfpm.yaml --packager "$packager" \
+                --target "$GITHUB_WORKSPACE/dist/realtimex-link_${VERSION}_${arch}.${packager}")
             done
           done
           ls -l *.deb *.rpm
