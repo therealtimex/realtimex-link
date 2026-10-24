@@ -3754,7 +3754,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-control"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3774,14 +3774,14 @@ dependencies = [
 
 [[package]]
 name = "rtx-glibc-compat"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "rtx-link"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3797,7 +3797,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-linkd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3810,6 +3810,7 @@ dependencies = [
  "libc",
  "png 0.17.16",
  "rand",
+ "ring",
  "rtx-glibc-compat",
  "rusqlite",
  "rustls",
@@ -3829,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-screens"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "block2 0.6.2",

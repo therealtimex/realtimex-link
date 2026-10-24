@@ -18,6 +18,8 @@ base64 = "0.22"
 # main.rs), the Remote Control routes called in-process, and the Marketplace API (blocking, rare).
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Ed25519 for same-account identity tokens (identity.rs); already rustls' provider.
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower = { version = "0.5", features = ["util"] }

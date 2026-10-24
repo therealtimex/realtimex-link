@@ -6,8 +6,8 @@
 //! It is also reached through its own Public Exposure relay (relay.rs) once RealTimeX has signed
 //! it in; its App ID is then the relay's exposure ID.
 //!
-//! Not here yet (#2753 phase 2): same-account admission (the daemon has no RealTimeX sign-in of
-//! its own yet). "Allow my own computers" then behaves like "Ask me".
+//! "Allow my own computers" admits a controller that proves the same RealTimeX account
+//! (identity.rs) without asking; without this computer's account it behaves like "Ask me".
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use crate::backend::Backend;
 use crate::clients::{normalize_permissions, Authenticated, ClientStore, ConnectRequest, KeyState};
 use crate::error::ApiError;
+use crate::identity::IdentityVerifier;
 use crate::password;
 use crate::relay::Relay;
 use crate::requests::{NewRequest, Poll, RequestStore};
@@ -111,6 +112,7 @@ pub struct Host {
     listener: tokio::sync::Mutex<Option<Listener>>,
     /// This computer's own Public Exposure (relay.rs).
     pub relay: Arc<Relay>,
+    identity: IdentityVerifier,
     reconciling: tokio::sync::Mutex<()>,
     last_active: Mutex<HashMap<String, i64>>,
     permissions: Mutex<Option<(std::time::Instant, Value)>>,
@@ -171,6 +173,7 @@ impl Host {
                 }),
                 listener: tokio::sync::Mutex::new(None),
                 relay: Relay::new(me.clone()),
+                identity: IdentityVerifier::new(),
                 reconciling: tokio::sync::Mutex::new(()),
                 last_active: Mutex::new(HashMap::new()),
                 permissions: Mutex::new(None),
@@ -500,7 +503,23 @@ impl Host {
             }
             return self.admit_client(&who, "password", None, false);
         }
-        // Same-account admission needs the daemon's own sign-in (phase 2): never same account.
+        // Same account (identity.rs): in at once with "Allow my own computers", else marked so.
+        let identity = text("identity");
+        let account = if identity.is_empty() {
+            None
+        } else {
+            self.identity
+                .verify(
+                    &self.store,
+                    &identity,
+                    &self.app_id(),
+                    &self.relay.api_base(),
+                )
+                .await
+        };
+        if account.is_some() && self.state().new_computer_policy == "own-account" {
+            return self.admit_client(&who, "account", None, false);
+        }
         if self.state().new_computer_policy == "password-only" {
             return Ok(Admitted::refuse(
                 401,
@@ -533,8 +552,8 @@ impl Host {
             },
             client_name: who.name.clone(),
             machine: who.machine.clone(),
-            same_account: false,
-            verified_machine_name: None,
+            same_account: account.is_some(),
+            verified_machine_name: account.and_then(|a| a.verified_machine_name),
             via: via.to_string(),
             remote_address: Some(address.to_string()),
             tailnet_login: login,

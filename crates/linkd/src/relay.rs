@@ -165,6 +165,14 @@ impl Relay {
             .map(|base| base.trim().trim_end_matches('/').to_string())
             .filter(|base| base.starts_with("https://") || base.starts_with("http://127.0.0.1"))
             .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+        // This computer's account, for "Allow my own computers" (identity.rs), kept across restarts.
+        if let (Some(host), Some(account)) =
+            (self.host.upgrade(), crate::identity::account_of(token))
+        {
+            if host.store.get(crate::identity::keys::ACCOUNT).as_ref() != Some(&account) {
+                host.store.set(crate::identity::keys::ACCOUNT, &account)?;
+            }
+        }
         *lock(&self.account) = Some(Account {
             token: token.to_string(),
             api_base,
@@ -172,6 +180,14 @@ impl Relay {
         });
         self.wake();
         Ok(())
+    }
+
+    /// The Marketplace API base RealTimeX named (also the identity tokens' issuer).
+    pub fn api_base(&self) -> String {
+        lock(&self.account)
+            .as_ref()
+            .map(|account| account.api_base.clone())
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
     }
 
     fn account(&self) -> Option<Account> {

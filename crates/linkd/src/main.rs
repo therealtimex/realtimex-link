@@ -17,6 +17,7 @@ mod error;
 mod file_browse;
 mod files;
 mod host;
+mod identity;
 mod install;
 mod local_api;
 mod lock;
