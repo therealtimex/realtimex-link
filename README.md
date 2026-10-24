@@ -68,9 +68,13 @@ make the `.dmg` (`ci/sign-mac.sh`), sign the Windows executables and installer
   its own, and after Sign out it is only offered (`POST /v1/account/use-realtimex`).
   `RTX_LINK_AUTH_ISSUER` points at another realm for development.
 - **Public Exposure:** Link enrolls its own exposure with the account's access token (only Remote Control's route),
-  and its App ID becomes that exposure's ID. `/hello` lists the App IDs it had before
-  (`formerAppIds`), and RealTimeX moves a computer saved under one to the new one. The tunnel
-  runs on Link's own credential, so it stays up while RealTimeX is closed.
+  and its App ID becomes that exposure's ID: Remote Control always uses Link's App ID.
+  RealTimeX keeps its own Public Exposure ID for its other features (artifacts, webhooks…).
+  Computers that saved a RealTimeX's ID back when RealTimeX hosted Remote Control are moved:
+  `/hello` lists those IDs (`formerAppIds`; each RealTimeX on the computer that hosted hands its
+  own over, `POST /v1/import`, then with `merge` for a second one), and a controller that finds
+  Link by one saves Link's App ID instead. The tunnel runs on Link's own credential, so it stays
+  up while RealTimeX is closed.
 
 ## Build
 

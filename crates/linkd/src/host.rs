@@ -59,6 +59,10 @@ pub mod keys {
     /// it stays this computer's, so computers that saved it keep finding it.
     pub const APP_ID: &str = "app-id";
     pub const SETTINGS: &str = "settings";
+    /// IDs other RealTimeX instances on this computer were reached by for Remote Control before
+    /// Link (their Public Exposure IDs, which stay theirs for everything else), merged in after the
+    /// first import (POST /v1/import with merge).
+    pub const MERGED_APP_IDS: &str = "merged-app-ids";
 }
 
 pub struct Settings {
@@ -212,19 +216,29 @@ impl Host {
             .filter(|id| !id.is_empty())
     }
 
-    /// App IDs this computer had before (the one RealTimeX handed over, its own): controllers
-    /// that saved one find it by them.
+    /// IDs this computer was reached by for Remote Control before Link's own App ID (RealTimeX's
+    /// Public Exposure IDs, still RealTimeX's for its other features; its own fallback):
+    /// `/hello` lists them, so a controller that saved one finds Link and moves to Link's App ID.
     fn former_app_ids(&self) -> Vec<String> {
         let current = self.app_id();
-        let mut former: Vec<String> = [
+        let merged: Vec<String> = self
+            .store
+            .get(keys::MERGED_APP_IDS)
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let mut former: Vec<String> = Vec::new();
+        for id in [
             self.imported_app_id(),
             Some(self.state().fallback_app_id.clone()),
         ]
         .into_iter()
         .flatten()
-        .filter(|id| !id.is_empty() && *id != current)
-        .collect();
-        former.dedup();
+        .chain(merged)
+        {
+            if !id.is_empty() && id != current && !former.contains(&id) {
+                former.push(id);
+            }
+        }
         former
     }
 
@@ -365,6 +379,10 @@ impl Host {
     /// decrypted, sealed again with the daemon's key. The controlling side's `computers` and
     /// `controller-id` stay with RealTimeX.
     pub async fn import_legacy(&self, body: &Value) -> Result<Value, ApiError> {
+        let already = self.store.meta_get(IMPORT_MARK).is_some();
+        if already && body.get("merge") == Some(&Value::Bool(true)) {
+            return self.merge_legacy(body);
+        }
         if let Some(done) = self.store.meta_get(IMPORT_MARK) {
             let done: Value = serde_json::from_str(&done).unwrap_or(Value::Null);
             let mut error = ApiError::coded(
@@ -414,6 +432,76 @@ impl Host {
             imported.join(", ")
         ));
         Ok(json!({ "keys": imported }))
+    }
+
+    /// Another RealTimeX on this computer that hosted Remote Control too (a second install, a
+    /// development copy): after the first import, the ID it was reached by joins the former ones
+    /// and its clients Link doesn't have yet are added, so computers that saved it find Link and
+    /// can sign in. Link's own App ID, and the first import's password and settings, stay.
+    fn merge_legacy(&self, body: &Value) -> Result<Value, ApiError> {
+        let state = body.get("state").cloned().unwrap_or(json!({}));
+        let mut values: Vec<(&str, Value)> = Vec::new();
+        let mut app_id_added = false;
+        if let Some(id) = state
+            .get(keys::APP_ID)
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            let mut merged: Vec<String> = self
+                .store
+                .get(keys::MERGED_APP_IDS)
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            if id != self.app_id() && !merged.iter().any(|m| m == id) {
+                merged.push(id.to_string());
+                app_id_added = true;
+                values.push((keys::MERGED_APP_IDS, json!(merged)));
+            }
+        }
+        let mut clients: Vec<Value> = self
+            .store
+            .get(crate::clients::STORE_KEY)
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let known = |client: &Value, key: &str| {
+            client
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let mut added = 0;
+        for client in state
+            .get("clients")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let (Some(id), Some(client_id)) = (known(&client, "id"), known(&client, "clientId"))
+            else {
+                continue;
+            };
+            let present = clients.iter().any(|c| {
+                known(c, "id").as_deref() == Some(id.as_str())
+                    || known(c, "clientId").as_deref() == Some(client_id.as_str())
+            });
+            if !present {
+                clients.push(client);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            values.push((crate::clients::STORE_KEY, json!(clients)));
+        }
+        if !values.is_empty() {
+            self.store.transaction(&values, &[])?;
+            self.clients.reload();
+            (self.log)(&format!(
+                "[remote-control] merged another RealTimeX's hosting state: its ID {}, {added} clients",
+                if app_id_added { "added as a former one" } else { "known" }
+            ));
+        }
+        Ok(json!({ "merged": { "appId": app_id_added, "clients": added } }))
     }
 
     // --- sign-in ------------------------------------------------------------
