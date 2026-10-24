@@ -2,6 +2,10 @@
 //! only, as server/utils/remoteHost/client.js speaks it. Every request needs the bearer
 //! token from the data folder (same-user trust, like a Docker socket); a request addressed to any
 //! other host name is refused, so a web page can't reach it through DNS rebinding.
+//!
+//! The one request without the token is POST /v1/hello: the daemon proves it holds the token
+//! before a client sends it. Otherwise a process of another user that took over the port of a
+//! daemon that died (linkd.json still names it) would be handed the token.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,10 +27,18 @@ use crate::util::same_bytes;
 /// The local API's protocol: a caller that speaks another one says so instead of misreading it.
 pub const PROTOCOL: u32 = 1;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-pub const FEATURES: &[&str] = &["host", "autostart", "window", "relay"];
+pub const FEATURES: &[&str] = &["host", "autostart", "window", "relay", "hello"];
+/// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
+/// caller's nonce (see `hello_proof`).
+pub const HELLO_CONTEXT: &str = "linkd-hello";
+const HELLO_PATH: &str = "/v1/hello";
+const MIN_NONCE_LENGTH: usize = 16;
+const MAX_NONCE_LENGTH: usize = 256;
 
 pub struct LocalState {
     pub token: String,
+    /// The port this API listens on, which /v1/hello's proof names.
+    pub port: u16,
     pub version: String,
     pub started_at: String,
     pub host: Arc<Host>,
@@ -44,6 +56,7 @@ type Shared = Arc<LocalState>;
 
 pub fn router(state: Shared) -> Router {
     Router::new()
+        .route(HELLO_PATH, post(hello))
         .route("/v1/version", get(version))
         .route("/v1/status", get(status))
         .route("/v1/shutdown", post(shutdown))
@@ -99,6 +112,10 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
         )
             .into_response();
     }
+    // Asked before the client trusts this port with its token: it carries none.
+    if request.uri().path() == HELLO_PATH {
+        return next.run(request).await;
+    }
     let given = request
         .headers()
         .get("authorization")
@@ -141,6 +158,34 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for Body64 {
             .map_err(|_| ApiError::bad_request("Request body is not JSON"))?;
         Ok(Self(if value.is_object() { value } else { json!({}) }))
     }
+}
+
+/// The proof POST /v1/hello answers with: lowercase hex of HMAC-SHA256, keyed with the token's
+/// text, over "linkd-hello:<port>:<nonce>". The port is part of it so that a process on another
+/// port can't pass on a live daemon's answer as its own.
+pub fn hello_proof(token: &str, port: u16, nonce: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    let message = format!("{HELLO_CONTEXT}:{port}:{nonce}");
+    ring::hmac::sign(&key, message.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// { nonce } (16 to 256 characters, fresh for each try): { hmac, protocol }. The caller checks
+/// the hmac against the api-token file, in constant time, before it sends that token.
+async fn hello(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let nonce = body.get("nonce").and_then(Value::as_str).unwrap_or("");
+    if !(MIN_NONCE_LENGTH..=MAX_NONCE_LENGTH).contains(&nonce.len()) {
+        return Err(ApiError::bad_request(format!(
+            "nonce must be {MIN_NONCE_LENGTH} to {MAX_NONCE_LENGTH} characters"
+        )));
+    }
+    Ok(Json(json!({
+        "hmac": hello_proof(&state.token, state.port, nonce),
+        "protocol": PROTOCOL,
+    })))
 }
 
 async fn version(State(state): State<Shared>) -> Json<Value> {
@@ -467,5 +512,25 @@ mod tests {
         assert_eq!(strip_bearer("Bearer abc"), "abc");
         assert_eq!(strip_bearer("bearer   abc"), "abc");
         assert_eq!(strip_bearer("abc"), "abc");
+    }
+
+    #[test]
+    fn hello_proves_the_token_for_this_port_and_nonce() {
+        // What a client computes: in Node, crypto.createHmac("sha256", token)
+        // .update(`linkd-hello:${port}:${nonce}`).digest("hex").
+        let proof = hello_proof("token", 7000, "nonce-0123456789");
+        assert_eq!(
+            proof,
+            "0951928c6c00bc5c4f3e9628f20424305372b20f170d80b13ee212f402181af6"
+        );
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"token");
+        let tag: Vec<u8> = (0..proof.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&proof[i..i + 2], 16).unwrap())
+            .collect();
+        assert!(ring::hmac::verify(&key, b"linkd-hello:7000:nonce-0123456789", &tag).is_ok());
+        assert_ne!(proof, hello_proof("other", 7000, "nonce-0123456789"));
+        assert_ne!(proof, hello_proof("token", 7001, "nonce-0123456789"));
+        assert_ne!(proof, hello_proof("token", 7000, "nonce-0123456780"));
     }
 }
