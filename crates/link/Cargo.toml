@@ -12,6 +12,10 @@ publish.workspace = true
 anyhow.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+# eframe's own winit, with the Adwaita title bar on Wayland: GNOME draws no server-side decorations,
+# and without this feature winit falls back to plain rectangles for its buttons. X11, macOS and
+# Windows are unaffected (the window manager or OS draws the title bar).
+winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita"] }
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3.5.0", features = ["json"] }
