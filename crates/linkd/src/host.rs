@@ -500,6 +500,10 @@ impl Host {
                 refused.retry_after = error.retry_after;
                 Ok(refused)
             }
+            // Another address (or account verdict) has a request open for this client ID.
+            Err(error) if error.code.as_deref() == Some("request-conflict") => Ok(
+                Admitted::refuse(409, "request-conflict", &error.message),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -567,6 +571,13 @@ impl Host {
     }
 
     /// Allow (control or view only) or deny; the requester's next poll claims the result.
+    ///
+    /// Allowing marks the request "deciding" first, so a second allow can't admit the client
+    /// again and replace the credentials just approved. A request names its client ID itself: when
+    /// that ID is a saved client whose key still works, the request never proved that key, so
+    /// allowing it admits a new client instead of changing (and taking over) the saved one. A
+    /// saved client whose key a password change reset has no working credential to protect: it
+    /// comes back through a request as itself.
     pub async fn decide_connection_request(
         &self,
         reference: &str,
@@ -574,13 +585,10 @@ impl Host {
     ) -> Result<Value, ApiError> {
         let settled =
             || ApiError::coded(409, "request-settled", "This request was already settled");
-        let request = self
-            .requests
-            .by_ref(reference)
-            .filter(|r| r.status == "pending")
-            .ok_or_else(settled)?;
         if decision == "deny" {
-            self.requests.deny(&request.reference);
+            if !self.requests.deny(reference) {
+                return Err(settled());
+            }
             return Ok(json!({ "status": "denied" }));
         }
         if decision != "allow-control" && decision != "allow-view" {
@@ -588,18 +596,33 @@ impl Host {
                 "decision must be allow-control, allow-view or deny",
             ));
         }
+        let request = self
+            .requests
+            .begin_decision(reference)
+            .ok_or_else(settled)?;
         let grant = json!({ "view": true, "control": decision == "allow-control" });
+        let client_id = if self.clients.has_working_key(&request.client_id) {
+            crate::util::uuid()
+        } else {
+            request.client_id.clone()
+        };
         let who = Who {
-            client_id: request.client_id.clone(),
+            client_id,
             name: Some(json!(request.client_name)),
             machine: Some(json!(request.machine)),
             actor: "person",
             address: request.remote_address.clone().unwrap_or_default(),
             via: request.via.clone(),
         };
-        let admitted = self.admit_client(&who, "request", Some(&grant), true)?;
+        let admitted = match self.admit_client(&who, "request", Some(&grant), true) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.requests.undecide(&request.reference);
+                return Err(error);
+            }
+        };
         if admitted.status != 200 {
-            self.requests.deny(&request.reference);
+            self.requests.deny_decided(&request.reference);
             return Ok(json!({ "status": "denied" }));
         }
         if !self

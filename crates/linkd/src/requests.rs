@@ -2,6 +2,10 @@
 //! without the password asks, the person at this computer allows or denies. In memory only: a
 //! restart drops them and the controller sees "expired". Each request has two ids: `id`, the
 //! poll capability returned only to the requester, and `ref`, which this computer's UI uses.
+//!
+//! The client ID a request names is self-reported, so it doesn't make a request anyone's: an open
+//! request is handed back only to the same address with the same account verdict, and anyone else
+//! naming that client gets a 409.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -74,6 +78,11 @@ pub struct Request {
 }
 
 impl Request {
+    /// Still waiting: pending, or being allowed right now ("deciding", see `begin_decision`).
+    pub fn open(&self) -> bool {
+        self.status == "pending" || self.status == "deciding"
+    }
+
     /// What this computer's own UI sees: no poll capability, no admission.
     pub fn visible(&self) -> Value {
         json!({
@@ -126,6 +135,14 @@ pub struct RequestStore {
     state: Mutex<State>,
     on_create: Hook,
     on_settle: Hook,
+}
+
+fn request_conflict() -> ApiError {
+    ApiError::coded(
+        409,
+        "request-conflict",
+        "Another request to connect is open for this client",
+    )
 }
 
 fn rate_limited(retry_after_ms: i64) -> ApiError {
@@ -181,8 +198,9 @@ impl RequestStore {
         }
     }
 
-    /// A pending request for this client, or its existing one. 429 for too many requests not
-    /// from this computer's account.
+    /// A pending request for this client, or its existing one when the same address asks again
+    /// with the same account verdict; 409 when anyone else names a client with an open request.
+    /// 429 for too many requests not from this computer's account.
     pub fn create(&self, new: NewRequest) -> Result<(Request, bool), ApiError> {
         let now = now_ms();
         let (result, expired) = {
@@ -191,10 +209,14 @@ impl RequestStore {
             let existing = state
                 .requests
                 .values()
-                .find(|r| r.client_id == new.client_id && r.status == "pending")
+                .find(|r| r.client_id == new.client_id && r.open())
                 .cloned();
             if let Some(existing) = existing {
-                (Ok((existing, false)), expired)
+                if existing.status == "pending" && same_requester(&existing, &new) {
+                    (Ok((existing, false)), expired)
+                } else {
+                    (Err(request_conflict()), expired)
+                }
             } else {
                 match Self::check_other_limits(&mut state, &new, now) {
                     Err(error) => (Err(error), expired),
@@ -257,7 +279,7 @@ impl RequestStore {
         let pending_other = state
             .requests
             .values()
-            .filter(|r| r.status == "pending" && !r.same_account)
+            .filter(|r| r.open() && !r.same_account)
             .count();
         if recent.len() >= PER_SOURCE_LIMIT {
             return Err(rate_limited(PER_SOURCE_WINDOW_MS - (now - recent[0])));
@@ -275,21 +297,6 @@ impl RequestStore {
         Ok(())
     }
 
-    pub fn by_ref(&self, reference: &str) -> Option<Request> {
-        let expired;
-        let found = {
-            let mut state = self.lock();
-            expired = Self::sweep(&mut state, now_ms());
-            state
-                .requests
-                .values()
-                .find(|r| r.reference == reference)
-                .cloned()
-        };
-        self.settled(expired);
-        found
-    }
-
     /// Open requests, for this computer's own UI.
     pub fn pending(&self) -> Vec<Value> {
         let (list, expired) = {
@@ -305,6 +312,39 @@ impl RequestStore {
         };
         self.settled(expired);
         list
+    }
+
+    /// Allowing starts: the request is marked "deciding" under the lock, so a second allow (or a
+    /// deny) can't settle it while this one admits the client. None when it isn't pending. Ends
+    /// with `allow`, `deny_decided`, or `undecide` when admitting failed.
+    pub fn begin_decision(&self, reference: &str) -> Option<Request> {
+        let (found, expired) = {
+            let mut state = self.lock();
+            let expired = Self::sweep(&mut state, now_ms());
+            let found = state
+                .requests
+                .values_mut()
+                .find(|r| r.reference == reference && r.status == "pending")
+                .map(|request| {
+                    request.status = "deciding".into();
+                    request.clone()
+                });
+            (found, expired)
+        };
+        self.settled(expired);
+        found
+    }
+
+    /// Admitting failed: the request is pending again (until it expires as usual).
+    pub fn undecide(&self, reference: &str) {
+        let mut state = self.lock();
+        if let Some(request) = state
+            .requests
+            .values_mut()
+            .find(|r| r.reference == reference && r.status == "deciding")
+        {
+            request.status = "pending".into();
+        }
     }
 
     /// The requester's poll: waits up to `wait_ms` (at most 25 s) for a change. An allowed
@@ -339,6 +379,11 @@ impl RequestStore {
                     request.status = "claimed".into();
                     Poll::Allowed(request.admit.clone().unwrap_or(json!({})))
                 }
+                // Being allowed is still waiting, as far as the requester knows.
+                "deciding" => Poll::Waiting {
+                    status: "pending".into(),
+                    expires_at: at(request.expires_at),
+                },
                 status => Poll::Waiting {
                     status: status.to_string(),
                     expires_at: at(request.expires_at),
@@ -350,9 +395,11 @@ impl RequestStore {
         answer
     }
 
+    /// Settle the first request `matches` accepts, when its status is one of `from`.
     fn settle(
         &self,
         matches: impl Fn(&Request) -> bool,
+        from: &[&str],
         status: &str,
         grant: Option<Value>,
         admit: Option<Value>,
@@ -364,7 +411,7 @@ impl RequestStore {
             let Some(request) = state.requests.values_mut().find(|r| matches(r)) else {
                 return false;
             };
-            if request.status != "pending" {
+            if !from.contains(&request.status.as_str()) {
                 return false;
             }
             request.status = status.into();
@@ -383,7 +430,7 @@ impl RequestStore {
 
     /// The requester gave up (or connected with the password). Idempotent.
     pub fn withdraw(&self, id: &str) -> Option<String> {
-        self.settle(|r| r.id == id, "withdrawn", None, None);
+        self.settle(|r| r.id == id, &["pending"], "withdrawn", None, None);
         let state = self.lock();
         state.requests.get(id).map(|r| r.status.clone())
     }
@@ -392,15 +439,18 @@ impl RequestStore {
     pub fn withdraw_client(&self, client_id: &str) {
         while self.settle(
             |r| r.client_id == client_id && r.status == "pending",
+            &["pending"],
             "withdrawn",
             None,
             None,
         ) {}
     }
 
+    /// Only a request `begin_decision` marked: the admission in `admit` was made for it.
     pub fn allow(&self, reference: &str, grant: Value, admit: Value) -> bool {
         self.settle(
             |r| r.reference == reference,
+            &["deciding"],
             "allowed",
             Some(grant),
             Some(admit),
@@ -408,8 +458,18 @@ impl RequestStore {
     }
 
     pub fn deny(&self, reference: &str) -> bool {
-        self.settle(|r| r.reference == reference, "denied", None, None)
+        self.settle(|r| r.reference == reference, &["pending"], "denied", None, None)
     }
+
+    /// The client couldn't be admitted after all (revoked meanwhile): the requester is denied.
+    pub fn deny_decided(&self, reference: &str) -> bool {
+        self.settle(|r| r.reference == reference, &["deciding"], "denied", None, None)
+    }
+}
+
+/// The same requester asking again: from the same address, with the same account verdict.
+fn same_requester(existing: &Request, new: &NewRequest) -> bool {
+    existing.remote_address == new.remote_address && existing.same_account == new.same_account
 }
 
 #[cfg(test)]
@@ -442,6 +502,10 @@ mod tests {
         assert!(!ask(&store, "c1", "100.64.0.2").unwrap().1);
         assert_eq!(store.pending().len(), 1);
         assert!(store.pending()[0].get("id").is_none());
+        // Allowing needs the decision started first.
+        assert!(!store.allow(&request.reference, json!({}), json!({})));
+        assert!(store.begin_decision(&request.reference).is_some());
+        assert!(store.begin_decision(&request.reference).is_none());
         assert!(store.allow(
             &request.reference,
             json!({ "view": true }),
@@ -474,6 +538,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(answer, Some(Poll::Waiting { status, .. }) if status == "denied"));
+    }
+
+    #[test]
+    fn another_requester_cannot_take_over_an_open_request() {
+        let store = store();
+        let (request, _) = ask(&store, "c1", "100.64.0.2").unwrap();
+        // The same client ID from another address: 409, not the request.
+        let error = ask(&store, "c1", "100.64.0.3").unwrap_err();
+        assert_eq!(
+            (error.status, error.code.as_deref()),
+            (409, Some("request-conflict"))
+        );
+        // Nor from the same address with another account verdict.
+        let error = store
+            .create(NewRequest {
+                client_id: "c1".into(),
+                client_name: None,
+                machine: None,
+                same_account: true,
+                verified_machine_name: None,
+                via: "tailnet".into(),
+                remote_address: Some("100.64.0.2".into()),
+                tailnet_login: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.status, 409);
+        // While it is being allowed, nobody gets it, not even the same requester.
+        store.begin_decision(&request.reference).unwrap();
+        assert_eq!(ask(&store, "c1", "100.64.0.2").unwrap_err().status, 409);
+        store.undecide(&request.reference);
+        let (again, created) = ask(&store, "c1", "100.64.0.2").unwrap();
+        assert!(!created);
+        assert_eq!(again.id, request.id);
+    }
+
+    #[tokio::test]
+    async fn a_decision_in_progress_looks_pending_and_settles_once() {
+        let store = store();
+        let (request, _) = ask(&store, "c1", "100.64.0.2").unwrap();
+        store.begin_decision(&request.reference).unwrap();
+        assert!(matches!(
+            store.poll(&request.id, 0).await,
+            Some(Poll::Waiting { status, .. }) if status == "pending"
+        ));
+        // The requester can't withdraw it now, and a second allow finds nothing to start.
+        assert_eq!(store.withdraw(&request.id).as_deref(), Some("deciding"));
+        assert!(store.begin_decision(&request.reference).is_none());
+        assert!(store.allow(&request.reference, json!({}), json!({ "token": "t" })));
+        assert!(!store.allow(&request.reference, json!({}), json!({ "token": "u" })));
+        assert!(!store.deny(&request.reference));
     }
 
     #[test]
