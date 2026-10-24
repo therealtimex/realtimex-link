@@ -293,3 +293,56 @@ pub fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32, Color32) {
     };
     (rgb(surface), rgb(border), rgb(fg))
 }
+
+/// The desktop's light or dark setting, where egui can't see it: winit reports no theme on
+/// Linux, and egui would then always be dark. GNOME's "Default" (no preference) is light.
+#[cfg(target_os = "linux")]
+pub fn system_theme() -> Option<egui::Theme> {
+    // The XDG settings portal, read as winit's own title bar (sctk-adwaita) reads it.
+    let output = std::process::Command::new("dbus-send")
+        .args([
+            "--reply-timeout=200",
+            "--print-reply=literal",
+            "--dest=org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings.Read",
+            "string:org.freedesktop.appearance",
+            "string:color-scheme",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    portal_theme(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn system_theme() -> Option<egui::Theme> {
+    None
+}
+
+/// "variant  variant  uint32 1": 1 prefers dark, 2 prefers light, 0 has no preference.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn portal_theme(reply: &str) -> Option<egui::Theme> {
+    match reply.split_whitespace().last()?.parse::<u32>().ok()? {
+        1 => Some(egui::Theme::Dark),
+        _ => Some(egui::Theme::Light),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_portal_colour_scheme_is_dark_only_when_dark_is_preferred() {
+        let reply = |value: u32| format!("   variant       variant          uint32 {value}\n");
+        assert_eq!(portal_theme(&reply(1)), Some(egui::Theme::Dark));
+        assert_eq!(portal_theme(&reply(2)), Some(egui::Theme::Light));
+        assert_eq!(portal_theme(&reply(0)), Some(egui::Theme::Light));
+        assert_eq!(portal_theme(""), None);
+        assert_eq!(
+            portal_theme("Error org.freedesktop.DBus.Error.ServiceUnknown"),
+            None
+        );
+    }
+}

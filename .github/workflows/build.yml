@@ -99,11 +99,15 @@ jobs:
       - name: Build (macOS, Linux)
         if: matrix.script == 'unix'
         run: scripts/build.sh ${{ matrix.arch }} dist/${{ matrix.name }}
-      # Unit tests, once (Linux): the daemon (autostart, install, the local API) and the screen
-      # capture crate (its one-request-at-a-time gate, image helpers).
-      - name: Test rtx-linkd and rtx-screens (Linux)
+      # Unit tests, once (Linux): the daemon (autostart, install, the local API), the window (its
+      # theme) and the screen capture crate (its one-request-at-a-time gate, image helpers).
+      - name: Test rtx-linkd, rtx-link and rtx-screens (Linux)
         if: matrix.name == 'linux-x86_64'
-        run: cargo test --locked -p rtx-linkd -p rtx-screens
+        run: cargo test --locked -p rtx-linkd -p rtx-link -p rtx-screens
+      # Lints, once (Linux): warnings show in the log; errors fail the build.
+      - name: Clippy (Linux)
+        if: matrix.name == 'linux-x86_64'
+        run: cargo clippy --locked -p rtx-linkd -p rtx-link -p rtx-screens
       # The macOS key mapping (which key, and Shift, types each character), once (Apple silicon).
       - name: Test macOS key mapping
         if: matrix.name == 'macos-arm64'

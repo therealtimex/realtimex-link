@@ -150,9 +150,19 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
         };
         if let Some(api) = api {
             let status = api.get("/v1/status").ok();
-            let preference = theme_preference(status.as_ref());
+            let preference = match theme_preference(status.as_ref()) {
+                egui::ThemePreference::System => theme::system_theme()
+                    .map_or(egui::ThemePreference::System, egui::ThemePreference::from),
+                preference => preference,
+            };
             if appearance != Some(preference) {
                 ctx.set_theme(preference);
+                // The title bar too (the Linux one is drawn by winit, Windows' by the system).
+                ctx.send_viewport_cmd(ViewportCommand::SetTheme(match preference {
+                    egui::ThemePreference::Light => egui::SystemTheme::Light,
+                    egui::ThemePreference::Dark => egui::SystemTheme::Dark,
+                    egui::ThemePreference::System => egui::SystemTheme::SystemDefault,
+                }));
                 appearance = Some(preference);
             }
             let shown = status.and_then(|status| status["showWindow"].as_u64());
