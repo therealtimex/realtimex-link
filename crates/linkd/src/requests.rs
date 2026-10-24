@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use crate::error::ApiError;
-use crate::util::{base64url, iso, now_ms, random_bytes};
+use crate::util::{base64url, iso, now_ms, random_bytes, same_bytes};
 
 pub const REQUEST_TTL_MS: i64 = 60 * 1000;
 /// Settled requests are kept this long so a poll in flight still learns the outcome.
@@ -112,6 +112,8 @@ pub struct NewRequest {
     pub via: String,
     pub remote_address: Option<String>,
     pub tailnet_login: Option<String>,
+    /// The `requestId` the requester was given for its open request, sent back to ask again.
+    pub request_id: Option<String>,
 }
 
 /// The requester's poll answer.
@@ -198,8 +200,10 @@ impl RequestStore {
         }
     }
 
-    /// A pending request for this client, or its existing one when the same address asks again
-    /// with the same account verdict; 409 when anyone else names a client with an open request.
+    /// A pending request for this client, or its existing one when the requester asks again with
+    /// that request's `requestId` and the same account verdict; 409 for anyone else naming a
+    /// client with an open request. The address proves nothing: computers behind one NAT share
+    /// it, and a client ID is no secret (every computer the controller connected to has seen it).
     /// 429 for too many requests not from this computer's account.
     pub fn create(&self, new: NewRequest) -> Result<(Request, bool), ApiError> {
         let now = now_ms();
@@ -472,9 +476,13 @@ impl RequestStore {
     }
 }
 
-/// The same requester asking again: from the same address, with the same account verdict.
+/// The same requester asking again: it holds the request's poll capability (only ever sent to
+/// whoever created it), with the same account verdict.
 fn same_requester(existing: &Request, new: &NewRequest) -> bool {
-    existing.remote_address == new.remote_address && existing.same_account == new.same_account
+    new.request_id
+        .as_deref()
+        .is_some_and(|id| same_bytes(id.as_bytes(), existing.id.as_bytes()))
+        && existing.same_account == new.same_account
 }
 
 #[cfg(test)]
@@ -486,6 +494,16 @@ mod tests {
     }
 
     fn ask(store: &RequestStore, client: &str, from: &str) -> Result<(Request, bool), ApiError> {
+        ask_again(store, client, from, None)
+    }
+
+    /// Asking with the `requestId` an earlier answer gave (or a guessed one).
+    fn ask_again(
+        store: &RequestStore,
+        client: &str,
+        from: &str,
+        request_id: Option<&str>,
+    ) -> Result<(Request, bool), ApiError> {
         store.create(NewRequest {
             client_id: client.into(),
             client_name: Some(json!("Laptop\u{202e}")),
@@ -495,6 +513,7 @@ mod tests {
             via: "tailnet".into(),
             remote_address: Some(from.into()),
             tailnet_login: None,
+            request_id: request_id.map(str::to_string),
         })
     }
 
@@ -504,7 +523,11 @@ mod tests {
         let (request, created) = ask(&store, "c1", "100.64.0.2").unwrap();
         assert!(created);
         assert_eq!(request.client_name, "Laptop");
-        assert!(!ask(&store, "c1", "100.64.0.2").unwrap().1);
+        assert!(
+            !ask_again(&store, "c1", "100.64.0.2", Some(&request.id))
+                .unwrap()
+                .1
+        );
         assert_eq!(store.pending().len(), 1);
         assert!(store.pending()[0].get("id").is_none());
         // Allowing needs the decision started first.
@@ -555,7 +578,7 @@ mod tests {
             (error.status, error.code.as_deref()),
             (409, Some("request-conflict"))
         );
-        // Nor from the same address with another account verdict.
+        // Nor with the request's ID but another account verdict.
         let error = store
             .create(NewRequest {
                 client_id: "c1".into(),
@@ -566,16 +589,55 @@ mod tests {
                 via: "tailnet".into(),
                 remote_address: Some("100.64.0.2".into()),
                 tailnet_login: None,
+                request_id: Some(request.id.clone()),
             })
             .unwrap_err();
         assert_eq!(error.status, 409);
-        // While it is being allowed, nobody gets it, not even the same requester.
+        // While it is being allowed, nobody gets it, not even the requester with its ID.
         store.begin_decision(&request.reference).unwrap();
-        assert_eq!(ask(&store, "c1", "100.64.0.2").unwrap_err().status, 409);
+        assert_eq!(
+            ask_again(&store, "c1", "100.64.0.2", Some(&request.id))
+                .unwrap_err()
+                .status,
+            409
+        );
         store.undecide(&request.reference);
-        let (again, created) = ask(&store, "c1", "100.64.0.2").unwrap();
+        // The requester asks again with its ID, even from a new address (a phone that moved).
+        let (again, created) = ask_again(&store, "c1", "100.64.0.9", Some(&request.id)).unwrap();
         assert!(!created);
         assert_eq!(again.id, request.id);
+    }
+
+    /// Two computers behind one NAT: same public address, same (known) client ID, same verdict.
+    /// Only the one that created the request can get it back or claim the admission.
+    #[tokio::test]
+    async fn a_neighbour_behind_the_same_address_gets_nothing() {
+        let store = store();
+        let (request, _) = ask(&store, "c1", "203.0.113.7").unwrap();
+        // The neighbour without the request's ID, or with a guessed one: 409, no request.
+        for guess in [None, Some("not-the-id"), Some("")] {
+            let error = ask_again(&store, "c1", "203.0.113.7", guess).unwrap_err();
+            assert_eq!(
+                (error.status, error.code.as_deref()),
+                (409, Some("request-conflict"))
+            );
+        }
+        assert_eq!(store.pending().len(), 1);
+        // The person allows it: the admission goes to the creator's poll, once.
+        store.begin_decision(&request.reference).unwrap();
+        assert!(store.allow(
+            &request.reference,
+            json!({ "view": true }),
+            json!({ "token": "t" })
+        ));
+        assert!(store.poll("not-the-id", 0).await.is_none());
+        assert!(
+            matches!(store.poll(&request.id, 0).await, Some(Poll::Allowed(admit)) if admit["token"] == "t")
+        );
+        // Settled: the client ID is free again, as a new request.
+        let (next, created) = ask(&store, "c1", "203.0.113.7").unwrap();
+        assert!(created);
+        assert_ne!(next.id, request.id);
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@
 //! - Linux: /opt needs root, so the window opens the release page (the .deb / .rpm are there).
 
 use std::path::Path;
+// Only the macOS and Windows updates run programs; Linux opens the release page.
+#[cfg(any(target_os = "macos", windows))]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;

@@ -492,6 +492,8 @@ impl Host {
             via: via.to_string(),
             remote_address: Some(address.to_string()),
             tailnet_login: login,
+            // Asking again for an open request (RealTimeX sends the requestId it was given).
+            request_id: Some(text("requestId")).filter(|id| !id.is_empty()),
         });
         match created {
             Ok((request, _)) => Ok(Admitted {
@@ -511,7 +513,7 @@ impl Host {
                 refused.retry_after = error.retry_after;
                 Ok(refused)
             }
-            // Another address (or account verdict) has a request open for this client ID.
+            // A request is open for this client ID and this caller didn't show its requestId.
             Err(error) if error.code.as_deref() == Some("request-conflict") => Ok(
                 Admitted::refuse(409, "request-conflict", &error.message),
             ),
