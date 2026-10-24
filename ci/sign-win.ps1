@@ -1,51 +1,49 @@
 # Sign RealTimeX Link for Windows, on RealTimeX's Windows release runner (the GitLab `sign-win`
-# job): the unsigned archive from the draft release (checked against its SHA256SUMS) in; out, the
-# archive (same name) with the executables signed by Azure Trusted Signing, and
-# RealTimeX-Link-Setup-<version>.exe, Link's NSIS installer (packaging/windows/installer.nsi)
-# around them, signed. Signing is the one RealTimeX's electron-builder uses: the TrustedSigning
-# module, RealTimeX's account and profile, AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET.
-# The draft release is read with GITHUB_LINK_TOKEN.
+# job): the unsigned archive in; out, the archive (same name) with the executables signed by Azure
+# Trusted Signing, and RealTimeX-Link-Setup-<version>.exe, Link's NSIS installer around them,
+# signed. Signing is the one RealTimeX's electron-builder uses: the TrustedSigning module (pinned
+# below), RealTimeX's account and profile, AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET.
+# -In is the verify job's output (ci/release.py fetch): the unsigned archive, taken from the tag's
+# build run and checked there, and tree\, the release commit's packaging\ and its icon (the
+# installer script comes from there, not from this checkout, which is main's when signing again).
 param(
   [Parameter(Mandatory = $true)][string]$Version,
+  [Parameter(Mandatory = $true)][string]$In,
   [Parameter(Mandatory = $true)][string]$Out
 )
 $ErrorActionPreference = 'Stop'
-$repository = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { 'therealtimex/realtimex-link' }
 $name = 'realtimex-link-windows-x86_64.tar.gz'
 $setup = "RealTimeX-Link-Setup-$Version.exe"
 $publisher = 'Dang Le'
 $executables = @('rtx-linkd.exe', 'rtx-link.exe', 'rtx-control.exe')
+# The TrustedSigning module, exactly this version (PowerShell Gallery): a new upload under that name
+# never runs with the signing credentials until it is reviewed and pinned here.
+$trustedSigningVersion = '0.5.8'
 
-foreach ($variable in 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'GITHUB_LINK_TOKEN') {
+foreach ($variable in 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET') {
   if (-not [Environment]::GetEnvironmentVariable($variable)) { throw "$variable is not set" }
 }
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("realtimex-link-" + [Guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $work, $Out | Out-Null
 $Out = (Resolve-Path $Out).Path
+$In = (Resolve-Path $In).Path
+$tree = Join-Path $In 'tree'
+foreach ($file in (Join-Path $In $name), (Join-Path $tree 'packaging\windows\installer.nsi'), (Join-Path $tree 'assets\icon.ico')) {
+  if (-not (Test-Path $file)) { throw "$file is missing: the verify job's output (link-unsigned) didn't arrive" }
+}
 try {
-  # The unsigned build, only if it is the one the release lists. A draft's assets come through
-  # the API, with the token.
-  $headers = @{ Authorization = "Bearer $env:GITHUB_LINK_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'realtimex-link-gitlab-ci' }
-  $release = (Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repository/releases?per_page=50") |
-    Where-Object { $_.tag_name -eq "v$Version" } | Select-Object -First 1
-  if (-not $release) { throw "$repository has no release v$Version" }
-  foreach ($file in $name, 'SHA256SUMS') {
-    $asset = $release.assets | Where-Object { $_.name -eq $file } | Select-Object -First 1
-    if (-not $asset) { throw "release v$Version has no $file" }
-    Invoke-WebRequest -UseBasicParsing -Headers ($headers + @{ Accept = 'application/octet-stream' }) -Uri $asset.url -OutFile (Join-Path $work $file)
-  }
-  $expected = (Get-Content (Join-Path $work 'SHA256SUMS') | Where-Object { $_ -match " $([regex]::Escape($name))$" }) -split '\s+' | Select-Object -First 1
-  $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $work $name)).Hash.ToLower()
-  if (-not $expected -or $actual -ne $expected) { throw "$name`: SHA-256 $actual, but the release lists '$expected'" }
   $payload = Join-Path $work 'payload'
   New-Item -ItemType Directory -Force -Path $payload | Out-Null
-  tar -xzf (Join-Path $work $name) -C $payload
+  tar -xzf (Join-Path $In $name) -C $payload
   if ($LASTEXITCODE -ne 0) { throw "tar failed" }
 
   # Azure Trusted Signing, as electron-builder does it.
   try { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null } catch {}
-  Install-Module -Name TrustedSigning -MinimumVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser
+  if (-not (Get-Module -ListAvailable -Name TrustedSigning | Where-Object { $_.Version -eq [version]$trustedSigningVersion })) {
+    Install-Module -Name TrustedSigning -RequiredVersion $trustedSigningVersion -Force -Repository PSGallery -Scope CurrentUser
+  }
+  Import-Module -Name TrustedSigning -RequiredVersion $trustedSigningVersion -Force
   function Sign-Files([string[]]$Files) {
     Invoke-TrustedSigning -Endpoint 'https://wus.codesigning.azure.net/' -CodeSigningAccountName 'RealTimeX' `
       -CertificateProfileName 'realtimex-production-profile' -TimestampRfc3161 'http://timestamp.acs.microsoft.com' `
@@ -54,6 +52,11 @@ try {
       $signature = Get-AuthenticodeSignature $file
       if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch "CN=`"?$([regex]::Escape($publisher))") {
         throw "$file`: signature $($signature.Status), signer $($signature.SignerCertificate.Subject)"
+      }
+      # Countersigned by the timestamp server: Trusted Signing certificates live a few days, and
+      # without a timestamp the signature stops validating when the certificate expires.
+      if (-not $signature.TimeStamperCertificate) {
+        throw "$file`: signed without a timestamp"
       }
       Write-Host "signed: $(Split-Path -Leaf $file) ($($signature.SignerCertificate.Subject))"
     }
@@ -66,8 +69,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "tar failed" }
   Pop-Location
 
-  # The installer, from this checkout (the release's tag).
-  $source = (Get-Location).Path
+  # The installer, from the release commit's tree.
   $nsis = @(
     "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
     "$env:ProgramFiles\NSIS\makensis.exe"
@@ -95,7 +97,7 @@ try {
   }
   if (-not $nsis) { throw "NSIS (makensis.exe) is not on this runner" }
   Write-Host "NSIS: $nsis"
-  Push-Location (Join-Path $source 'packaging\windows')
+  Push-Location (Join-Path $tree 'packaging\windows')
   & $nsis /V2 "/DVERSION=$Version" "/DPAYLOAD=$payload" "/DOUTFILE=$(Join-Path $Out $setup)" installer.nsi
   if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
   Pop-Location
