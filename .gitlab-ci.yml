@@ -9,6 +9,8 @@
 #   runner (Azure Trusted Signing; the signed archive and the installer, ci/sign-win.ps1).
 # - publish (vX.Y.Z tags): the signed files replace or join the draft's assets, SHA256SUMS is
 #   rewritten and the release is published as Link's latest (ci/release.py).
+# - Sign again without building (a signing fix): Run pipeline on main with LINK_SIGN_VERSION=X.Y.Z
+#   signs and publishes that existing draft release with this commit's scripts.
 #
 # CI variables: GITHUB_LINK_TOKEN (the mirror: Contents and Actions read/write), and the signing
 # credentials RealTimeX's own releases use: CSC_NAME, KEYCHAIN, KEYCHAIN_PASSWORD, APPLE_ID,
@@ -28,10 +30,20 @@ variables:
 workflow:
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+      variables:
+        RELEASE_VERSION: $CI_COMMIT_TAG
+    - if: '$LINK_SIGN_VERSION =~ /^v?[0-9]+\.[0-9]+\.[0-9]+$/ && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api")'
+      variables:
+        RELEASE_VERSION: $LINK_SIGN_VERSION
     - if: '$CI_COMMIT_BRANCH'
 
 build:
   stage: build
+  rules:
+    # Signing an existing draft again builds nothing.
+    - if: '$LINK_SIGN_VERSION'
+      when: never
+    - when: on_success
   # A newer push to the same branch cancels this one (Settings → CI/CD → Auto-cancel redundant
   # pipelines): only the latest commit's build matters.
   interruptible: true
@@ -43,15 +55,17 @@ build:
 
 .release:
   rules:
-    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+    - if: '$RELEASE_VERSION'
 
 .sign-mac:
   extends: .release
   stage: sign
-  needs: [build]
+  needs:
+    - job: build
+      optional: true
   timeout: 1h
   script:
-    - ci/sign-mac.sh "${CI_COMMIT_TAG#v}" "$CPU_ARCH" link-signed
+    - bash ci/sign-mac.sh "${RELEASE_VERSION#v}" "$CPU_ARCH" link-signed
   artifacts:
     expire_in: 30 days
     paths:
@@ -74,12 +88,14 @@ sign-mac-x86_64:
 sign-win:
   extends: .release
   stage: sign
-  needs: [build]
+  needs:
+    - job: build
+      optional: true
   timeout: 1h
   tags:
     - office-win-dell
   script:
-    - powershell -NoProfile -ExecutionPolicy Bypass -File ci\sign-win.ps1 -Version ($env:CI_COMMIT_TAG -replace '^v','') -Out link-signed
+    - powershell -NoProfile -ExecutionPolicy Bypass -File ci\sign-win.ps1 -Version ($env:RELEASE_VERSION -replace '^v','') -Out link-signed
     - if ($LASTEXITCODE -ne 0) { throw "sign-win failed" }
   artifacts:
     expire_in: 30 days
@@ -94,4 +110,4 @@ publish:
   tags:
     - $LINK_CI_RUNNER_TAG
   script:
-    - python3 -u ci/release.py publish "$CI_COMMIT_TAG" link-signed
+    - python3 -u ci/release.py publish "$RELEASE_VERSION" link-signed
