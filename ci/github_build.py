@@ -6,6 +6,11 @@ the Build workflow on the mirror for the pipeline's branch or tag, checks the ru
 commit, waits for it and fails when it fails. A vX.Y.Z tag builds every platform and opens the
 draft release the signing pipeline picks up.
 
+On a tag it first checks that the tag is Cargo.toml's version (a release whose tag isn't the version
+Link reports would be offered to every Link as an update, forever). When the run succeeds it writes
+build.env (LINK_BUILD_RUN_ID, LINK_BUILD_SHA), the job's dotenv report: the verify job takes the
+release's unsigned files from that very run's artifacts, not from whatever the draft holds by then.
+
 Environment: GITHUB_LINK_TOKEN (Actions read/write on the mirror), CI_COMMIT_SHA, CI_COMMIT_TAG or
 CI_COMMIT_BRANCH, and optionally GITHUB_REPOSITORY (default therealtimex/realtimex-link) and
 BUILD_TARGETS (test|all; tags always build all).
@@ -17,6 +22,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+from versions import tag_matches_cargo
 
 API = "https://api.github.com"
 MIRROR_WAIT = 10 * 60
@@ -52,6 +59,13 @@ def main():
     tag = os.environ.get("CI_COMMIT_TAG", "")
     ref = tag or os.environ["CI_COMMIT_BRANCH"]
     targets = "all" if tag else os.environ.get("BUILD_TARGETS", "test")
+
+    if tag:
+        with open("Cargo.toml", encoding="utf-8") as file:
+            problem = tag_matches_cargo(tag, file.read())
+        if problem:
+            raise SystemExit(problem)
+        print(f"{tag} is Cargo.toml's version")
 
     # The push mirror copies the commit to GitHub; wait until the ref points at it.
     kind = "tags" if tag else "heads"
@@ -102,6 +116,9 @@ def main():
         print(f"  {job['name']}: {job['conclusion']}")
     if run["conclusion"] != "success":
         raise SystemExit(f"the build failed ({run['conclusion']}): {run['html_url']}")
+    # For the later jobs (.gitlab-ci.yml: artifacts: reports: dotenv): which run built this commit.
+    with open(os.environ.get("LINK_BUILD_ENV", "build.env"), "w", encoding="utf-8") as file:
+        file.write(f"LINK_BUILD_RUN_ID={run['id']}\nLINK_BUILD_SHA={sha}\n")
     if tag:
         print(f"draft release: https://github.com/{repo}/releases (tag {tag})")
 
