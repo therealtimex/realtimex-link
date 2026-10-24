@@ -1,0 +1,208 @@
+//! RealTimeX's look in the window: its typeface (Plus Jakarta Sans) and its theme tokens
+//! (realtimex-ai-app frontend/src/index.css, `--theme-*`), for both the dark and the light theme.
+//! The window follows the system's theme, as eframe does by default.
+
+use std::sync::Arc;
+
+use eframe::egui::{
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke,
+    TextStyle, Theme,
+};
+
+/// Plus Jakarta Sans (OFL, fonts/OFL.txt), RealTimeX's typeface: one variable font, regular by
+/// default and semibold through its weight axis (semibold()).
+const FONT: &[u8] = include_bytes!("../fonts/PlusJakartaSans.ttf");
+const SEMIBOLD: f32 = 600.0;
+
+/// One theme's tokens.
+struct Tokens {
+    /// --theme-bg-primary: the window.
+    bg_primary: Color32,
+    /// --theme-bg-secondary: cards and plain buttons.
+    bg_secondary: Color32,
+    /// --theme-settings-input-bg: text fields.
+    input_bg: Color32,
+    /// --theme-text-primary and --theme-text-secondary.
+    text: Color32,
+    text_secondary: Color32,
+    /// --theme-modal-border: card, button and field borders.
+    border: Color32,
+    /// --theme-sidebar-item-hover: a plain button under the pointer.
+    hover: Color32,
+    /// The links' colour.
+    link: Color32,
+}
+
+const DARK: Tokens = Tokens {
+    bg_primary: Color32::from_rgb(0x19, 0x1d, 0x1d),
+    bg_secondary: Color32::from_rgb(0x1b, 0x1b, 0x1e),
+    input_bg: Color32::from_rgb(0x1e, 0x22, 0x25),
+    text: Color32::WHITE,
+    // rgba(255, 255, 255, 0.6) on --theme-bg-primary.
+    text_secondary: Color32::from_rgb(0xa3, 0xa5, 0xa5),
+    border: Color32::from_rgb(0x3f, 0x3f, 0x42),
+    hover: Color32::from_rgb(0x3f, 0x3f, 0x42),
+    // --theme-button-primary.
+    link: PRIMARY,
+};
+
+const LIGHT: Tokens = Tokens {
+    bg_primary: Color32::from_rgb(0xfc, 0xfc, 0xfc),
+    bg_secondary: Color32::WHITE,
+    input_bg: Color32::from_rgb(0xf9, 0xf9, 0xf9),
+    text: Color32::from_rgb(0x0e, 0x0f, 0x0f),
+    text_secondary: Color32::from_rgb(0x7a, 0x7d, 0x7e),
+    border: Color32::from_rgb(0xd3, 0xd3, 0xd3),
+    hover: Color32::from_rgb(0xe0, 0xef, 0xf4),
+    // --theme-status-info-fg: --theme-button-primary is too faint for text on white.
+    link: Color32::from_rgb(0x07, 0x6e, 0x9e),
+};
+
+/// --theme-button-primary, with --theme-button-primary-text on it.
+pub const PRIMARY: Color32 = Color32::from_rgb(0x36, 0xbf, 0xfa);
+/// --theme-button-primary-hover: rgba(54, 191, 250, 0.9).
+const PRIMARY_HOVER: Color32 = Color32::from_rgba_premultiplied(49, 172, 225, 230);
+
+/// Buttons and fields (rounded-md), and cards and alerts (rounded-lg).
+pub const CONTROL_RADIUS: u8 = 6;
+pub const CARD_RADIUS: u8 = 8;
+/// Buttons are h-10 in RealTimeX; a little lower here, where they sit in rows inside cards.
+const CONTROL_HEIGHT: f32 = 32.0;
+pub const PRIMARY_HEIGHT: f32 = 36.0;
+
+pub fn apply(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "plus-jakarta-sans".into(),
+        Arc::new(FontData::from_static(FONT)),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "plus-jakarta-sans".into());
+    ctx.set_fonts(fonts);
+    for (theme, tokens) in [(Theme::Dark, &DARK), (Theme::Light, &LIGHT)] {
+        ctx.style_mut_of(theme, |style| {
+            style.text_styles = [
+                (TextStyle::Small, FontId::proportional(12.0)),
+                (TextStyle::Body, FontId::proportional(14.0)),
+                (TextStyle::Button, FontId::proportional(14.0)),
+                (TextStyle::Heading, FontId::proportional(16.0)),
+                (TextStyle::Monospace, FontId::monospace(13.0)),
+            ]
+            .into();
+            style.spacing.interact_size.y = CONTROL_HEIGHT;
+            style.spacing.button_padding = egui::vec2(12.0, 4.0);
+            visuals(&mut style.visuals, tokens);
+        });
+    }
+}
+
+fn visuals(visuals: &mut egui::Visuals, tokens: &Tokens) {
+    visuals.panel_fill = tokens.bg_primary;
+    visuals.window_fill = tokens.bg_secondary;
+    visuals.window_stroke = Stroke::new(1.0, tokens.border);
+    visuals.window_corner_radius = CornerRadius::same(CARD_RADIUS);
+    visuals.menu_corner_radius = CornerRadius::same(CONTROL_RADIUS);
+    visuals.extreme_bg_color = tokens.input_bg;
+    visuals.text_edit_bg_color = Some(tokens.input_bg);
+    visuals.faint_bg_color = tokens.bg_secondary;
+    visuals.hyperlink_color = tokens.link;
+    visuals.weak_text_color = Some(tokens.text_secondary);
+    visuals.selection.bg_fill = PRIMARY;
+    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    let widgets = &mut visuals.widgets;
+    widgets.noninteractive.bg_fill = tokens.bg_primary;
+    widgets.noninteractive.weak_bg_fill = tokens.bg_primary;
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0, tokens.border);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0, tokens.text);
+    // Plain buttons are RealTimeX's outline buttons: a border on --theme-bg-secondary.
+    for (state, fill) in [
+        (&mut widgets.inactive, tokens.bg_secondary),
+        (&mut widgets.hovered, tokens.hover),
+        (&mut widgets.active, tokens.hover),
+        (&mut widgets.open, tokens.hover),
+    ] {
+        state.bg_fill = fill;
+        state.weak_bg_fill = fill;
+        state.bg_stroke = Stroke::new(1.0, tokens.border);
+        state.fg_stroke = Stroke::new(1.0, tokens.text);
+        state.expansion = 0.0;
+    }
+    // Text fields and the switch's track.
+    widgets.inactive.bg_fill = tokens.input_bg;
+    for state in [
+        &mut widgets.noninteractive,
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.corner_radius = CornerRadius::same(CONTROL_RADIUS);
+    }
+}
+
+/// Text in the semibold weight (RealTimeX's font-semibold), in the strong colour.
+pub fn semibold(text: impl Into<String>) -> RichText {
+    RichText::new(text).strong().variation("wght", SEMIBOLD)
+}
+
+/// RealTimeX's primary button: white semibold text on --theme-button-primary.
+pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    // Through the widget visuals rather than Button::fill, which would also be the hover fill.
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        for (state, fill) in [
+            (&mut widgets.inactive, PRIMARY),
+            (&mut widgets.hovered, PRIMARY_HOVER),
+            (&mut widgets.active, PRIMARY_HOVER),
+        ] {
+            state.weak_bg_fill = fill;
+            state.bg_stroke = Stroke::NONE;
+            state.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+        }
+        ui.add(
+            egui::Button::new(semibold(text).color(Color32::WHITE))
+                .min_size(egui::vec2(0.0, PRIMARY_HEIGHT)),
+        )
+    })
+    .inner
+}
+
+/// A card: --theme-bg-secondary with a --theme-modal-border border.
+pub fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    let visuals = ui.visuals();
+    egui::Frame::new()
+        .fill(visuals.faint_bg_color)
+        .stroke(visuals.widgets.noninteractive.bg_stroke)
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+}
+
+#[derive(Clone, Copy)]
+pub enum Tone {
+    Success,
+    Warning,
+    Danger,
+    Info,
+    Neutral,
+}
+
+/// A tone's colours: (surface, border, text), --theme-status-*-surface / -border / -fg.
+pub fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32, Color32) {
+    let rgb = |hex: u32| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
+    let (surface, border, fg) = match (tone, ui.visuals().dark_mode) {
+        (Tone::Success, true) => (0x1b3525, 0x558568, 0xa6f4c5),
+        (Tone::Success, false) => (0xd8faed, 0x379a6e, 0x027a44),
+        (Tone::Warning, true) => (0x352d1b, 0x937632, 0xfec84b),
+        (Tone::Warning, false) => (0xf7eadd, 0xa97b4c, 0x854708),
+        (Tone::Danger, true) => (0x351d1b, 0xb2524b, 0xf97066),
+        (Tone::Danger, false) => (0xf5dfdf, 0xc95f58, 0xb42318),
+        (Tone::Info, true) => (0x1b2d35, 0x4a7d95, 0x7cd4fd),
+        (Tone::Info, false) => (0xd9f0fb, 0x3b8eb5, 0x076e9e),
+        // --theme-action-menu-bg, --theme-modal-border and --theme-text-primary.
+        (Tone::Neutral, true) => (0x27282a, 0x3f3f42, 0xffffff),
+        (Tone::Neutral, false) => (0xeaeaea, 0xd3d3d3, 0x0e0f0f),
+    };
+    (rgb(surface), rgb(border), rgb(fg))
+}

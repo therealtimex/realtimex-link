@@ -38,3 +38,13 @@ pub fn apply() {
         }
     }
 }
+
+/// macOS: the app menu says "About RealTimeX Link", "Quit RealTimeX Link": winit names its items
+/// after the process, which is the executable's name (rtx-link). Before the window is made.
+pub fn name_process() {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSProcessInfo, NSString};
+        NSProcessInfo::processInfo().setProcessName(&NSString::from_str("RealTimeX Link"));
+    }
+}

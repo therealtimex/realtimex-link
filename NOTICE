@@ -2,3 +2,7 @@ RealTimeX Link
 Copyright 2026 RealTimeX
 
 This product includes software developed by RealTimeX (https://realtimex.ai).
+
+The window uses the Plus Jakarta Sans typeface (crates/link/fonts/PlusJakartaSans.ttf),
+Copyright 2020 The Plus Jakarta Sans Project Authors, under the SIL Open Font License 1.1
+(crates/link/fonts/OFL.txt).

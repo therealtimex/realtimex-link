@@ -11,12 +11,15 @@ use serde_json::{json, Value};
 
 use crate::api::Api;
 use crate::desktop;
+use crate::theme::{self, primary_button, semibold, tone_colors, Tone};
 
 const POLL: Duration = Duration::from_millis(1500);
 /// The window's height follows its content between these; past the maximum the content scrolls.
 const MIN_HEIGHT: f32 = 360.0;
 const MAX_HEIGHT: f32 = 720.0;
 const NOTICE_FOR: Duration = Duration::from_secs(4);
+/// macOS: the height of the hidden title bar, where the window's buttons stay.
+const TRAFFIC_LIGHTS: f32 = 28.0;
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -113,7 +116,18 @@ pub fn register(api: &Api) -> bool {
     !answer.is_ok_and(|answer| answer["owner"] == false)
 }
 
+/// RealTimeX's theme, which the window follows (GET /v1/status "appearance"): "light", "dark" or
+/// "system"; an older daemon has none, which is the system's.
+fn theme_preference(status: Option<&Value>) -> egui::ThemePreference {
+    match status.and_then(|status| status["appearance"].as_str()) {
+        Some("light") => egui::ThemePreference::Light,
+        Some("dark") => egui::ThemePreference::Dark,
+        _ => egui::ThemePreference::System,
+    }
+}
+
 pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
+    let mut appearance = None;
     loop {
         let api = lock(&shared).api.clone();
         let api = match api {
@@ -135,10 +149,13 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             },
         };
         if let Some(api) = api {
-            let shown = api
-                .get("/v1/status")
-                .ok()
-                .and_then(|status| status["showWindow"].as_u64());
+            let status = api.get("/v1/status").ok();
+            let preference = theme_preference(status.as_ref());
+            if appearance != Some(preference) {
+                ctx.set_theme(preference);
+                appearance = Some(preference);
+            }
+            let shown = status.and_then(|status| status["showWindow"].as_u64());
             let seen = std::mem::replace(&mut lock(&shared).show_window, shown);
             if let (Some(seen), Some(shown)) = (seen, shown) {
                 if shown > seen {
@@ -229,6 +246,8 @@ pub struct LinkApp {
     editing_password: Option<String>,
     confirm: Option<Confirm>,
     tray: Option<crate::tray::Tray>,
+    /// The app icon in the header.
+    icon: egui::TextureHandle,
 }
 
 impl LinkApp {
@@ -253,7 +272,9 @@ impl LinkApp {
             )
             .ok()
         };
+        theme::apply(&cc.egui_ctx);
         Self {
+            icon: header_icon(&cc.egui_ctx),
             tray,
             shared,
             refresh,
@@ -275,75 +296,55 @@ impl LinkApp {
 
 // --- small pieces -----------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-enum Tone {
-    Success,
-    Warning,
-    Danger,
-    Info,
-    Neutral,
-}
-
-fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32) {
-    let dark = ui.visuals().dark_mode;
-    match (tone, dark) {
-        (Tone::Success, true) => (
-            Color32::from_rgb(20, 61, 38),
-            Color32::from_rgb(134, 239, 172),
-        ),
-        (Tone::Success, false) => (
-            Color32::from_rgb(220, 252, 231),
-            Color32::from_rgb(22, 101, 52),
-        ),
-        (Tone::Warning, true) => (
-            Color32::from_rgb(66, 46, 12),
-            Color32::from_rgb(253, 211, 77),
-        ),
-        (Tone::Warning, false) => (
-            Color32::from_rgb(254, 243, 199),
-            Color32::from_rgb(133, 77, 14),
-        ),
-        (Tone::Danger, true) => (
-            Color32::from_rgb(69, 20, 20),
-            Color32::from_rgb(252, 165, 165),
-        ),
-        (Tone::Danger, false) => (
-            Color32::from_rgb(254, 226, 226),
-            Color32::from_rgb(153, 27, 27),
-        ),
-        (Tone::Info, true) => (
-            Color32::from_rgb(23, 37, 72),
-            Color32::from_rgb(147, 197, 253),
-        ),
-        (Tone::Info, false) => (
-            Color32::from_rgb(219, 234, 254),
-            Color32::from_rgb(30, 64, 175),
-        ),
-        (Tone::Neutral, true) => (Color32::from_gray(48), Color32::from_gray(220)),
-        (Tone::Neutral, false) => (Color32::from_gray(232), Color32::from_gray(60)),
+/// The app icon (the window's, main.rs) at 64 px, shown at 24 pt in the header: averaged down
+/// 4 x 4 here, as the texture has no mipmaps to scale it down smoothly.
+fn header_icon(ctx: &egui::Context) -> egui::TextureHandle {
+    const FROM: usize = 256;
+    const TO: usize = 64;
+    const STEP: usize = FROM / TO;
+    // The rounded icon outside Windows, like the platform's own (macOS has no window icon).
+    #[cfg(windows)]
+    let rgba = include_bytes!("../icons/window-256.rgba");
+    #[cfg(not(windows))]
+    let rgba = include_bytes!("../icons/window-linux-256.rgba");
+    let full = egui::ColorImage::from_rgba_unmultiplied([FROM, FROM], rgba);
+    let mut pixels = Vec::with_capacity(TO * TO);
+    for y in 0..TO {
+        for x in 0..TO {
+            let mut sum = [0u32; 4];
+            for dy in 0..STEP {
+                for dx in 0..STEP {
+                    let pixel = full.pixels[(y * STEP + dy) * FROM + x * STEP + dx];
+                    for (total, channel) in sum.iter_mut().zip(pixel.to_array()) {
+                        *total += u32::from(channel);
+                    }
+                }
+            }
+            let [r, g, b, a] = sum.map(|total| (total / (STEP * STEP) as u32) as u8);
+            pixels.push(Color32::from_rgba_premultiplied(r, g, b, a));
+        }
     }
+    ctx.load_texture(
+        "app-icon",
+        egui::ColorImage::new([TO, TO], pixels),
+        egui::TextureOptions::LINEAR,
+    )
 }
 
+/// A pill: the tone's text on its surface.
 fn badge(ui: &mut egui::Ui, text: &str, tone: Tone) {
-    let (fill, fg) = tone_colors(ui, tone);
+    let (fill, _, fg) = tone_colors(ui, tone);
     egui::Frame::new()
         .fill(fill)
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).small().strong().color(fg));
+            ui.label(semibold(text).small().color(fg));
         });
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let visuals = ui.visuals();
-    egui::Frame::new()
-        .fill(visuals.extreme_bg_color)
-        .stroke(Stroke::new(
-            1.0,
-            visuals.widgets.noninteractive.bg_stroke.color,
-        ))
-        .corner_radius(CornerRadius::same(10))
+    theme::card_frame(ui)
         .inner_margin(Margin::same(14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -353,14 +354,15 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 fn alert<R>(ui: &mut egui::Ui, tone: Tone, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let (fill, fg) = tone_colors(ui, tone);
+    let (fill, border, fg) = tone_colors(ui, tone);
     egui::Frame::new()
         .fill(fill)
-        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, border))
+        .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().color(fg));
+            ui.label(semibold(title).color(fg));
             ui.add_space(4.0);
             add(ui)
         })
@@ -482,9 +484,25 @@ impl eframe::App for LinkApp {
         ctx.request_repaint_after(Duration::from_millis(500));
 
         egui::Panel::top("header").show(ui, |ui| {
+            // macOS: the title bar is hidden (main.rs) and its buttons sit over this space, which
+            // moves the window as the title bar would.
+            if cfg!(target_os = "macos") {
+                let (_, drag) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), TRAFFIC_LIGHTS),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started() {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                if drag.double_clicked() {
+                    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+                }
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("RealTimeX Link").strong().size(16.0));
+                ui.add(egui::Image::new((self.icon.id(), egui::vec2(24.0, 24.0))));
+                ui.label(semibold("RealTimeX Link").size(16.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(machine) = overview
                         .as_ref()
@@ -505,7 +523,7 @@ impl eframe::App for LinkApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Link on its own is the whole point here: RealTimeX is a quiet link.
                     if installed {
-                        if ui.button("Open RealTimeX").clicked() {
+                        if primary_button(ui, "Open RealTimeX").clicked() {
                             desktop::open_realtimex();
                         }
                     } else if ui.link("Get RealTimeX").clicked() {
@@ -629,7 +647,7 @@ impl LinkApp {
                                 ui.spinner();
                             }
                             None => {
-                                if ui.button(RichText::new("Update").strong()).clicked() {
+                                if primary_button(ui, "Update").clicked() {
                                     start_update(&self.shared, &self.refresh, ctx);
                                 }
                             }
@@ -637,7 +655,7 @@ impl LinkApp {
                     });
                 });
                 if let Some(error) = error {
-                    ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).1));
+                    ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).2));
                 }
             },
         );
@@ -650,13 +668,13 @@ impl LinkApp {
         let signing_in = account.get("signingIn") == Some(&Value::Bool(true));
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Account").strong().size(15.0));
+                ui.label(semibold("Account").size(15.0));
                 if signed_in {
                     badge(ui, "Signed in", Tone::Success);
                 }
             });
             if let Some(error) = account.get("error").and_then(Value::as_str) {
-                ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).1));
+                ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).2));
             }
             if signed_in {
                 ui.horizontal(|ui| {
@@ -686,7 +704,7 @@ impl LinkApp {
                 } else {
                     "Sign in"
                 };
-                if ui.button(RichText::new(label).strong()).clicked() {
+                if primary_button(ui, label).clicked() {
                     self.sign_in(ctx);
                 }
                 if let Some(offer) = account.get("offer").and_then(Value::as_str) {
@@ -751,7 +769,7 @@ impl LinkApp {
                 }
                 ui.label(detail.join(" · "));
                 if !same {
-                    ui.label(RichText::new("This computer belongs to someone else. Only allow it if you expect it.").color(tone_colors(ui, Tone::Warning).1));
+                    ui.label(RichText::new("This computer belongs to someone else. Only allow it if you expect it.").color(tone_colors(ui, Tone::Warning).2));
                 }
                 caption(
                     ui,
@@ -764,7 +782,7 @@ impl LinkApp {
                     let decide = |decision: &str, done: String| {
                         act(&self.shared, &self.refresh, ctx, "/v1/host/connection-requests/decide", json!({ "requestRef": reference, "decision": decision }), &done);
                     };
-                    if ui.button(RichText::new("Allow control").strong()).clicked() {
+                    if primary_button(ui, "Allow control").clicked() {
                         decide("allow-control", format!("{name} can now control this computer. It connects without asking next time."));
                     }
                     if ui.button("View only").clicked() {
@@ -862,7 +880,7 @@ impl LinkApp {
         };
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("This computer").strong().size(15.0));
+                ui.label(semibold("This computer").size(15.0));
                 badge(ui, label, tone);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if toggle(ui, &mut allow).changed() {
@@ -963,7 +981,7 @@ impl LinkApp {
                             "Every computer is signed out and must use the new password.",
                         )
                         .small()
-                        .color(tone_colors(ui, Tone::Warning).1),
+                        .color(tone_colors(ui, Tone::Warning).2),
                     );
                     let short = draft.chars().count() < 8;
                     let mut done = false;
@@ -1024,7 +1042,7 @@ impl LinkApp {
                 }
             }
             ui.separator();
-            ui.label(RichText::new("When a new computer asks to connect").strong());
+            ui.label(semibold("When a new computer asks to connect"));
             let policy = text(overview, "newComputerPolicy");
             let policies = [
                 (
@@ -1065,7 +1083,7 @@ impl LinkApp {
                     "Saved.",
                 );
             }
-            ui.label(RichText::new("Access for new computers").strong());
+            ui.label(semibold("Access for new computers"));
             let control =
                 overview.pointer("/defaultPermissions/control") == Some(&Value::Bool(true));
             let mut access = control;
@@ -1112,7 +1130,7 @@ impl LinkApp {
             let control = client.pointer("/permissions/control") == Some(&Value::Bool(true));
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&name).strong());
+                    ui.label(semibold(&name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if revoked {
                             badge(ui, "Blocked", Tone::Danger);
@@ -1213,16 +1231,12 @@ impl LinkApp {
         let mut confirmed = false;
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
             ui.set_max_width(340.0);
-            ui.label(RichText::new(title).strong().size(15.0));
+            ui.label(semibold(title).size(15.0));
             ui.label(message);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
-                    .button(
-                        RichText::new(action)
-                            .strong()
-                            .color(tone_colors(ui, Tone::Danger).1),
-                    )
+                    .button(semibold(action).color(tone_colors(ui, Tone::Danger).2))
                     .clicked()
                 {
                     confirmed = true;
