@@ -159,5 +159,20 @@
   "tray.quit": "Beenden (andere Computer können sich nicht verbinden)",
   "tray.starting": "RealTimeX Link startet…",
   "tray.off": "Die Fernsteuerung ist aus",
-  "tray.on": "Die Fernsteuerung ist an"
+  "tray.on": "Die Fernsteuerung ist an",
+  "settings.title": "Einstellungen",
+  "settings.back": "Zurück",
+  "settings.theme": "Design",
+  "settings.themeHelp": "Wählen Sie das visuelle Design für die Anwendung.",
+  "settings.themeSystem": "System",
+  "settings.themeLight": "Hell",
+  "settings.themeDark": "Dunkel",
+  "settings.language": "Anzeigesprache",
+  "settings.languageHelp": "Wählen Sie die in der gesamten Anwendung verwendete Sprache.",
+  "settings.systemDefault": "Systemstandard ({language})",
+  "settings.realtimexNote": "RealTimeX gleicht diese beim Start und bei jeder Änderung dort an seine eigenen Einstellungen an.",
+  "settings.cantShow": "Link kann {language} auf diesem Computer noch nicht anzeigen und verwendet daher Englisch.",
+  "settings.saveFailedTitle": "Einstellung konnte nicht gespeichert werden",
+  "settings.saveFailed": "Link hat die vorherige beibehalten. Prüfen Sie, ob RealTimeX Link läuft, und versuchen Sie es erneut.",
+  "settings.tryAgain": "Erneut versuchen"
 }

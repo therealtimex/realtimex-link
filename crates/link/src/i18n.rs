@@ -99,8 +99,7 @@ fn offered(locale: &Locale) -> bool {
     }
 }
 
-/// The locales this computer can show: the one list a language picker offers.
-#[allow(dead_code)] // Settings' language list.
+/// The locales this computer can show: the one list Settings offers.
 pub fn offered_languages() -> Vec<&'static Locale> {
     LOCALES.iter().filter(|&l| offered(l)).collect()
 }
@@ -154,13 +153,17 @@ pub fn current() -> &'static Locale {
     &LOCALES[CURRENT.read().unwrap_or_else(|p| p.into_inner()).effective]
 }
 
-/// The language asked for, as stored ("system" when none was).
-#[allow(dead_code)] // Settings' language field.
-pub fn requested() -> String {
-    let current = CURRENT.read().unwrap_or_else(|p| p.into_inner());
-    match current.requested.as_str() {
-        "" => "system".to_string(),
-        requested => requested.to_string(),
+/// When a stored language can't be shown here (so English is): its English name, or the tag
+/// itself for a language Link has no locale for. None for the system default.
+pub fn unavailable(requested: &str) -> Option<String> {
+    if matches!(requested.trim(), "" | "system") {
+        return None;
+    }
+    let shown = effective_locale(requested);
+    match locale_for(requested) {
+        Some(locale) if std::ptr::eq(locale, shown) => None,
+        Some(locale) => Some(locale.english.to_string()),
+        None => Some(requested.to_string()),
     }
 }
 
@@ -349,6 +352,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_stored_language_that_cant_be_shown_is_named() {
+        assert_eq!(unavailable("system"), None);
+        assert_eq!(unavailable("vi"), None);
+        assert_eq!(unavailable("pt-br"), None);
+        assert_eq!(unavailable("ar").as_deref(), Some("Arabic"));
+        assert_eq!(unavailable("sv").as_deref(), Some("sv"));
     }
 
     #[test]

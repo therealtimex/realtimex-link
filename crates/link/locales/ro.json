@@ -159,5 +159,20 @@
   "tray.quit": "Ieșire (alte computere nu se pot conecta)",
   "tray.starting": "RealTimeX Link pornește…",
   "tray.off": "Controlul la distanță este dezactivat",
-  "tray.on": "Controlul la distanță este activat"
+  "tray.on": "Controlul la distanță este activat",
+  "settings.title": "Setări",
+  "settings.back": "Înapoi",
+  "settings.theme": "Temă",
+  "settings.themeHelp": "Selectați tema de culori preferată pentru aplicație.",
+  "settings.themeSystem": "Sistem",
+  "settings.themeLight": "Luminos",
+  "settings.themeDark": "Întunecat",
+  "settings.language": "Limbă afișată",
+  "settings.languageHelp": "Selectați limba preferată în care se va afișa interfața RealTimeX.ai.",
+  "settings.systemDefault": "Implicit de sistem ({language})",
+  "settings.realtimexNote": "RealTimeX le potrivește cu propriile setări la pornire și de fiecare dată când le schimbați acolo.",
+  "settings.cantShow": "Link nu poate afișa încă {language} pe acest computer, așa că folosește engleza.",
+  "settings.saveFailedTitle": "Setarea nu a putut fi salvată",
+  "settings.saveFailed": "Link a păstrat setarea anterioară. Verificați că RealTimeX Link rulează, apoi încercați din nou.",
+  "settings.tryAgain": "Încearcă din nou"
 }

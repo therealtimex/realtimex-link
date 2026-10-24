@@ -159,5 +159,20 @@
   "tray.quit": "Välju (teised arvutid ei saa ühenduda)",
   "tray.starting": "RealTimeX Link käivitub…",
   "tray.off": "Kaugjuhtimine on välja lülitatud",
-  "tray.on": "Kaugjuhtimine on sisse lülitatud"
+  "tray.on": "Kaugjuhtimine on sisse lülitatud",
+  "settings.title": "Seaded",
+  "settings.back": "Tagasi",
+  "settings.theme": "Teema",
+  "settings.themeHelp": "Vali rakenduse visuaalne teema.",
+  "settings.themeSystem": "Süsteem",
+  "settings.themeLight": "Hele",
+  "settings.themeDark": "Tume",
+  "settings.language": "Kuvatav keel",
+  "settings.languageHelp": "Vali kogu rakenduses kasutatav keel.",
+  "settings.systemDefault": "Süsteemi vaikeväärtus ({language})",
+  "settings.realtimexNote": "RealTimeX seab need käivitumisel ja iga kord, kui sa neid seal muudad, oma seadetega samaks.",
+  "settings.cantShow": "Link ei saa selles arvutis veel keelt „{language}” kuvada, seega kasutab see inglise keelt.",
+  "settings.saveFailedTitle": "Seadet ei õnnestunud salvestada",
+  "settings.saveFailed": "Link jättis eelmise alles. Veendu, et RealTimeX Link töötab, ja proovi uuesti.",
+  "settings.tryAgain": "Proovi uuesti"
 }

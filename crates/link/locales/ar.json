@@ -159,5 +159,20 @@
   "tray.quit": "إنهاء (لن تتمكن الحواسيب الأخرى من الاتصال)",
   "tray.starting": "جارٍ بدء RealTimeX Link…",
   "tray.off": "التحكم عن بُعد متوقف",
-  "tray.on": "التحكم عن بُعد يعمل"
+  "tray.on": "التحكم عن بُعد يعمل",
+  "settings.title": "الإعدادات",
+  "settings.back": "رجوع",
+  "settings.theme": "السمة",
+  "settings.themeHelp": "اختر السمة البصرية للتطبيق.",
+  "settings.themeSystem": "النظام",
+  "settings.themeLight": "فاتح",
+  "settings.themeDark": "داكن",
+  "settings.language": "لغة العرض",
+  "settings.languageHelp": "اختر اللغة المستخدمة في التطبيق.",
+  "settings.systemDefault": "افتراضي النظام ({language})",
+  "settings.realtimexNote": "يضبط RealTimeX هذه الخيارات لتطابق إعداداته عند بدء تشغيله وكلما غيّرتها فيه.",
+  "settings.cantShow": "لا يستطيع Link عرض {language} على هذا الحاسوب بعد، لذا يستخدم الإنجليزية.",
+  "settings.saveFailedTitle": "تعذّر حفظ الإعداد",
+  "settings.saveFailed": "احتفظ Link بالإعداد السابق. تحقق من أن RealTimeX Link قيد التشغيل، ثم حاول مرة أخرى.",
+  "settings.tryAgain": "حاول مرة أخرى"
 }

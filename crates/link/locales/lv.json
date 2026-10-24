@@ -159,5 +159,20 @@
   "tray.quit": "Iziet (citi datori nevarēs pievienoties)",
   "tray.starting": "RealTimeX Link startē…",
   "tray.off": "Attālā vadība ir izslēgta",
-  "tray.on": "Attālā vadība ir ieslēgta"
+  "tray.on": "Attālā vadība ir ieslēgta",
+  "settings.title": "Iestatījumi",
+  "settings.back": "Atpakaļ",
+  "settings.theme": "Tēma",
+  "settings.themeHelp": "Izvēlieties lietotnes vizuālo tēmu.",
+  "settings.themeSystem": "Sistēma",
+  "settings.themeLight": "Gaišs",
+  "settings.themeDark": "Tumšs",
+  "settings.language": "Attēlošanas valoda",
+  "settings.languageHelp": "Izvēlieties valodu, kas tiek izmantota visā lietotnē.",
+  "settings.systemDefault": "Sistēmas noklusējums ({language})",
+  "settings.realtimexNote": "RealTimeX pieskaņo šos iestatījumus saviem, kad tiek palaists un katru reizi, kad tos tajā maināt.",
+  "settings.cantShow": "Link šajā datorā vēl nevar parādīt valodu “{language}”, tāpēc izmanto angļu valodu.",
+  "settings.saveFailedTitle": "Neizdevās saglabāt iestatījumu",
+  "settings.saveFailed": "Link paturēja iepriekšējo. Pārbaudiet, vai RealTimeX Link darbojas, un mēģiniet vēlreiz.",
+  "settings.tryAgain": "Mēģināt vēlreiz"
 }

@@ -36,6 +36,12 @@ pub struct Snapshot {
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
     pub show_window: Option<u64>,
+    /// The theme and language as stored (GET /v1/status): "light", "dark", "system"; a tag or
+    /// "system". Settings shows them.
+    pub theme: String,
+    pub language: String,
+    /// A Settings change the daemon didn't take: sent again by Try again.
+    pub settings_error: Option<Value>,
 }
 
 pub type Shared = Arc<Mutex<Snapshot>>;
@@ -103,6 +109,50 @@ pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) 
     });
 }
 
+/// A Settings change ({theme} or {language}), sent at once. The select shows it right away; when
+/// the daemon doesn't take it, the select goes back to `previous` and Settings offers Try again.
+pub fn save_setting(
+    shared: &Shared,
+    refresh: &Sender<()>,
+    ctx: &egui::Context,
+    body: Value,
+    previous: Option<(String, String)>,
+) {
+    let (shared, refresh, ctx) = (shared.clone(), refresh.clone(), ctx.clone());
+    {
+        let mut state = lock(&shared);
+        if let Some(theme) = body.get("theme").and_then(Value::as_str) {
+            state.theme = theme.to_string();
+        }
+        if let Some(language) = body.get("language").and_then(Value::as_str) {
+            state.language = language.to_string();
+        }
+    }
+    std::thread::spawn(move || {
+        let api = lock(&shared).api.clone();
+        let result = match api {
+            Some(api) => api.post("/v1/appearance", body.clone()),
+            None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
+        };
+        {
+            let mut state = lock(&shared);
+            match result {
+                Ok(_) => state.settings_error = None,
+                Err(_) => {
+                    match previous {
+                        Some((field, value)) if field == "theme" => state.theme = value,
+                        Some((_, value)) => state.language = value,
+                        None => {}
+                    }
+                    state.settings_error = Some(body);
+                }
+            }
+        }
+        let _ = refresh.send(());
+        ctx.request_repaint();
+    });
+}
+
 /// What this process is to the daemon (POST /v1/window/open): "window", or on Linux "tray" for
 /// the icon on its own (icon.rs).
 pub static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -156,13 +206,16 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
                     .map_or(egui::ThemePreference::System, egui::ThemePreference::from),
                 preference => preference,
             };
-            // RealTimeX's language, or the one chosen in Settings; an older daemon has none.
-            let language = status
-                .as_ref()
-                .and_then(|status| status["language"].as_str())
-                .unwrap_or("system");
-            if crate::i18n::set_language(language) {
-                ctx.request_repaint();
+            // The stored theme and language (RealTimeX's, or chosen in Settings); an older daemon
+            // has no language. Kept as they are when the status can't be read.
+            let stored = status.as_ref().map(|status| {
+                let field = |name: &str| status[name].as_str().unwrap_or("system").to_string();
+                (field("appearance"), field("language"))
+            });
+            if let Some((_, language)) = &stored {
+                if crate::i18n::set_language(language) {
+                    ctx.request_repaint();
+                }
             }
             if appearance != Some(preference) {
                 ctx.set_theme(preference);
@@ -191,6 +244,10 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let mut state = lock(&shared);
             state.account = account;
             state.update = update;
+            if let Some((theme, language)) = stored {
+                state.theme = theme;
+                state.language = language;
+            }
             match overview {
                 Ok(overview) => {
                     state.overview = Some(overview);
@@ -249,6 +306,13 @@ enum Tab {
     Computers,
 }
 
+/// Where keyboard focus goes next frame: Back when Settings opens, the gear when it closes.
+#[derive(PartialEq, Clone, Copy)]
+enum Focus {
+    Back,
+    Gear,
+}
+
 enum Confirm {
     TurnOff,
     NewPassword,
@@ -261,6 +325,11 @@ pub struct LinkApp {
     shared: Shared,
     refresh: Sender<()>,
     tab: Tab,
+    /// Settings in place of the tabs (the gear in the header).
+    settings: bool,
+    /// The header's area last frame: on macOS it moves the window.
+    header: egui::Rect,
+    focus: Option<Focus>,
     show_password: bool,
     editing_password: Option<String>,
     confirm: Option<Confirm>,
@@ -298,6 +367,9 @@ impl LinkApp {
             shared,
             refresh,
             tab: Tab::ThisComputer,
+            settings: false,
+            header: egui::Rect::NOTHING,
+            focus: None,
             show_password: false,
             editing_password: None,
             confirm: None,
@@ -476,7 +548,17 @@ impl eframe::App for LinkApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        let (overview, requests, password, account, update, error, notice) = {
+        // Esc leaves Settings, unless a list or a confirmation is open (Esc closes that first).
+        // Read before the selects run: they close their list on the same Esc.
+        if self.settings
+            && self.confirm.is_none()
+            && !egui::Popup::is_any_open(ctx)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.settings = false;
+            self.focus = Some(Focus::Gear);
+        }
+        let (overview, requests, password, account, update, error, notice, stored) = {
             let mut state = lock(&self.shared);
             if state
                 .notice
@@ -493,37 +575,30 @@ impl eframe::App for LinkApp {
                 state.update.clone(),
                 state.error.clone(),
                 state.notice.clone(),
+                (
+                    state.theme.clone(),
+                    state.language.clone(),
+                    state.settings_error.clone(),
+                ),
             )
         };
         // Countdowns and notices move on their own.
         ctx.request_repaint_after(Duration::from_millis(500));
 
         egui::Panel::top("header").show(ui, |ui| {
+            // Its text isn't selectable, so dragging the title moves the window (macOS).
+            ui.style_mut().interaction.selectable_labels = false;
             // macOS: the title bar is hidden (main.rs) and its buttons sit over this space.
             if cfg!(target_os = "macos") {
                 ui.add_space(TRAFFIC_LIGHTS);
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add(egui::Image::new((self.icon.id(), egui::vec2(24.0, 24.0))));
-                ui.label(semibold("RealTimeX Link").size(16.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(machine) = overview
-                        .as_ref()
-                        .map(|o| text(o, "machine"))
-                        .filter(|m| !m.is_empty())
-                    {
-                        badge(ui, &machine, Tone::Neutral);
-                    }
-                });
-            });
-            ui.add_space(8.0);
-            // macOS: the whole header (it has no controls) moves the window, as the title bar
-            // would. A double-click minimizes when the system says so ("Double-click a window's
-            // title bar to"); zooming would fight the height that follows the content.
+            // macOS: the whole header (as drawn last frame) moves the window, as the title bar
+            // would; the gear, registered after it, keeps its clicks. A double-click minimizes
+            // when the system says so ("Double-click a window's title bar to"); zooming would
+            // fight the height that follows the content.
             if cfg!(target_os = "macos") {
                 let header = ui.interact(
-                    ui.min_rect(),
+                    self.header,
                     ui.scope_id().with("move"),
                     egui::Sense::click_and_drag(),
                 );
@@ -534,6 +609,35 @@ impl eframe::App for LinkApp {
                     ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                 }
             }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Image::new((self.icon.id(), egui::vec2(24.0, 24.0))));
+                ui.label(semibold("RealTimeX Link").size(16.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let gear = theme::icon_button(ui, theme::Icon::Gear, &t("settings.title"));
+                    if self.focus == Some(Focus::Gear) {
+                        gear.request_focus();
+                        self.focus = None;
+                    }
+                    if gear.clicked() {
+                        self.settings = !self.settings;
+                        self.focus = Some(if self.settings {
+                            Focus::Back
+                        } else {
+                            Focus::Gear
+                        });
+                    }
+                    if let Some(machine) = overview
+                        .as_ref()
+                        .map(|o| text(o, "machine"))
+                        .filter(|m| !m.is_empty())
+                    {
+                        badge(ui, &machine, Tone::Neutral);
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            self.header = ui.min_rect();
         });
 
         egui::Panel::bottom("footer").show(ui, |ui| {
@@ -596,6 +700,10 @@ impl eframe::App for LinkApp {
                     self.update_ui(ui, ctx, update.as_ref());
                     self.requests_ui(ui, ctx, &requests);
                     self.session_ui(ui, overview);
+                    if self.settings {
+                        self.settings_ui(ui, ctx, &stored);
+                        return;
+                    }
                     ui.horizontal(|ui| {
                         theme::selectable_value(
                             ui,
@@ -1234,6 +1342,123 @@ impl LinkApp {
                 });
             });
         }
+    }
+
+    /// Settings, in place of the tabs: Back, then the theme and the language. A change is saved
+    /// at once (POST /v1/appearance); RealTimeX's own changes show on the next poll.
+    fn settings_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        (stored_theme, language, error): &(String, String, Option<Value>),
+    ) {
+        ui.horizontal(|ui| {
+            let back = theme::icon_button(ui, theme::Icon::ArrowLeft, &t("settings.back"));
+            if self.focus == Some(Focus::Back) {
+                back.request_focus();
+                self.focus = None;
+            }
+            if back.clicked() {
+                self.settings = false;
+                self.focus = Some(Focus::Gear);
+            }
+            ui.label(semibold(t("settings.title")).size(15.0));
+        });
+        ui.separator();
+        if let Some(body) = error {
+            alert(ui, Tone::Danger, &t("settings.saveFailedTitle"), |ui| {
+                ui.label(t("settings.saveFailed"));
+                if ui.button(t("settings.tryAgain")).clicked() {
+                    save_setting(&self.shared, &self.refresh, ctx, body.clone(), None);
+                }
+            });
+        }
+        card(ui, |ui| {
+            ui.label(semibold(t("settings.theme")));
+            caption(ui, t("settings.themeHelp"));
+            let theme_label = |value: &str| {
+                t(match value {
+                    "light" => "settings.themeLight",
+                    "dark" => "settings.themeDark",
+                    _ => "settings.themeSystem",
+                })
+            };
+            let mut chosen = stored_theme.clone();
+            egui::ComboBox::from_id_salt("theme")
+                .width(ui.available_width())
+                .selected_text(theme_label(stored_theme.as_str()))
+                .show_ui(ui, |ui| {
+                    for value in ["system", "light", "dark"] {
+                        theme::selectable_value(
+                            ui,
+                            &mut chosen,
+                            value.to_string(),
+                            &theme_label(value),
+                        );
+                    }
+                });
+            if chosen != *stored_theme {
+                save_setting(
+                    &self.shared,
+                    &self.refresh,
+                    ctx,
+                    json!({ "theme": chosen }),
+                    Some(("theme".into(), stored_theme.clone())),
+                );
+            }
+            ui.add_space(8.0);
+            ui.label(semibold(t("settings.language")));
+            caption(ui, t("settings.languageHelp"));
+            // The stored language, as the list names it: "system", a locale shown here, or one
+            // that can't be (the select then says English, and the note why).
+            let unavailable = crate::i18n::unavailable(language);
+            let current = if language == "system" || language.is_empty() {
+                "system".to_string()
+            } else if unavailable.is_some() {
+                language.clone()
+            } else {
+                crate::i18n::effective_locale(language).code.to_string()
+            };
+            let system_default = tf(
+                "settings.systemDefault",
+                &[("language", crate::i18n::effective_locale("system").endonym)],
+            );
+            let selected = match current.as_str() {
+                "system" => system_default.clone(),
+                _ => crate::i18n::effective_locale(language).endonym.to_string(),
+            };
+            let mut chosen = current.clone();
+            egui::ComboBox::from_id_salt("language")
+                .width(ui.available_width())
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    theme::selectable_value(ui, &mut chosen, "system".to_string(), &system_default);
+                    for locale in crate::i18n::offered_languages() {
+                        theme::selectable_value(
+                            ui,
+                            &mut chosen,
+                            locale.code.to_string(),
+                            locale.endonym,
+                        );
+                    }
+                });
+            if let Some(name) = &unavailable {
+                caption(ui, tf("settings.cantShow", &[("language", name.as_str())]));
+            }
+            if chosen != current {
+                save_setting(
+                    &self.shared,
+                    &self.refresh,
+                    ctx,
+                    json!({ "language": chosen }),
+                    Some(("language".into(), language.clone())),
+                );
+            }
+            if desktop::realtimex_app().is_some() {
+                ui.add_space(4.0);
+                caption(ui, t("settings.realtimexNote"));
+            }
+        });
     }
 
     /// Changes that end someone's access ask first.

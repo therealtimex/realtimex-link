@@ -251,6 +251,74 @@ pub fn selectable_value<V: PartialEq>(
     response
 }
 
+/// What an icon button shows (drawn here: the bundled fonts have no icons).
+#[derive(Clone, Copy)]
+pub enum Icon {
+    /// Lucide's "settings" cog.
+    Gear,
+    /// Lucide's "arrow-left".
+    ArrowLeft,
+}
+
+/// RealTimeX's ghost icon button (variant="ghost" size="icon"): no fill until hovered, the focus
+/// ring when focused, and its name for screen readers and as its tooltip.
+pub fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response {
+    let tokens = tokens(ui);
+    let size = egui::vec2(CONTROL_HEIGHT, CONTROL_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if response.hovered() || response.is_pointer_button_down_on() {
+            painter.rect_filled(rect, CONTROL_RADIUS, tokens.hover);
+        }
+        if response.has_focus() {
+            painter.rect_stroke(
+                rect,
+                CONTROL_RADIUS,
+                Stroke::new(FOCUS_WIDTH, tokens.link),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let stroke = Stroke::new(1.6, tokens.text);
+        let center = rect.center();
+        match icon {
+            Icon::Gear => {
+                // Eight teeth around a ring, and the hole: 16 pt across, Lucide's 24 scaled.
+                let (outer, inner) = (8.0, 6.0);
+                let mut points = Vec::with_capacity(32);
+                for tooth in 0..8 {
+                    let middle = tooth as f32 * std::f32::consts::TAU / 8.0;
+                    for (offset, radius) in
+                        [(-13.0, inner), (-8.0, outer), (8.0, outer), (13.0, inner)]
+                    {
+                        let angle = middle + f32::to_radians(offset);
+                        points.push(center + radius * egui::vec2(angle.cos(), angle.sin()));
+                    }
+                }
+                painter.add(egui::Shape::closed_line(points, stroke));
+                painter.circle_stroke(center, 2.6, stroke);
+            }
+            Icon::ArrowLeft => {
+                let (left, right) = (center.x - 6.0, center.x + 6.0);
+                painter.line_segment(
+                    [egui::pos2(left, center.y), egui::pos2(right, center.y)],
+                    stroke,
+                );
+                painter.line(
+                    vec![
+                        egui::pos2(left + 5.0, center.y - 5.0),
+                        egui::pos2(left, center.y),
+                        egui::pos2(left + 5.0, center.y + 5.0),
+                    ],
+                    stroke,
+                );
+            }
+        }
+    }
+    response.on_hover_text(label)
+}
+
 /// The on/off switch, as RealTimeX draws it: a --theme-button-primary track with a white knob when
 /// on, a bordered field-coloured one when off, and the focus ring around it.
 pub fn paint_switch(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, t: f32, on: bool) {

@@ -159,5 +159,20 @@
   "tray.quit": "Выйти (другие компьютеры не смогут подключиться)",
   "tray.starting": "RealTimeX Link запускается…",
   "tray.off": "Удалённое управление выключено",
-  "tray.on": "Удалённое управление включено"
+  "tray.on": "Удалённое управление включено",
+  "settings.title": "Настройки",
+  "settings.back": "Назад",
+  "settings.theme": "Тема",
+  "settings.themeHelp": "Выберите визуальную тему приложения.",
+  "settings.themeSystem": "Система",
+  "settings.themeLight": "Светлый",
+  "settings.themeDark": "Тёмный",
+  "settings.language": "Язык отображения",
+  "settings.languageHelp": "Выберите язык интерфейса приложения.",
+  "settings.systemDefault": "Системный по умолчанию ({language})",
+  "settings.realtimexNote": "RealTimeX приводит эти настройки в соответствие со своими при запуске и каждый раз, когда вы меняете их в RealTimeX.",
+  "settings.cantShow": "Link пока не может показать язык «{language}» на этом компьютере, поэтому использует английский.",
+  "settings.saveFailedTitle": "Не удалось сохранить настройку",
+  "settings.saveFailed": "Link сохранил прежнее значение. Убедитесь, что RealTimeX Link запущен, и попробуйте снова.",
+  "settings.tryAgain": "Попробовать снова"
 }

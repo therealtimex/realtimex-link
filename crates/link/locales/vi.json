@@ -159,5 +159,20 @@
   "tray.quit": "Thoát (máy tính khác không thể kết nối)",
   "tray.starting": "RealTimeX Link đang khởi động…",
   "tray.off": "Điều khiển từ xa đang tắt",
-  "tray.on": "Điều khiển từ xa đang bật"
+  "tray.on": "Điều khiển từ xa đang bật",
+  "settings.title": "Cài đặt",
+  "settings.back": "Quay lại",
+  "settings.theme": "Diện mạo",
+  "settings.themeHelp": "Chọn diện mạo trực quan cho ứng dụng.",
+  "settings.themeSystem": "Hệ thống",
+  "settings.themeLight": "Sáng",
+  "settings.themeDark": "Tối",
+  "settings.language": "Ngôn ngữ hiển thị",
+  "settings.languageHelp": "Chọn ngôn ngữ sử dụng trong toàn bộ ứng dụng.",
+  "settings.systemDefault": "Mặc định hệ thống ({language})",
+  "settings.realtimexNote": "RealTimeX đặt các mục này theo cài đặt của chính nó khi khởi động và mỗi khi bạn thay đổi ở đó.",
+  "settings.cantShow": "Link chưa thể hiển thị {language} trên máy tính này, nên dùng tiếng Anh.",
+  "settings.saveFailedTitle": "Không lưu được cài đặt",
+  "settings.saveFailed": "Link giữ cài đặt trước đó. Hãy kiểm tra RealTimeX Link đang chạy rồi thử lại.",
+  "settings.tryAgain": "Thử lại"
 }

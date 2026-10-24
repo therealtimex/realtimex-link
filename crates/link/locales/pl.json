@@ -159,5 +159,20 @@
   "tray.quit": "Zakończ (inne komputery nie będą mogły się połączyć)",
   "tray.starting": "RealTimeX Link się uruchamia…",
   "tray.off": "Zdalne sterowanie jest wyłączone",
-  "tray.on": "Zdalne sterowanie jest włączone"
+  "tray.on": "Zdalne sterowanie jest włączone",
+  "settings.title": "Ustawienia",
+  "settings.back": "Wstecz",
+  "settings.theme": "Motyw",
+  "settings.themeHelp": "Wybierz motyw wizualny aplikacji.",
+  "settings.themeSystem": "System",
+  "settings.themeLight": "Jasny",
+  "settings.themeDark": "Ciemny",
+  "settings.language": "Język wyświetlania",
+  "settings.languageHelp": "Wybierz język używany w całej aplikacji.",
+  "settings.systemDefault": "Domyślny systemowy ({language})",
+  "settings.realtimexNote": "RealTimeX dopasowuje te ustawienia do własnych przy uruchomieniu i za każdym razem, gdy je tam zmienisz.",
+  "settings.cantShow": "Link nie może jeszcze wyświetlić języka „{language}” na tym komputerze, więc używa angielskiego.",
+  "settings.saveFailedTitle": "Nie udało się zapisać ustawienia",
+  "settings.saveFailed": "Link zachował poprzednie. Sprawdź, czy RealTimeX Link działa, i spróbuj ponownie.",
+  "settings.tryAgain": "Spróbuj ponownie"
 }

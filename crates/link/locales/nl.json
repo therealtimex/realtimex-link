@@ -159,5 +159,20 @@
   "tray.quit": "Afsluiten (andere computers kunnen geen verbinding maken)",
   "tray.starting": "RealTimeX Link wordt gestart…",
   "tray.off": "Bediening op afstand staat uit",
-  "tray.on": "Bediening op afstand staat aan"
+  "tray.on": "Bediening op afstand staat aan",
+  "settings.title": "Instellingen",
+  "settings.back": "Terug",
+  "settings.theme": "Thema",
+  "settings.themeHelp": "Kies het visuele thema voor de applicatie.",
+  "settings.themeSystem": "Systeem",
+  "settings.themeLight": "Licht",
+  "settings.themeDark": "Donker",
+  "settings.language": "Weergavetaal",
+  "settings.languageHelp": "Kies de taal die door de gehele applicatie wordt gebruikt.",
+  "settings.systemDefault": "Systeemstandaard ({language})",
+  "settings.realtimexNote": "RealTimeX stemt deze af op zijn eigen instellingen wanneer het start en telkens wanneer je ze daar wijzigt.",
+  "settings.cantShow": "Link kan {language} nog niet weergeven op deze computer en gebruikt daarom Engels.",
+  "settings.saveFailedTitle": "Kan de instelling niet opslaan",
+  "settings.saveFailed": "Link heeft de vorige behouden. Controleer of RealTimeX Link draait en probeer het opnieuw.",
+  "settings.tryAgain": "Opnieuw proberen"
 }

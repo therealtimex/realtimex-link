@@ -159,5 +159,20 @@
   "tray.quit": "خروج (رایانه‌های دیگر نمی‌توانند وصل شوند)",
   "tray.starting": "RealTimeX Link در حال اجراست…",
   "tray.off": "کنترل از راه دور خاموش است",
-  "tray.on": "کنترل از راه دور روشن است"
+  "tray.on": "کنترل از راه دور روشن است",
+  "settings.title": "تنظیمات",
+  "settings.back": "بازگشت",
+  "settings.theme": "پوسته",
+  "settings.themeHelp": "پوسته بصری برنامه را انتخاب کنید.",
+  "settings.themeSystem": "سیستم",
+  "settings.themeLight": "روشن",
+  "settings.themeDark": "تیره",
+  "settings.language": "زبان نمایش",
+  "settings.languageHelp": "زبان مورد استفاده در سراسر برنامه را انتخاب کنید.",
+  "settings.systemDefault": "پیش‌فرض سیستم ({language})",
+  "settings.realtimexNote": "RealTimeX هنگام شروع و هر بار که آن‌ها را در RealTimeX تغییر دهید، این موارد را با تنظیمات خودش هماهنگ می‌کند.",
+  "settings.cantShow": "Link هنوز نمی‌تواند {language} را روی این رایانه نمایش دهد، بنابراین از انگلیسی استفاده می‌کند.",
+  "settings.saveFailedTitle": "ذخیرهٔ تنظیم ممکن نشد",
+  "settings.saveFailed": "Link تنظیم قبلی را نگه داشت. مطمئن شوید RealTimeX Link در حال اجراست، سپس دوباره تلاش کنید.",
+  "settings.tryAgain": "دوباره تلاش کنید"
 }

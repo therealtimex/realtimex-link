@@ -159,5 +159,20 @@
   "tray.quit": "Salir (otros equipos no podrán conectarse)",
   "tray.starting": "RealTimeX Link se está iniciando…",
   "tray.off": "El control remoto está desactivado",
-  "tray.on": "El control remoto está activado"
+  "tray.on": "El control remoto está activado",
+  "settings.title": "Configuración",
+  "settings.back": "Atrás",
+  "settings.theme": "Tema",
+  "settings.themeHelp": "Elige el tema visual de la aplicación.",
+  "settings.themeSystem": "Sistema",
+  "settings.themeLight": "Claro",
+  "settings.themeDark": "Oscuro",
+  "settings.language": "Idioma de visualización",
+  "settings.languageHelp": "Elige el idioma que se usa en toda la aplicación.",
+  "settings.systemDefault": "Predeterminado del sistema ({language})",
+  "settings.realtimexNote": "RealTimeX ajusta estos valores a su propia configuración al iniciarse y cada vez que los cambias allí.",
+  "settings.cantShow": "Link aún no puede mostrar {language} en este equipo, así que usa el inglés.",
+  "settings.saveFailedTitle": "No se pudo guardar el ajuste",
+  "settings.saveFailed": "Link conservó el anterior. Comprueba que RealTimeX Link se esté ejecutando y vuelve a intentarlo.",
+  "settings.tryAgain": "Intentar de nuevo"
 }

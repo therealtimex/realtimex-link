@@ -159,5 +159,20 @@
   "tray.quit": "Quitter (les autres ordinateurs ne pourront plus se connecter)",
   "tray.starting": "RealTimeX Link démarre…",
   "tray.off": "Le contrôle à distance est désactivé",
-  "tray.on": "Le contrôle à distance est activé"
+  "tray.on": "Le contrôle à distance est activé",
+  "settings.title": "Paramètres",
+  "settings.back": "Retour",
+  "settings.theme": "Thème",
+  "settings.themeHelp": "Choisissez le thème visuel de l'application.",
+  "settings.themeSystem": "Système",
+  "settings.themeLight": "Clair",
+  "settings.themeDark": "Sombre",
+  "settings.language": "Langue d'affichage",
+  "settings.languageHelp": "Choisissez la langue utilisée dans toute l'application.",
+  "settings.systemDefault": "Par défaut du système ({language})",
+  "settings.realtimexNote": "RealTimeX les aligne sur ses propres réglages à son démarrage et chaque fois que vous les modifiez dans RealTimeX.",
+  "settings.cantShow": "Link ne peut pas encore afficher le {language} sur cet ordinateur ; il utilise donc l'anglais.",
+  "settings.saveFailedTitle": "Impossible d'enregistrer le réglage",
+  "settings.saveFailed": "Link a conservé le précédent. Vérifiez que RealTimeX Link est en cours d'exécution, puis réessayez.",
+  "settings.tryAgain": "Réessayer"
 }

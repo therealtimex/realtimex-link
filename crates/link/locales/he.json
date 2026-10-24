@@ -159,5 +159,20 @@
   "tray.quit": "צא (מחשבים אחרים לא יוכלו להתחבר)",
   "tray.starting": "RealTimeX Link מופעל…",
   "tray.off": "השליטה מרחוק כבויה",
-  "tray.on": "השליטה מרחוק פועלת"
+  "tray.on": "השליטה מרחוק פועלת",
+  "settings.title": "הגדרות",
+  "settings.back": "חזרה",
+  "settings.theme": "ערכת נושא",
+  "settings.themeHelp": "בחר את ערכת הנושא החזותית לאפליקציה.",
+  "settings.themeSystem": "מערכת",
+  "settings.themeLight": "בהיר",
+  "settings.themeDark": "כהה",
+  "settings.language": "שפת תצוגה",
+  "settings.languageHelp": "בחר את השפה המשמשת בכל רחבי האפליקציה.",
+  "settings.systemDefault": "ברירת המחדל של המערכת ({language})",
+  "settings.realtimexNote": "RealTimeX מתאים את אלה להגדרות שלו כשהוא מופעל ובכל פעם שתשנה אותן בו.",
+  "settings.cantShow": "Link עדיין לא יכול להציג {language} במחשב הזה, ולכן הוא משתמש באנגלית.",
+  "settings.saveFailedTitle": "לא ניתן לשמור את ההגדרה",
+  "settings.saveFailed": "Link שמר את ההגדרה הקודמת. ודא ש-RealTimeX Link פועל, ונסה שוב.",
+  "settings.tryAgain": "נסה שוב"
 }

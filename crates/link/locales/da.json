@@ -159,5 +159,20 @@
   "tray.quit": "Afslut (andre computere kan ikke forbinde)",
   "tray.starting": "RealTimeX Link starter…",
   "tray.off": "Fjernstyring er slået fra",
-  "tray.on": "Fjernstyring er slået til"
+  "tray.on": "Fjernstyring er slået til",
+  "settings.title": "Indstillinger",
+  "settings.back": "Tilbage",
+  "settings.theme": "Tema",
+  "settings.themeHelp": "Vælg det visuelle tema for applikationen.",
+  "settings.themeSystem": "System",
+  "settings.themeLight": "Lys",
+  "settings.themeDark": "Mørk",
+  "settings.language": "Visningssprog",
+  "settings.languageHelp": "Vælg det sprog, der skal bruges i hele applikationen.",
+  "settings.systemDefault": "Systemstandard ({language})",
+  "settings.realtimexNote": "RealTimeX tilpasser disse til sine egne indstillinger, når det starter, og hver gang du ændrer dem dér.",
+  "settings.cantShow": "Link kan endnu ikke vise {language} på denne computer, så det bruger engelsk.",
+  "settings.saveFailedTitle": "Indstillingen kunne ikke gemmes",
+  "settings.saveFailed": "Link beholdt den forrige. Kontrollér, at RealTimeX Link kører, og prøv igen.",
+  "settings.tryAgain": "Prøv igen"
 }

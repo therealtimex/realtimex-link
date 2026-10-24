@@ -159,5 +159,20 @@
   "tray.quit": "Quit (other computers can't connect)",
   "tray.starting": "RealTimeX Link is starting…",
   "tray.off": "Remote control is off",
-  "tray.on": "Remote control is on"
+  "tray.on": "Remote control is on",
+  "settings.title": "Settings",
+  "settings.back": "Back",
+  "settings.theme": "Theme",
+  "settings.themeHelp": "Choose the visual theme for the application.",
+  "settings.themeSystem": "System",
+  "settings.themeLight": "Light",
+  "settings.themeDark": "Dark",
+  "settings.language": "Display Language",
+  "settings.languageHelp": "Choose the language used throughout the application.",
+  "settings.systemDefault": "System default ({language})",
+  "settings.realtimexNote": "RealTimeX sets these to match its own settings when it starts and whenever you change them there.",
+  "settings.cantShow": "Link can't show {language} on this computer yet, so it uses English.",
+  "settings.saveFailedTitle": "Couldn't save the setting",
+  "settings.saveFailed": "Link kept the previous one. Check that RealTimeX Link is running, then try again.",
+  "settings.tryAgain": "Try again"
 }

@@ -159,5 +159,20 @@
   "tray.quit": "Çık (diğer bilgisayarlar bağlanamaz)",
   "tray.starting": "RealTimeX Link başlatılıyor…",
   "tray.off": "Uzaktan kontrol kapalı",
-  "tray.on": "Uzaktan kontrol açık"
+  "tray.on": "Uzaktan kontrol açık",
+  "settings.title": "Ayarlar",
+  "settings.back": "Geri",
+  "settings.theme": "Tema",
+  "settings.themeHelp": "Uygulama için görsel temayı seçin.",
+  "settings.themeSystem": "Sistem",
+  "settings.themeLight": "Açık",
+  "settings.themeDark": "Koyu",
+  "settings.language": "Görüntüleme Dili",
+  "settings.languageHelp": "Uygulama genelinde kullanılan dili seçin.",
+  "settings.systemDefault": "Sistem varsayılanı ({language})",
+  "settings.realtimexNote": "RealTimeX bunları başladığında ve orada her değiştirdiğinizde kendi ayarlarına göre eşitler.",
+  "settings.cantShow": "Link bu bilgisayarda {language} dilini henüz gösteremiyor, bu yüzden İngilizce kullanıyor.",
+  "settings.saveFailedTitle": "Ayar kaydedilemedi",
+  "settings.saveFailed": "Link öncekini korudu. RealTimeX Link'in çalıştığından emin olun ve tekrar deneyin.",
+  "settings.tryAgain": "Tekrar dene"
 }
