@@ -196,7 +196,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _held = InstanceLock::acquire(dir.path()).unwrap();
         // flock from another process: it can't have the lock while this one holds it.
-        let status = std::process::Command::new("flock")
+        let status = crate::util::command("flock")
             .args(["-n"])
             .arg(dir.path().join(LOCK_FILE))
             .arg("true")

@@ -9,7 +9,7 @@
 //! runs there), so a refused install leaves a remote host running.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -88,7 +88,7 @@ pub(crate) fn executables_dir(install: &Path) -> PathBuf {
 fn installed_version(destination: &Path) -> Result<Option<String>> {
     let linkd = executables_dir(destination).join(executable("rtx-linkd"));
     let reported = || -> Option<String> {
-        let output = Command::new(&linkd)
+        let output = crate::util::command(&linkd)
             .arg("--version")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -198,7 +198,7 @@ fn platform_others_running(paths: &[PathBuf]) -> bool {
         return false;
     }
     let pids = |args: &[&str]| -> Vec<u32> {
-        Command::new("pgrep")
+        crate::util::command("pgrep")
             .args(args)
             .stderr(Stdio::null())
             .output()
@@ -242,7 +242,7 @@ fn others_running_script(paths: &[PathBuf]) -> String {
 
 #[cfg(windows)]
 fn platform_others_running(paths: &[PathBuf]) -> bool {
-    Command::new("powershell")
+    crate::util::command("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -304,7 +304,7 @@ fn pattern(path: &Path) -> String {
 
 #[cfg(unix)]
 fn running(path: &Path) -> bool {
-    Command::new("pgrep")
+    crate::util::command("pgrep")
         .args(["-f", &pattern(path)])
         .stdout(Stdio::null())
         .status()
@@ -314,7 +314,7 @@ fn running(path: &Path) -> bool {
 /// SIGTERM: the daemon stops as it does on any SIGTERM, the window exits.
 #[cfg(unix)]
 fn signal(path: &Path) {
-    let _ = Command::new("pkill").args(["-f", &pattern(path)]).status();
+    let _ = crate::util::command("pkill").args(["-f", &pattern(path)]).status();
 }
 
 #[cfg(windows)]
@@ -328,7 +328,7 @@ fn running(path: &Path) -> bool {
         "if (Get-Process | Where-Object {{ $_.Path -eq '{}' }}) {{ exit 0 }} else {{ exit 1 }}",
         powershell_path(path)
     );
-    Command::new("powershell")
+    crate::util::command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Stdio::null())
         .status()
@@ -341,7 +341,7 @@ fn signal(path: &Path) {
         "Get-Process | Where-Object {{ $_.Path -eq '{}' }} | Stop-Process -Force",
         powershell_path(path)
     );
-    let _ = Command::new("powershell")
+    let _ = crate::util::command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Stdio::null())
         .status();
@@ -413,7 +413,7 @@ fn menu_entry(_destination: &Path) -> Result<()> {
 /// The whole .app with ditto (signatures, extended attributes and links kept).
 #[cfg(target_os = "macos")]
 fn copy(source: &Path, staging: &Path) -> Result<()> {
-    let status = Command::new("/usr/bin/ditto")
+    let status = crate::util::command("/usr/bin/ditto")
         .arg(source)
         .arg(staging)
         .status()

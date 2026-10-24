@@ -46,7 +46,7 @@ pub struct Detected {
 
 /// Ask a binary whether it is an rtx-control this daemon can drive (`--check`).
 fn check_control_binary(binary: &Path) -> Result<(), String> {
-    let output = std::process::Command::new(binary)
+    let output = crate::util::command(binary)
         .arg("--check")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -136,7 +136,7 @@ fn resolve_binary() -> Detected {
 }
 
 fn has_gstreamer_pipewire() -> bool {
-    std::process::Command::new("gst-inspect-1.0")
+    crate::util::command("gst-inspect-1.0")
         .arg("pipewiresrc")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -419,7 +419,7 @@ impl Backend {
     }
 
     fn spawn_helper(binary: &Path) -> Result<Child, ApiError> {
-        let mut command = Command::new(binary);
+        let mut command = crate::util::tokio_command(binary);
         helper_env(&mut command);
         command
             .stdin(Stdio::piped())

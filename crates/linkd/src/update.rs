@@ -17,8 +17,10 @@
 
 use std::path::Path;
 // Only the macOS and Windows updates run programs; Linux opens the release page.
+#[cfg(target_os = "macos")]
+use std::process::Command;
 #[cfg(any(target_os = "macos", windows))]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -329,7 +331,7 @@ mod platform {
 
     /// The Team ID a signed app or executable carries ("not set" for ad-hoc).
     fn team_id(path: &Path) -> Option<String> {
-        let output = Command::new("/usr/bin/codesign")
+        let output = crate::util::command("/usr/bin/codesign")
             .args(["-dv", "--verbose=2"])
             .arg(path)
             .stdout(Stdio::null())
@@ -349,7 +351,7 @@ mod platform {
         let ours = team_id(&installed).ok_or_else(|| {
             anyhow!("This RealTimeX Link isn't signed, so it can't update itself")
         })?;
-        let status = Command::new("/usr/bin/tar")
+        let status = crate::util::command("/usr/bin/tar")
             .arg("-xzf")
             .arg(archive)
             .arg("-C")
@@ -361,7 +363,7 @@ mod platform {
         let app = dir.join("RealTimeX Link.app");
         let requirement = codesign_requirement(&ours)
             .ok_or_else(|| anyhow!("This RealTimeX Link's Team ID ({ours}) isn't one"))?;
-        let verified = Command::new("/usr/bin/codesign")
+        let verified = crate::util::command("/usr/bin/codesign")
             .args(["--verify", "--deep", "--strict", "-R"])
             .arg(format!("={requirement}"))
             .arg(&app)
@@ -372,7 +374,7 @@ mod platform {
             bail!("the downloaded RealTimeX Link isn't signed by the same developer");
         }
         // Notarized too, as Gatekeeper would want it opened.
-        let notarized = Command::new("/usr/sbin/spctl")
+        let notarized = crate::util::command("/usr/sbin/spctl")
             .args(["--assess", "--type", "execute"])
             .arg(&app)
             .stdout(Stdio::null())
@@ -385,7 +387,7 @@ mod platform {
         // the installed Link, in the background like at login.
         let linkd = crate::install::executables_dir(&app).join("rtx-linkd");
         detached(
-            Command::new("/bin/sh")
+            crate::util::command("/bin/sh")
                 .args(["-c", MACOS_HELPER, "update"])
                 .arg(&linkd)
                 .arg(&installed),
@@ -524,8 +526,8 @@ mod platform {
     use super::authenticode::{self, Signature};
 
     fn signature(path: &Path) -> Option<Signature> {
-        use std::os::windows::process::CommandExt;
-        let output = Command::new("powershell.exe")
+        // util::command: no console flashing up.
+        let output = crate::util::command("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -534,8 +536,6 @@ mod platform {
             ])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
-            // CREATE_NO_WINDOW: no console flashing up.
-            .creation_flags(0x0800_0000)
             .output()
             .ok()?;
         authenticode::parse(&String::from_utf8_lossy(&output.stdout))
@@ -559,7 +559,7 @@ mod platform {
         );
         let app = Path::new(&installed[0]).join("rtx-link.exe");
         use std::os::windows::process::CommandExt;
-        Command::new("powershell.exe")
+        crate::util::command("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",

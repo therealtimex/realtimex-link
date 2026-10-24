@@ -6,7 +6,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::process::Command;
 
 const BINARIES: &[&str] = &[
     "tailscale",
@@ -32,17 +31,13 @@ pub fn is_tailscale_ipv4(address: &str) -> bool {
 }
 
 async fn run(binary: &str, args: &[&str]) -> Option<String> {
-    let mut command = Command::new(binary);
+    // util::tokio_command: no console window flashing up every minute on Windows.
+    let mut command = crate::util::tokio_command(binary);
     command
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        // No console window flashing up every minute.
-        command.creation_flags(0x0800_0000);
-    }
     let output = tokio::time::timeout(TIMEOUT, command.output())
         .await
         .ok()?
