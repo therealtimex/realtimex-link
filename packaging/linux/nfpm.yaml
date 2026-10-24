@@ -9,7 +9,7 @@ platform: linux
 version: ${VERSION}
 section: net
 priority: optional
-maintainer: RealTimeX <support@realtimex.ai>
+maintainer: RealTimeX <info@realtimex.ai>
 vendor: RealTimeX
 homepage: https://realtimex.ai
 license: Apache-2.0
