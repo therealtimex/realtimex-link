@@ -40,6 +40,9 @@ const MAX_FPS: i32 = 15;
 const IDLE_STOP: Duration = Duration::from_secs(5);
 /// How long the first frame of a new stream may take.
 const FIRST_FRAME: Duration = Duration::from_secs(3);
+/// How long a live view's width is taken to fit the same stream without listing the displays
+/// again: a display that changes resolution gets a stream of its new size this soon.
+const REFIT: Duration = Duration::from_secs(30);
 
 /// The newest frame, and why macOS stopped the stream if it did.
 #[derive(Default)]
@@ -148,6 +151,9 @@ struct Running {
     _queue: DispatchRetained<DispatchQueue>,
     latest: Arc<Latest>,
     size: (usize, usize),
+    /// The live view widths found to fit `size`, and when: a frame request of one of them
+    /// finds this stream without listing the displays (see [`known_stream`]).
+    widths: Vec<(u32, Instant)>,
     last_asked: Instant,
 }
 
@@ -169,34 +175,9 @@ const MAX_STREAMS: usize = 2;
 /// on first use, and again after a size change or after macOS stopped it). A new `seq` only when
 /// the screen changed.
 pub fn display_frame(max_width: u32) -> Result<Frame> {
-    let filter = crate::macos::main_display_filter()?;
-    let size = crate::macos::fit_filter(&filter, max_width)?;
-    let latest = {
-        let mut streams = STREAMS.lock().unwrap();
-        let found = streams.running.iter().position(|r| r.size == size);
-        if let Some(i) = found.filter(|&i| streams.running[i].latest.stopped().is_some()) {
-            stop(streams.running.swap_remove(i));
-        }
-        let index = match streams.running.iter().position(|r| r.size == size) {
-            Some(i) => i,
-            None => {
-                if streams.running.len() >= MAX_STREAMS {
-                    let oldest = (0..streams.running.len())
-                        .min_by_key(|&i| streams.running[i].last_asked)
-                        .unwrap();
-                    stop(streams.running.swap_remove(oldest));
-                }
-                streams.running.push(start(&filter, size)?);
-                streams.running.len() - 1
-            }
-        };
-        if !streams.reaper {
-            streams.reaper = true;
-            thread::spawn(stop_when_idle);
-        }
-        let running = &mut streams.running[index];
-        running.last_asked = Instant::now();
-        running.latest.clone()
+    let latest = match known_stream(max_width) {
+        Some(latest) => latest,
+        None => stream_for(max_width)?,
     };
     let slot = latest.frame.lock().unwrap();
     let (slot, _) = latest
@@ -212,6 +193,59 @@ pub fn display_frame(max_width: u32) -> Result<Frame> {
         bail!("the display stream stopped: {why}");
     }
     frame.ok_or_else(|| anyhow!("the display stream sent no picture"))
+}
+
+/// The running stream a request of `max_width` was fitted to within REFIT, unless macOS stopped
+/// it. Found without listing the displays: a live view asks for 15 frames a second, and
+/// listing goes through the one-request gate (`crate::gate`), where it would queue behind
+/// screenshots and, after a stalled request, be refused, although the stream itself still runs.
+fn known_stream(max_width: u32) -> Option<Arc<Latest>> {
+    let mut streams = STREAMS.lock().unwrap();
+    let running = streams.running.iter_mut().find(|r| {
+        r.widths
+            .iter()
+            .any(|&(w, at)| w == max_width && at.elapsed() < REFIT)
+            && r.latest.stopped().is_none()
+    })?;
+    running.last_asked = Instant::now();
+    Some(running.latest.clone())
+}
+
+/// The stream for `max_width`, found by the size the main display fits to now (which lists the
+/// displays): the running one of that size, or a new one.
+fn stream_for(max_width: u32) -> Result<Arc<Latest>> {
+    let filter = crate::macos::main_display_filter()?;
+    let size = crate::macos::fit_filter(&filter, max_width)?;
+    let mut streams = STREAMS.lock().unwrap();
+    let found = streams.running.iter().position(|r| r.size == size);
+    if let Some(i) = found.filter(|&i| streams.running[i].latest.stopped().is_some()) {
+        stop(streams.running.swap_remove(i));
+    }
+    let index = match streams.running.iter().position(|r| r.size == size) {
+        Some(i) => i,
+        None => {
+            if streams.running.len() >= MAX_STREAMS {
+                let oldest = (0..streams.running.len())
+                    .min_by_key(|&i| streams.running[i].last_asked)
+                    .unwrap();
+                stop(streams.running.swap_remove(oldest));
+            }
+            streams.running.push(start(&filter, size)?);
+            streams.running.len() - 1
+        }
+    };
+    if !streams.reaper {
+        streams.reaper = true;
+        thread::spawn(stop_when_idle);
+    }
+    // This width fits this stream now, and no other (the display may have changed size).
+    for running in &mut streams.running {
+        running.widths.retain(|&(w, _)| w != max_width);
+    }
+    let running = &mut streams.running[index];
+    running.widths.push((max_width, Instant::now()));
+    running.last_asked = Instant::now();
+    Ok(running.latest.clone())
 }
 
 fn start(filter: &SCContentFilter, (width, height): (usize, usize)) -> Result<Running> {
@@ -259,6 +293,7 @@ fn start(filter: &SCContentFilter, (width, height): (usize, usize)) -> Result<Ru
         _queue: queue,
         latest,
         size: (width, height),
+        widths: Vec::new(),
         last_asked: Instant::now(),
     })
 }
