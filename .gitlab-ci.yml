@@ -20,9 +20,10 @@ stages:
   - publish
 
 variables:
-  # The build job only waits on GitHub: the shared pool that runs several jobs at once, not a
-  # release build runner (which runs one, and builds RealTimeX releases).
-  LINK_CI_RUNNER_TAG: check-mr-realtimex-ai
+  # build and publish only wait on GitHub and upload files: link-ci, Link's own shell runner (two
+  # jobs at once, in the realtimex-builder container on the office-80 server), so they never queue
+  # behind RealTimeX's release builds or MR checks.
+  LINK_CI_RUNNER_TAG: link-ci
 
 workflow:
   rules:
@@ -31,6 +32,9 @@ workflow:
 
 build:
   stage: build
+  # A newer push to the same branch cancels this one (Settings → CI/CD → Auto-cancel redundant
+  # pipelines): only the latest commit's build matters.
+  interruptible: true
   tags:
     - $LINK_CI_RUNNER_TAG
   timeout: 3h
@@ -86,7 +90,8 @@ publish:
   extends: .release
   stage: publish
   needs: [sign-mac-arm64, sign-mac-x86_64, sign-win]
+  # Only Python and the network: the shared pool, not a release runner.
   tags:
-    - office-macmini-200
+    - $LINK_CI_RUNNER_TAG
   script:
     - python3 -u ci/release.py publish "$CI_COMMIT_TAG" link-signed
