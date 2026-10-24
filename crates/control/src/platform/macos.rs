@@ -217,8 +217,8 @@ fn post(event: CGEventRef) -> Result<()> {
     Ok(())
 }
 
-/// US-layout virtual key codes (kVK_*). Shortcuts use these; other characters are typed by
-/// their Unicode value.
+/// US-layout virtual key codes (kVK_*). A character's is its unshifted key's (see `char_key`);
+/// characters with no key are typed by their Unicode value.
 fn keycode(key: Key) -> Option<u16> {
     Some(match key {
         Key::Return => 0x24,
@@ -245,7 +245,7 @@ fn keycode(key: Key) -> Option<u16> {
         ]
         .get(n.checked_sub(1)? as usize)
         .copied()?,
-        Key::Char(c) => match c.to_ascii_lowercase() {
+        Key::Char(c) => match c {
             'a' => 0x00,
             's' => 0x01,
             'd' => 0x02,
@@ -297,6 +297,38 @@ fn keycode(key: Key) -> Option<u16> {
             _ => return None,
         },
     })
+}
+
+/// The key that types this character on a US layout, and whether it needs Shift: 'I' is the
+/// i key with Shift. Apps such as TextEdit read the case from the key and the flags, not only
+/// from the event's Unicode string.
+fn char_key(c: char) -> Option<(u16, bool)> {
+    let (base, shift) = match c {
+        'A'..='Z' => (c.to_ascii_lowercase(), true),
+        '~' => ('`', true),
+        '!' => ('1', true),
+        '@' => ('2', true),
+        '#' => ('3', true),
+        '$' => ('4', true),
+        '%' => ('5', true),
+        '^' => ('6', true),
+        '&' => ('7', true),
+        '*' => ('8', true),
+        '(' => ('9', true),
+        ')' => ('0', true),
+        '_' => ('-', true),
+        '+' => ('=', true),
+        '{' => ('[', true),
+        '}' => (']', true),
+        '|' => ('\\', true),
+        ':' => (';', true),
+        '"' => ('\'', true),
+        '<' => (',', true),
+        '>' => ('.', true),
+        '?' => ('/', true),
+        _ => (c, false),
+    };
+    Some((keycode(Key::Char(base))?, shift))
 }
 
 fn modifier_flag(key: Key) -> u64 {
@@ -428,22 +460,33 @@ impl Input {
                 self.flags & !flag
             };
         }
-        let code = keycode(key);
+        let (code, shift) = match key {
+            Key::Char(c) => char_key(c).map_or((None, false), |(code, shift)| (Some(code), shift)),
+            _ => (keycode(key), false),
+        };
+        // A shortcut keeps its flags as sent: ⌘ with 'C' is still ⌘C.
+        let shortcut = self.flags & (FLAG_COMMAND | FLAG_CONTROL) != 0;
+        let flags = self.flags | if shift && !shortcut { FLAG_SHIFT } else { 0 };
         let event = unsafe { CGEventCreateKeyboardEvent(self.source, code.unwrap_or(0), pressed) };
         if event.is_null() {
             bail!("could not create the key event");
         }
         unsafe {
-            if code.is_none() {
-                let Key::Char(c) = key else {
+            match key {
+                // The exact character too, so typing doesn't depend on the keyboard layout.
+                Key::Char(c) if code.is_none() || !shortcut => {
+                    let mut units = [0u16; 2];
+                    let units = c.encode_utf16(&mut units);
+                    CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
+                }
+                Key::Char(_) => {}
+                _ if code.is_none() => {
                     CFRelease(event);
                     bail!("{key:?} has no macOS key");
-                };
-                let mut units = [0u16; 2];
-                let units = c.encode_utf16(&mut units);
-                CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
+                }
+                _ => {}
             }
-            CGEventSetFlags(event, self.flags);
+            CGEventSetFlags(event, flags);
         }
         post(event)
     }
@@ -673,7 +716,28 @@ impl Drop for Input {
 
 #[cfg(test)]
 mod tests {
-    use super::app_name;
+    use super::{app_name, char_key};
+
+    /// #2753 QA: "Issue" typed key by key came out "issue".
+    #[test]
+    fn capitals_and_shifted_symbols_press_shift_on_their_key() {
+        assert_eq!(char_key('I'), Some((0x22, true)));
+        assert_eq!(char_key('i'), Some((0x22, false)));
+        assert_eq!(char_key('M'), Some((0x2e, true)));
+        assert_eq!(char_key('1'), Some((0x12, false)));
+        assert_eq!(char_key('!'), Some((0x12, true)));
+        assert_eq!(char_key('?'), Some((0x2c, true)));
+        assert_eq!(char_key('"'), Some((0x27, true)));
+        assert_eq!(char_key(' '), Some((0x31, false)));
+        assert_eq!(char_key('ệ'), None);
+        for c in "Issue Mac 123 ABC".chars() {
+            let (_, shift) = char_key(c).unwrap();
+            assert_eq!(shift, c.is_ascii_uppercase(), "{c}");
+        }
+        for c in ' '..='~' {
+            assert!(char_key(c).is_some(), "{c:?} has no key");
+        }
+    }
 
     #[test]
     fn names_the_outermost_app_bundle() {

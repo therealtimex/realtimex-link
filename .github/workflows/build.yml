@@ -104,6 +104,10 @@ jobs:
       - name: Test rtx-linkd and rtx-screens (Linux)
         if: matrix.name == 'linux-x86_64'
         run: cargo test --locked -p rtx-linkd -p rtx-screens
+      # The macOS key mapping (which key, and Shift, types each character), once (Apple silicon).
+      - name: Test macOS key mapping
+        if: matrix.name == 'macos-arm64'
+        run: cargo test --locked -p rtx-control -- platform::macos
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh
