@@ -45,10 +45,13 @@ RealTimeX installs Link in the same places, so either one installs or updates it
 downgrade. Link also updates itself (`crates/linkd/src/update.rs`): it looks for a newer release at
 start and every six hours, and the window and tray offer Update. On macOS it installs the signed
 archive once codesign confirms the same Team ID, then reopens; on Windows it starts the signed
-installer once Authenticode confirms the same publisher; on Linux it opens the release page. **Releases:** GitHub Actions builds every tag (unsigned archives, Linux packages);
-RealTimeX's GitLab then signs and notarizes the macOS and Windows builds, adds the `.dmg` and the
-Windows installer, and publishes the release. This repository is a mirror of
-`rtgit.rta.vn/rtlab/rtwebteam/realtimex-link`; send changes there.
+installer once Authenticode confirms the same publisher; on Linux it opens the release page. **Releases** (`.gitlab-ci.yml`): Link's code lives on
+`rtgit.rta.vn/rtlab/rtwebteam/realtimex-link`, and this GitHub repository is its public push
+mirror; send changes there. Each push runs the GitLab pipeline, which builds on GitHub Actions
+here (`ci/github_build.py`). A `vX.Y.Z` tag builds every platform into a draft release (unsigned
+archives, Linux packages), then RealTimeX's release runners sign and notarize the macOS builds and
+make the `.dmg` (`ci/sign-mac.sh`), sign the Windows executables and installer
+(`ci/sign-win.ps1`), and publish the release as Link's latest (`ci/release.py`).
 
 - **Installing:** `rtx-linkd install DESTINATION` installs the Link it belongs to as its own app:
   `/Applications/RealTimeX Link.app`, `C:\Program Files\RealTimeX Link`, `/opt/RealTimeX Link`
