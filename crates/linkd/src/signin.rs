@@ -249,7 +249,7 @@ impl SignIn {
         let (email, access) = self.keep(&tokens)?;
         *self.access.lock().await = Some(access);
         let host = self.host()?;
-        host.store.set(keys::HANDOVER_OFF, &Value::Null)?;
+        host.store.remove(keys::HANDOVER_OFF)?;
         *lock(&self.offered) = None;
         (host.log)(&format!("[sign-in] signed in as {email}"));
         host.relay.wake();
@@ -343,8 +343,8 @@ impl SignIn {
                 (host.log)(&format!("[sign-in] renewing failed: {error:#}"));
                 // The account ended this sign-in (signed out elsewhere, password changed).
                 if error.to_string().contains("invalid_grant") {
-                    let _ = host.store.set(keys::SESSION, &Value::Null);
-                    let _ = host.store.set(crate::identity::keys::ACCOUNT, &Value::Null);
+                    let _ = host.store.remove(keys::SESSION);
+                    let _ = host.store.remove(crate::identity::keys::ACCOUNT);
                     lock(&self.pending).error = Some("Your sign-in ended. Sign in again.".into());
                 }
                 None
@@ -378,9 +378,8 @@ impl SignIn {
             }
         }
         *self.access.lock().await = None;
-        host.store.set(keys::SESSION, &Value::Null)?;
-        host.store
-            .set(crate::identity::keys::ACCOUNT, &Value::Null)?;
+        host.store.remove(keys::SESSION)?;
+        host.store.remove(crate::identity::keys::ACCOUNT)?;
         host.store.set(keys::HANDOVER_OFF, &json!(true))?;
         host.relay.forget_account();
         lock(&self.pending).error = None;
@@ -394,7 +393,7 @@ impl SignIn {
         let (token, _) = lock(&self.offered)
             .take()
             .ok_or_else(|| anyhow!("RealTimeX hasn't offered an account; open RealTimeX"))?;
-        host.store.set(keys::HANDOVER_OFF, &Value::Null)?;
+        host.store.remove(keys::HANDOVER_OFF)?;
         host.relay.set_account(&token)
     }
 }

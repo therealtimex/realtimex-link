@@ -90,6 +90,13 @@ impl Store {
         set_state(&self.db(), key, value)
     }
 
+    /// Forget a value (get answers None again).
+    pub fn remove(&self, key: &str) -> Result<()> {
+        self.db()
+            .execute("DELETE FROM state WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     pub fn meta_get(&self, key: &str) -> Option<String> {
         self.db()
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
