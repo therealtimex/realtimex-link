@@ -698,9 +698,7 @@ impl Host {
     pub async fn set_allow_incoming(&self, allow: bool) -> Result<(), ApiError> {
         self.state().allow_incoming = allow;
         self.save_settings()?;
-        if allow {
-            self.start_at_login();
-        }
+        self.follow_hosting_at_login();
         if !allow {
             // Viewers are cut off first, then capture stops.
             self.end_streams(|_| true).await;
@@ -714,21 +712,45 @@ impl Host {
     }
 
     /// Hosting on means this computer should be reachable after a restart too: Link starts at
-    /// login. RealTimeX turns this on as well; on its own, Link has to. A copy with its own data
-    /// folder (development, tests) leaves the login item alone.
-    fn start_at_login(&self) {
-        if !crate::paths::is_standard()
-            || crate::autostart::app_binary().is_none()
-            || crate::autostart::enabled()
-        {
-            return;
+    /// login. Hosting off, nothing needs Link at login, so the item goes (autostart.rs). Turned
+    /// off through POST /v1/autostart, it stays off. A copy with its own data folder
+    /// (development, tests) leaves the login item alone.
+    fn sync_login_item(&self) -> anyhow::Result<()> {
+        if !crate::paths::is_standard() {
+            return Ok(());
         }
-        match crate::autostart::set(true) {
-            Ok(()) => (self.log)("[remote-control] RealTimeX Link starts at login"),
-            Err(error) => (self.log)(&format!(
-                "[remote-control] couldn't start at login: {error:#}"
-            )),
+        let hosting = self.state().allow_incoming;
+        let opted_out = crate::autostart::opted_out(&self.store);
+        match crate::autostart::follow(hosting, opted_out)? {
+            crate::autostart::Change::Add => {
+                (self.log)("[remote-control] RealTimeX Link starts at login");
+            }
+            crate::autostart::Change::Remove => {
+                (self.log)("[remote-control] RealTimeX Link no longer starts at login");
+            }
+            crate::autostart::Change::Keep => {}
         }
+        Ok(())
+    }
+
+    fn follow_hosting_at_login(&self) {
+        if let Err(error) = self.sync_login_item() {
+            (self.log)(&format!(
+                "[remote-control] couldn't update starting at login: {error:#}"
+            ));
+        }
+    }
+
+    /// POST /v1/autostart: off is kept (the login item stays away whatever hosting does); on
+    /// lets it follow hosting again.
+    pub fn set_start_at_login(&self, on: bool) -> Result<(), ApiError> {
+        crate::autostart::set_opted_out(&self.store, !on)?;
+        self.sync_login_item()?;
+        Ok(())
+    }
+
+    pub fn start_at_login_opted_out(&self) -> bool {
+        crate::autostart::opted_out(&self.store)
     }
 
     // --- lifecycle ----------------------------------------------------------
@@ -739,9 +761,7 @@ impl Host {
             self.state().last_error = Some(error.message);
         }
         self.reconcile().await;
-        if self.state().allow_incoming {
-            self.start_at_login();
-        }
+        self.follow_hosting_at_login();
         self.relay.start();
         self.updater.start();
         let weak = Arc::downgrade(self);

@@ -313,23 +313,26 @@ async fn use_realtimex(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({})))
 }
 
-/// Start at login (autostart.rs): { enabled, available }. Available: rtx-link is installed next to
-/// this daemon, so there is something to start.
-async fn autostart() -> Answer {
+/// Start at login (autostart.rs): { enabled, available, optedOut }. Available: rtx-link is
+/// installed next to this daemon, in the installed Link, so there is something to start. Opted
+/// out: turned off here, so hosting doesn't add it back.
+async fn autostart(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({
         "enabled": crate::autostart::enabled(),
-        "available": crate::autostart::app_binary().is_some(),
+        "available": crate::autostart::available(),
+        "optedOut": state.host.start_at_login_opted_out(),
     })))
 }
 
-/// { enabled: bool }: add or remove the login item.
-async fn set_autostart(Body64(body): Body64) -> Answer {
+/// { enabled: bool }: false turns starting at login off and keeps it off; true lets the login
+/// item follow hosting again (there while this computer allows remote control).
+async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let on = body
         .get("enabled")
         .and_then(Value::as_bool)
         .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
-    crate::autostart::set(on).map_err(ApiError::internal)?;
-    autostart().await
+    state.host.set_start_at_login(on)?;
+    autostart(State(state)).await
 }
 
 /// RealTimeX's hosting state, once: { state: { clients, settings… }, password: { password,

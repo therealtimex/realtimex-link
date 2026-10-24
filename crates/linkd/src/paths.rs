@@ -69,6 +69,55 @@ pub fn is_standard() -> bool {
     DATA_DIR.get().is_some_and(|dir| same(dir, &standard))
 }
 
+/// Where RealTimeX Link is installed, as RealTimeX looks for it (server/utils/remoteHost/
+/// linkdBridge.js): the .app on macOS, the folder of executables elsewhere. Linux also has a
+/// per-user install (a development run puts one there: /opt needs root).
+pub fn install_dirs_for(
+    platform: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    home: &str,
+) -> Vec<String> {
+    match platform {
+        "macos" => vec![format!("/Applications/{APP_NAME}.app")],
+        "windows" => {
+            let program_files = env("ProgramW6432")
+                .filter(|dir| !dir.is_empty())
+                .or_else(|| env("ProgramFiles").filter(|dir| !dir.is_empty()))
+                .unwrap_or_else(|| "C:\\Program Files".to_string());
+            vec![format!("{program_files}\\{APP_NAME}")]
+        }
+        _ => {
+            let data_home = env("XDG_DATA_HOME")
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(|| format!("{home}/.local/share"));
+            vec![
+                format!("/opt/{APP_NAME}"),
+                format!("{data_home}/realtimex-link"),
+            ]
+        }
+    }
+}
+
+/// Whether `install` (install::source(): this executable's .app or folder) is one of the
+/// installed copies, not a build or a copy carried inside RealTimeX.
+pub fn is_install_dir(install: &Path, dirs: &[String]) -> bool {
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    dirs.iter().any(|dir| same(install, Path::new(dir)))
+}
+
+/// This executable belongs to RealTimeX Link as installed on this computer.
+pub fn running_installed() -> bool {
+    let dirs = install_dirs_for(
+        std::env::consts::OS,
+        &|name| std::env::var(name).ok(),
+        &home_dir(),
+    );
+    crate::install::source().is_ok_and(|install| is_install_dir(&install, &dirs))
+}
+
 pub fn home_dir() -> String {
     let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var(name).unwrap_or_default()
@@ -84,6 +133,55 @@ mod tests {
                 .iter()
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn install_dirs_match_realtimex() {
+        assert_eq!(
+            install_dirs_for("macos", &env_of(&[]), "/Users/me"),
+            ["/Applications/RealTimeX Link.app"]
+        );
+        assert_eq!(
+            install_dirs_for(
+                "windows",
+                &env_of(&[("ProgramW6432", "D:\\Programs"), ("ProgramFiles", "C:\\x86")]),
+                "C:\\Users\\me"
+            ),
+            ["D:\\Programs\\RealTimeX Link"]
+        );
+        assert_eq!(
+            install_dirs_for("windows", &env_of(&[]), "C:\\Users\\me"),
+            ["C:\\Program Files\\RealTimeX Link"]
+        );
+        assert_eq!(
+            install_dirs_for("linux", &env_of(&[]), "/home/me"),
+            ["/opt/RealTimeX Link", "/home/me/.local/share/realtimex-link"]
+        );
+    }
+
+    #[test]
+    fn only_an_installed_copy_is_the_installed_one() {
+        let dirs = install_dirs_for("linux", &env_of(&[]), "/home/me");
+        assert!(is_install_dir(Path::new("/opt/RealTimeX Link"), &dirs));
+        assert!(is_install_dir(
+            Path::new("/home/me/.local/share/realtimex-link"),
+            &dirs
+        ));
+        assert!(!is_install_dir(
+            Path::new("/home/me/src/link/target/release"),
+            &dirs
+        ));
+        assert!(!is_install_dir(Path::new("/opt/RealTimeX Link.new"), &dirs));
+        // The same folder through a link counts.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        {
+            let linked = dir.path().join("linked");
+            std::os::unix::fs::symlink(&real, &linked).unwrap();
+            assert!(is_install_dir(&linked, &[real.display().to_string()]));
         }
     }
 
