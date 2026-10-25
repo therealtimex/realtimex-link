@@ -48,10 +48,12 @@ archive once codesign confirms the same Team ID, then reopens; on Windows it sta
 installer once Authenticode confirms the same publisher; on Linux it opens the release page. **Releases** (`.gitlab-ci.yml`): Link's code lives on
 `rtgit.rta.vn/rtlab/rtwebteam/realtimex-link`, and this GitHub repository is its public push
 mirror; send changes there. Each push runs the GitLab pipeline, which builds on GitHub Actions
-here (`ci/github_build.py`). A `vX.Y.Z` tag builds every platform into a draft release (unsigned
-archives, Linux packages), then RealTimeX's release runners sign and notarize the macOS builds and
-make the `.dmg` (`ci/sign-mac.sh`), sign the Windows executables and installer
-(`ci/sign-win.ps1`), and publish the release as Link's latest (`ci/release.py`).
+here (`ci/github_build.py`). A `vX.Y.Z` tag (protected, and equal to Cargo.toml's version) builds
+every platform into a draft release (unsigned archives, Linux packages). GitLab then checks that the
+files come from the build run of the tag's own commit and takes them from that run's artifacts
+(`ci/release.py fetch`), RealTimeX's release runners sign and notarize the macOS builds and make
+the `.dmg` (`ci/sign-mac.sh`) and sign the Windows executables and installer (`ci/sign-win.ps1`),
+and the draft is published, as Link's latest unless a newer release is out (`ci/release.py`).
 
 - **Installing:** `rtx-linkd install DESTINATION` installs the Link it belongs to as its own app:
   `/Applications/RealTimeX Link.app`, `C:\Program Files\RealTimeX Link`, `/opt/RealTimeX Link`

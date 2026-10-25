@@ -35,7 +35,7 @@ VIAddVersionKey "CompanyName" "RealTimeX"
 VIAddVersionKey "FileDescription" "${APP} Setup"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
-VIAddVersionKey "LegalCopyright" "RealTimeX"
+VIAddVersionKey "LegalCopyright" "Copyright © 2025 RealTimeX"
 
 !define MUI_ICON "..\..\assets\icon.ico"
 !define MUI_UNICON "..\..\assets\icon.ico"

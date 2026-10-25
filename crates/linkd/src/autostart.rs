@@ -1,11 +1,23 @@
 //! Start at login: RealTimeX Link's menu bar / tray app (`rtx-link --background`, no window), which
-//! starts this daemon. RealTimeX turns it on with its Remote Control plugin and off without it
-//! (POST /v1/autostart). Each platform's own per-user login item: a LaunchAgent on macOS, the Run
+//! starts this daemon. Each platform's own per-user login item: a LaunchAgent on macOS, the Run
 //! key on Windows, an XDG autostart entry on Linux.
+//!
+//! Link owns the login item, and it follows hosting: there while this computer allows remote
+//! control, gone when it doesn't (host.rs). RealTimeX or the person can turn it off
+//! (POST /v1/autostart { enabled: false }); that is kept in the store and respected until they
+//! turn it on again. Only the installed Link writes it, so a build or a copy run from elsewhere
+//! can't point it at itself.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde_json::{json, Value};
+
+use crate::store::Store;
+
+/// The store key of "don't start at login", set through POST /v1/autostart. Absent: the login
+/// item follows hosting (every install from before it, too).
+pub const OPT_OUT_KEY: &str = "autostart-off";
 
 /// The login item's name: the Run value (Windows), the entry's Name (Linux).
 #[cfg(not(target_os = "macos"))]
@@ -33,13 +45,77 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Add or remove the login item. Adding needs rtx-link next to this daemon.
+/// There is something to start at login: rtx-link next to this daemon, in the installed Link.
+pub fn available() -> bool {
+    app_binary().is_some() && crate::paths::running_installed()
+}
+
+/// Add or remove the login item. Adding needs rtx-link next to this daemon, in the installed
+/// Link: the item follows no copy but that one.
 pub fn set(on: bool) -> Result<()> {
     if !on {
         return platform::remove();
     }
     let app = app_binary().context("rtx-link is not installed next to rtx-linkd")?;
+    anyhow::ensure!(
+        crate::paths::running_installed(),
+        "only the installed RealTimeX Link starts at login, not {}",
+        app.display()
+    );
     platform::write(&command_line(&app), &app)
+}
+
+/// Whether the person or RealTimeX turned starting at login off.
+pub fn opted_out(store: &Store) -> bool {
+    store.get(OPT_OUT_KEY) == Some(Value::Bool(true))
+}
+
+pub fn set_opted_out(store: &Store, off: bool) -> Result<()> {
+    if off {
+        store.set(OPT_OUT_KEY, &json!(true))
+    } else {
+        store.remove(OPT_OUT_KEY)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    Add,
+    Remove,
+    Keep,
+}
+
+/// What the login item needs: `installed` is this copy being the installed Link (it may write
+/// the item), `present` any item there, `ours` one that starts this installation's rtx-link.
+pub fn change(hosting: bool, opted_out: bool, installed: bool, present: bool, ours: bool) -> Change {
+    if hosting && !opted_out {
+        if ours || !installed {
+            Change::Keep
+        } else {
+            Change::Add
+        }
+    } else if present {
+        Change::Remove
+    } else {
+        Change::Keep
+    }
+}
+
+/// Make the login item match hosting and the opt-out; returns what was done.
+pub fn follow(hosting: bool, opted_out: bool) -> Result<Change> {
+    let wanted = change(
+        hosting,
+        opted_out,
+        available(),
+        platform::current().is_some(),
+        enabled(),
+    );
+    match wanted {
+        Change::Add => set(true)?,
+        Change::Remove => platform::remove()?,
+        Change::Keep => {}
+    }
+    Ok(wanted)
 }
 
 /// How the login item starts rtx-link, as the platform stores it.
@@ -246,7 +322,8 @@ mod platform {
         };
         let text = format!(
             "[Desktop Entry]\nType=Application\nName={NAME}\nComment=Lets your other computers \
-             connect to this one\nExec={exec}\n{icon}Terminal=false\nNoDisplay=true\n\
+             connect to this one\nExec={exec}\n{icon}StartupWMClass=realtimex-link\n\
+             Terminal=false\nNoDisplay=true\n\
              X-GNOME-Autostart-enabled=true\n"
         );
         std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))
@@ -270,6 +347,38 @@ fn remove_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_login_item_follows_hosting_unless_turned_off() {
+        // Hosting on: added by the installed Link, kept when it is already there.
+        assert_eq!(change(true, false, true, false, false), Change::Add);
+        assert_eq!(change(true, false, true, true, false), Change::Add);
+        assert_eq!(change(true, false, true, true, true), Change::Keep);
+        // A copy run from elsewhere doesn't point it at itself.
+        assert_eq!(change(true, false, false, false, false), Change::Keep);
+        assert_eq!(change(true, false, false, true, false), Change::Keep);
+        // Hosting off, or turned off: removed, whichever copy wrote it.
+        assert_eq!(change(false, false, true, true, true), Change::Remove);
+        assert_eq!(change(false, false, false, true, false), Change::Remove);
+        assert_eq!(change(true, true, true, true, true), Change::Remove);
+        assert_eq!(change(false, false, true, false, false), Change::Keep);
+        assert_eq!(change(true, true, true, false, false), Change::Keep);
+    }
+
+    #[test]
+    fn turning_it_off_is_kept_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // Installs from before the setting follow hosting.
+        assert!(!opted_out(&store));
+        set_opted_out(&store, true).unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(opted_out(&store));
+        set_opted_out(&store, false).unwrap();
+        assert!(!opted_out(&store));
+        assert_eq!(store.get(OPT_OUT_KEY), None);
+    }
 
     #[test]
     fn command_lines_quote_the_path() {

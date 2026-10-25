@@ -6,7 +6,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::process::Command;
 
 const BINARIES: &[&str] = &[
     "tailscale",
@@ -32,17 +31,13 @@ pub fn is_tailscale_ipv4(address: &str) -> bool {
 }
 
 async fn run(binary: &str, args: &[&str]) -> Option<String> {
-    let mut command = Command::new(binary);
+    // util::tokio_command: no console window flashing up every minute on Windows.
+    let mut command = crate::util::tokio_command(binary);
     command
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        // No console window flashing up every minute.
-        command.creation_flags(0x0800_0000);
-    }
     let output = tokio::time::timeout(TIMEOUT, command.output())
         .await
         .ok()?
@@ -80,6 +75,10 @@ pub fn parse_status(output: &str) -> Option<Option<Tailnet>> {
 }
 
 /// The CLI is asked first because on macOS the address does not show among the interfaces.
+///
+/// Without the CLI, only an interface Tailscale itself made counts: an address in 100.64.0.0/10
+/// alone is not enough, since mobile carriers and ISPs hand out the same range (CGNAT), and their
+/// other customers must not reach this computer's sign-in.
 pub async fn detect() -> Option<Tailnet> {
     for binary in BINARIES {
         let Some(output) = run(
@@ -99,11 +98,25 @@ pub async fn detect() -> Option<Tailnet> {
         .into_iter()
         .find_map(|interface| {
             let ip = interface.ip().to_string();
-            (!interface.is_loopback() && is_tailscale_ipv4(&ip)).then_some(Tailnet {
+            (!interface.is_loopback()
+                && is_tailscale_ipv4(&ip)
+                && is_tailscale_interface(std::env::consts::OS, &interface.name))
+            .then_some(Tailnet {
                 address: ip,
                 dns_name: None,
             })
         })
+}
+
+/// An interface Tailscale makes: `tailscale0` (and other `tailscale*`) on Linux, the adapter
+/// named "Tailscale" on Windows (if-addrs gives its friendly name). None on macOS, where the
+/// address isn't on an interface of its own name: there the CLI decides, or Link doesn't listen.
+pub fn is_tailscale_interface(os: &str, name: &str) -> bool {
+    match os {
+        "linux" => name.starts_with("tailscale"),
+        "windows" => name == "Tailscale",
+        _ => false,
+    }
 }
 
 /// The Tailscale login of whoever owns `address` (e.g. "linh@example.com"), or None.
@@ -150,5 +163,17 @@ mod tests {
             Some(None)
         );
         assert_eq!(parse_status("not json"), None);
+    }
+
+    #[test]
+    fn only_tailscales_own_interface_without_the_cli() {
+        assert!(is_tailscale_interface("linux", "tailscale0"));
+        assert!(!is_tailscale_interface("linux", "wwan0"));
+        assert!(!is_tailscale_interface("linux", "eth0"));
+        assert!(is_tailscale_interface("windows", "Tailscale"));
+        assert!(!is_tailscale_interface("windows", "Cellular"));
+        assert!(!is_tailscale_interface("windows", "Ethernet 2"));
+        assert!(!is_tailscale_interface("macos", "utun4"));
+        assert!(!is_tailscale_interface("macos", "tailscale0"));
     }
 }

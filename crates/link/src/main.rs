@@ -9,10 +9,14 @@ use rtx_glibc_compat as _;
 
 mod api;
 mod app;
+mod choices;
+mod cjk;
 mod desktop;
 mod dock;
+mod i18n;
 #[cfg(target_os = "linux")]
 mod icon;
+mod theme;
 mod tray;
 
 fn main() -> eframe::Result {
@@ -44,19 +48,26 @@ fn main() -> eframe::Result {
         }
     }
     dock::set_open(!background);
+    dock::name_process();
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("RealTimeX Link")
+        // The Wayland app_id and the X11 WM_CLASS: the menu entry's name (realtimex-link.desktop,
+        // StartupWMClass), so the dock shows the window under Link's own icon.
+        .with_app_id("realtimex-link")
+        .with_visible(!background)
+        // The height then follows the content (app.rs, fit_height).
+        .with_inner_size([440.0, 520.0])
+        .with_min_inner_size([380.0, 360.0])
+        .with_icon(std::sync::Arc::new(window_icon()));
+    // macOS: no title bar, like RealTimeX's window; the traffic lights sit over the header
+    // (app.rs), which also moves the window.
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false);
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("RealTimeX Link")
-            .with_visible(!background)
-            // The height then follows the content (app.rs, fit_height).
-            .with_inner_size([440.0, 520.0])
-            .with_min_inner_size([380.0, 360.0])
-            // RealTimeX Link's icon (RealTimeX's with assets/badge.svg, made by scripts/icons.py).
-            .with_icon(std::sync::Arc::new(eframe::egui::IconData {
-                rgba: include_bytes!("../icons/window-256.rgba").to_vec(),
-                width: 256,
-                height: 256,
-            })),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -64,4 +75,25 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::LinkApp::new(cc)))),
     )
+}
+
+/// RealTimeX Link's icon (RealTimeX's for the platform with assets/badge.svg, made by
+/// scripts/icons.py). None on macOS: eframe would put it in the Dock in place of the .app's
+/// icon.icns, which has macOS's rounded shape (eframe leaves the Dock alone for an empty icon).
+#[cfg(target_os = "macos")]
+fn window_icon() -> eframe::egui::IconData {
+    eframe::egui::IconData::default()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn window_icon() -> eframe::egui::IconData {
+    #[cfg(windows)]
+    let rgba = include_bytes!("../icons/window-256.rgba");
+    #[cfg(not(windows))]
+    let rgba = include_bytes!("../icons/window-linux-256.rgba");
+    eframe::egui::IconData {
+        rgba: rgba.to_vec(),
+        width: 256,
+        height: 256,
+    }
 }

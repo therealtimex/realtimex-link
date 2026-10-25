@@ -2,6 +2,10 @@
 //! only, as server/utils/remoteHost/client.js speaks it. Every request needs the bearer
 //! token from the data folder (same-user trust, like a Docker socket); a request addressed to any
 //! other host name is refused, so a web page can't reach it through DNS rebinding.
+//!
+//! The one request without the token is POST /v1/hello: the daemon proves it holds the token
+//! before a client sends it. Otherwise a process of another user that took over the port of a
+//! daemon that died (linkd.json still names it) would be handed the token.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,10 +27,26 @@ use crate::util::same_bytes;
 /// The local API's protocol: a caller that speaks another one says so instead of misreading it.
 pub const PROTOCOL: u32 = 1;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-pub const FEATURES: &[&str] = &["host", "autostart", "window", "relay"];
+pub const FEATURES: &[&str] = &[
+    "host",
+    "autostart",
+    "window",
+    "relay",
+    "hello",
+    "appearance",
+    "language",
+];
+/// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
+/// caller's nonce (see `hello_proof`).
+pub const HELLO_CONTEXT: &str = "linkd-hello";
+const HELLO_PATH: &str = "/v1/hello";
+const MIN_NONCE_LENGTH: usize = 16;
+const MAX_NONCE_LENGTH: usize = 256;
 
 pub struct LocalState {
     pub token: String,
+    /// The port this API listens on, which /v1/hello's proof names.
+    pub port: u16,
     pub version: String,
     pub started_at: String,
     pub host: Arc<Host>,
@@ -44,10 +64,12 @@ type Shared = Arc<LocalState>;
 
 pub fn router(state: Shared) -> Router {
     Router::new()
+        .route(HELLO_PATH, post(hello))
         .route("/v1/version", get(version))
         .route("/v1/status", get(status))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/autostart", get(autostart).post(set_autostart))
+        .route("/v1/appearance", get(appearance).post(set_appearance))
         .route("/v1/window/open", post(open_window))
         .route("/v1/account", get(account))
         .route("/v1/account/token", post(account_token))
@@ -99,6 +121,10 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
         )
             .into_response();
     }
+    // Asked before the client trusts this port with its token: it carries none.
+    if request.uri().path() == HELLO_PATH {
+        return next.run(request).await;
+    }
     let given = request
         .headers()
         .get("authorization")
@@ -143,6 +169,34 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for Body64 {
     }
 }
 
+/// The proof POST /v1/hello answers with: lowercase hex of HMAC-SHA256, keyed with the token's
+/// text, over "linkd-hello:<port>:<nonce>". The port is part of it so that a process on another
+/// port can't pass on a live daemon's answer as its own.
+pub fn hello_proof(token: &str, port: u16, nonce: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    let message = format!("{HELLO_CONTEXT}:{port}:{nonce}");
+    ring::hmac::sign(&key, message.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// { nonce } (16 to 256 characters, fresh for each try): { hmac, protocol }. The caller checks
+/// the hmac against the api-token file, in constant time, before it sends that token.
+async fn hello(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let nonce = body.get("nonce").and_then(Value::as_str).unwrap_or("");
+    if !(MIN_NONCE_LENGTH..=MAX_NONCE_LENGTH).contains(&nonce.len()) {
+        return Err(ApiError::bad_request(format!(
+            "nonce must be {MIN_NONCE_LENGTH} to {MAX_NONCE_LENGTH} characters"
+        )));
+    }
+    Ok(Json(json!({
+        "hmac": hello_proof(&state.token, state.port, nonce),
+        "protocol": PROTOCOL,
+    })))
+}
+
 async fn version(State(state): State<Shared>) -> Json<Value> {
     Json(json!({ "protocol": PROTOCOL, "version": state.version, "features": FEATURES }))
 }
@@ -155,6 +209,9 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         "schema": SCHEMA_VERSION,
         "startedAt": state.started_at,
         "showWindow": state.show_window.load(Ordering::Relaxed),
+        // The window follows it (light, dark, system) as it polls.
+        "appearance": state.host.appearance(),
+        "language": state.host.language(),
     }))
 }
 
@@ -313,23 +370,69 @@ async fn use_realtimex(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({})))
 }
 
-/// Start at login (autostart.rs): { enabled, available }. Available: rtx-link is installed next to
-/// this daemon, so there is something to start.
-async fn autostart() -> Answer {
+/// Start at login (autostart.rs): { enabled, available, optedOut }. Available: rtx-link is
+/// installed next to this daemon, in the installed Link, so there is something to start. Opted
+/// out: turned off here, so hosting doesn't add it back.
+async fn autostart(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({
         "enabled": crate::autostart::enabled(),
-        "available": crate::autostart::app_binary().is_some(),
+        "available": crate::autostart::available(),
+        "optedOut": state.host.start_at_login_opted_out(),
     })))
 }
 
-/// { enabled: bool }: add or remove the login item.
-async fn set_autostart(Body64(body): Body64) -> Answer {
+/// { enabled: bool }: false turns starting at login off and keeps it off; true lets the login
+/// item follow hosting again (there while this computer allows remote control).
+async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let on = body
         .get("enabled")
         .and_then(Value::as_bool)
         .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
-    crate::autostart::set(on).map_err(ApiError::internal)?;
-    autostart().await
+    state.host.set_start_at_login(on)?;
+    autostart(State(state)).await
+}
+
+async fn appearance(State(state): State<Shared>) -> Answer {
+    Ok(Json(json!({
+        "theme": state.host.appearance(),
+        "language": state.host.language(),
+    })))
+}
+
+/// { theme?: "light" | "dark" | "system", language?: BCP-47 tag | "system" }, at least one:
+/// RealTimeX's, posted when it starts and when it changes, or the choice in Link's Settings.
+/// "system" follows the OS. Both are checked before either is kept.
+async fn set_appearance(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let field = |name: &str| -> Result<Option<String>, ApiError> {
+        match body.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(ApiError::bad_request(format!("{name} must be a string"))),
+        }
+    };
+    let (theme, language) = (field("theme")?, field("language")?);
+    if theme.is_none() && language.is_none() {
+        return Err(ApiError::bad_request("theme or language is required"));
+    }
+    if let Some(theme) = &theme {
+        if !matches!(theme.as_str(), "light" | "dark" | "system") {
+            return Err(ApiError::bad_request("theme must be light, dark or system"));
+        }
+    }
+    if let Some(language) = &language {
+        if language != "system" && crate::host::language_tag(language).is_none() {
+            return Err(ApiError::bad_request(
+                "language must be a language tag or system",
+            ));
+        }
+    }
+    if let Some(theme) = &theme {
+        state.host.set_appearance(theme)?;
+    }
+    if let Some(language) = &language {
+        state.host.set_language(language)?;
+    }
+    appearance(State(state)).await
 }
 
 /// RealTimeX's hosting state, once: { state: { clients, settings… }, password: { password,
@@ -467,5 +570,25 @@ mod tests {
         assert_eq!(strip_bearer("Bearer abc"), "abc");
         assert_eq!(strip_bearer("bearer   abc"), "abc");
         assert_eq!(strip_bearer("abc"), "abc");
+    }
+
+    #[test]
+    fn hello_proves_the_token_for_this_port_and_nonce() {
+        // What a client computes: in Node, crypto.createHmac("sha256", token)
+        // .update(`linkd-hello:${port}:${nonce}`).digest("hex").
+        let proof = hello_proof("token", 7000, "nonce-0123456789");
+        assert_eq!(
+            proof,
+            "0951928c6c00bc5c4f3e9628f20424305372b20f170d80b13ee212f402181af6"
+        );
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"token");
+        let tag: Vec<u8> = (0..proof.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&proof[i..i + 2], 16).unwrap())
+            .collect();
+        assert!(ring::hmac::verify(&key, b"linkd-hello:7000:nonce-0123456789", &tag).is_ok());
+        assert_ne!(proof, hello_proof("other", 7000, "nonce-0123456789"));
+        assert_ne!(proof, hello_proof("token", 7001, "nonce-0123456789"));
+        assert_ne!(proof, hello_proof("token", 7000, "nonce-0123456780"));
     }
 }

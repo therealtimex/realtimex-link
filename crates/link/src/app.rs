@@ -10,13 +10,18 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Viewpo
 use serde_json::{json, Value};
 
 use crate::api::Api;
+use crate::choices::{Choices, Field};
 use crate::desktop;
+use crate::i18n::{t, tf};
+use crate::theme::{self, primary_button, semibold, tone_colors, Tone};
 
 const POLL: Duration = Duration::from_millis(1500);
 /// The window's height follows its content between these; past the maximum the content scrolls.
 const MIN_HEIGHT: f32 = 360.0;
 const MAX_HEIGHT: f32 = 720.0;
 const NOTICE_FOR: Duration = Duration::from_secs(4);
+/// macOS: the height of the hidden title bar, where the window's buttons stay.
+const TRAFFIC_LIGHTS: f32 = 28.0;
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -32,6 +37,9 @@ pub struct Snapshot {
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
     pub show_window: Option<u64>,
+    /// The theme ("light", "dark", "system") and the language (a tag or "system") the window
+    /// and Settings show, and Settings' changes on their way to the daemon.
+    pub choices: Choices,
 }
 
 pub type Shared = Arc<Mutex<Snapshot>>;
@@ -60,7 +68,7 @@ pub fn act(
         let api = lock(&shared).api.clone();
         let result = match api {
             Some(api) => api.post(&path, body),
-            None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+            None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
         };
         let notice = match result {
             Ok(_) => (done, true),
@@ -82,7 +90,7 @@ pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) 
         let api = lock(&shared).api.clone();
         let answer = match api {
             Some(api) => api.post("/v1/update/install", json!({})),
-            None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+            None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
         };
         match answer {
             Ok(answer) => {
@@ -94,6 +102,45 @@ pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) 
                 lock(&shared).notice = Some((error.to_string(), false, Instant::now()));
             }
         }
+        let _ = refresh.send(());
+        ctx.request_repaint();
+    });
+}
+
+/// A Settings change, shown at once and sent after any still on its way (one at a time, in
+/// order). When the daemon doesn't take it, Settings goes back and offers Try again.
+pub fn save_setting(
+    shared: &Shared,
+    refresh: &Sender<()>,
+    ctx: &egui::Context,
+    field: Field,
+    value: &str,
+) {
+    let start = {
+        let mut state = lock(shared);
+        state.choices.choose(field, value);
+        !std::mem::replace(&mut state.choices.writing, true)
+    };
+    // The poll applies it to the window now, without waiting for the daemon.
+    let _ = refresh.send(());
+    if !start {
+        return;
+    }
+    let (shared, refresh, ctx) = (shared.clone(), refresh.clone(), ctx.clone());
+    std::thread::spawn(move || loop {
+        let (api, next) = {
+            let mut state = lock(&shared);
+            let next = state.choices.next_write();
+            if next.is_none() {
+                state.choices.writing = false;
+            }
+            (state.api.clone(), next)
+        };
+        let Some((field, value)) = next else { break };
+        let mut body = serde_json::Map::new();
+        body.insert(field.key().to_string(), json!(value));
+        let taken = api.is_some_and(|api| api.post("/v1/appearance", Value::Object(body)).is_ok());
+        lock(&shared).choices.finished(field, taken);
         let _ = refresh.send(());
         ctx.request_repaint();
     });
@@ -113,7 +160,21 @@ pub fn register(api: &Api) -> bool {
     !answer.is_ok_and(|answer| answer["owner"] == false)
 }
 
+/// The theme the window follows: "light", "dark", or anything else the system's (an older daemon
+/// has none).
+fn theme_preference(theme: &str) -> egui::ThemePreference {
+    match theme {
+        "light" => egui::ThemePreference::Light,
+        "dark" => egui::ThemePreference::Dark,
+        _ => egui::ThemePreference::System,
+    }
+}
+
 pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
+    // Which CJK languages this computer can show: found off this thread, picked up by a later
+    // poll (the window shows English until then).
+    std::thread::spawn(crate::cjk::scan);
+    let mut appearance = None;
     loop {
         let api = lock(&shared).api.clone();
         let api = match api {
@@ -135,10 +196,48 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             },
         };
         if let Some(api) = api {
-            let shown = api
-                .get("/v1/status")
-                .ok()
-                .and_then(|status| status["showWindow"].as_u64());
+            let edits = lock(&shared).choices.edits();
+            let status = api.get("/v1/status").ok();
+            // The stored theme and language (RealTimeX's, or chosen in Settings), unless a change
+            // was made since this read started; an older daemon has no language. A failed read
+            // changes nothing: the window keeps what it shows.
+            let (theme, language) = {
+                let mut state = lock(&shared);
+                if let Some(status) = &status {
+                    let field = |name: &str| status[name].as_str().unwrap_or("system");
+                    state
+                        .choices
+                        .status(edits, field("appearance"), field("language"));
+                }
+                (
+                    state.choices.shown(Field::Theme).to_string(),
+                    state.choices.shown(Field::Language).to_string(),
+                )
+            };
+            // The fonts first (a CJK language's), so its text never shows without them.
+            let next = crate::i18n::effective_locale(&language);
+            if !std::ptr::eq(next, crate::i18n::current()) {
+                theme::apply_fonts(&ctx, next);
+            }
+            if crate::i18n::set_language(&language) {
+                ctx.request_repaint();
+            }
+            let preference = match theme_preference(&theme) {
+                egui::ThemePreference::System => theme::system_theme()
+                    .map_or(egui::ThemePreference::System, egui::ThemePreference::from),
+                preference => preference,
+            };
+            if appearance != Some(preference) {
+                ctx.set_theme(preference);
+                // The title bar too (the Linux one is drawn by winit, Windows' by the system).
+                ctx.send_viewport_cmd(ViewportCommand::SetTheme(match preference {
+                    egui::ThemePreference::Light => egui::SystemTheme::Light,
+                    egui::ThemePreference::Dark => egui::SystemTheme::Dark,
+                    egui::ThemePreference::System => egui::SystemTheme::SystemDefault,
+                }));
+                appearance = Some(preference);
+            }
+            let shown = status.and_then(|status| status["showWindow"].as_u64());
             let seen = std::mem::replace(&mut lock(&shared).show_window, shown);
             if let (Some(seen), Some(shown)) = (seen, shown) {
                 if shown > seen {
@@ -213,6 +312,13 @@ enum Tab {
     Computers,
 }
 
+/// Where keyboard focus goes next frame: Back when Settings opens, the gear when it closes.
+#[derive(PartialEq, Clone, Copy)]
+enum Focus {
+    Back,
+    Gear,
+}
+
 enum Confirm {
     TurnOff,
     NewPassword,
@@ -225,10 +331,25 @@ pub struct LinkApp {
     shared: Shared,
     refresh: Sender<()>,
     tab: Tab,
+    /// Settings in place of the tabs (the gear in the header).
+    settings: bool,
+    /// The header's area last frame: on macOS it moves the window.
+    header: egui::Rect,
+    focus: Option<Focus>,
+    /// The widget that had keyboard focus last frame: one that gets it out of view is scrolled
+    /// to (egui doesn't, so Tab could move to a control below the fold).
+    last_focus: Option<egui::Id>,
+    /// The select whose list is open: it gets the focus back when the list closes.
+    open_combo: Option<egui::Id>,
+    /// The header's and the footer's controls (the gear, Open/Get RealTimeX): never scrolled
+    /// to, they are always in view.
+    chrome: [Option<egui::Id>; 2],
     show_password: bool,
     editing_password: Option<String>,
     confirm: Option<Confirm>,
     tray: Option<crate::tray::Tray>,
+    /// The app icon in the header.
+    icon: egui::TextureHandle,
 }
 
 impl LinkApp {
@@ -253,11 +374,19 @@ impl LinkApp {
             )
             .ok()
         };
+        theme::apply(&cc.egui_ctx);
         Self {
+            icon: header_icon(&cc.egui_ctx),
             tray,
             shared,
             refresh,
             tab: Tab::ThisComputer,
+            settings: false,
+            header: egui::Rect::NOTHING,
+            focus: None,
+            last_focus: None,
+            open_combo: None,
+            chrome: [None; 2],
             show_password: false,
             editing_password: None,
             confirm: None,
@@ -275,75 +404,92 @@ impl LinkApp {
 
 // --- small pieces -----------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-enum Tone {
-    Success,
-    Warning,
-    Danger,
-    Info,
-    Neutral,
-}
-
-fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32) {
-    let dark = ui.visuals().dark_mode;
-    match (tone, dark) {
-        (Tone::Success, true) => (
-            Color32::from_rgb(20, 61, 38),
-            Color32::from_rgb(134, 239, 172),
-        ),
-        (Tone::Success, false) => (
-            Color32::from_rgb(220, 252, 231),
-            Color32::from_rgb(22, 101, 52),
-        ),
-        (Tone::Warning, true) => (
-            Color32::from_rgb(66, 46, 12),
-            Color32::from_rgb(253, 211, 77),
-        ),
-        (Tone::Warning, false) => (
-            Color32::from_rgb(254, 243, 199),
-            Color32::from_rgb(133, 77, 14),
-        ),
-        (Tone::Danger, true) => (
-            Color32::from_rgb(69, 20, 20),
-            Color32::from_rgb(252, 165, 165),
-        ),
-        (Tone::Danger, false) => (
-            Color32::from_rgb(254, 226, 226),
-            Color32::from_rgb(153, 27, 27),
-        ),
-        (Tone::Info, true) => (
-            Color32::from_rgb(23, 37, 72),
-            Color32::from_rgb(147, 197, 253),
-        ),
-        (Tone::Info, false) => (
-            Color32::from_rgb(219, 234, 254),
-            Color32::from_rgb(30, 64, 175),
-        ),
-        (Tone::Neutral, true) => (Color32::from_gray(48), Color32::from_gray(220)),
-        (Tone::Neutral, false) => (Color32::from_gray(232), Color32::from_gray(60)),
+/// The app icon (the window's, main.rs) at 64 px, shown at 24 pt in the header: averaged down
+/// 4 x 4 here, as the texture has no mipmaps to scale it down smoothly.
+fn header_icon(ctx: &egui::Context) -> egui::TextureHandle {
+    const FROM: usize = 256;
+    const TO: usize = 64;
+    const STEP: usize = FROM / TO;
+    // The rounded icon outside Windows, like the platform's own (macOS has no window icon).
+    #[cfg(windows)]
+    let rgba = include_bytes!("../icons/window-256.rgba");
+    #[cfg(not(windows))]
+    let rgba = include_bytes!("../icons/window-linux-256.rgba");
+    let full = egui::ColorImage::from_rgba_unmultiplied([FROM, FROM], rgba);
+    let mut pixels = Vec::with_capacity(TO * TO);
+    for y in 0..TO {
+        for x in 0..TO {
+            let mut sum = [0u32; 4];
+            for dy in 0..STEP {
+                for dx in 0..STEP {
+                    let pixel = full.pixels[(y * STEP + dy) * FROM + x * STEP + dx];
+                    for (total, channel) in sum.iter_mut().zip(pixel.to_array()) {
+                        *total += u32::from(channel);
+                    }
+                }
+            }
+            let [r, g, b, a] = sum.map(|total| (total / (STEP * STEP) as u32) as u8);
+            pixels.push(Color32::from_rgba_premultiplied(r, g, b, a));
+        }
     }
+    ctx.load_texture(
+        "app-icon",
+        egui::ColorImage::new([TO, TO], pixels),
+        egui::TextureOptions::LINEAR,
+    )
 }
 
+/// A pill: the tone's text on its surface.
 fn badge(ui: &mut egui::Ui, text: &str, tone: Tone) {
-    let (fill, fg) = tone_colors(ui, tone);
+    let (fill, _, fg) = tone_colors(ui, tone);
     egui::Frame::new()
         .fill(fill)
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).small().strong().color(fg));
+            ui.label(semibold(text).small().color(fg));
         });
 }
 
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let visuals = ui.visuals();
+/// The computer's name in the header: it takes only the room the title and the gear leave, and
+/// a long name ends in "…" with the whole name on hover.
+fn machine_badge(ui: &mut egui::Ui, machine: &str) {
+    let (fill, _, fg) = tone_colors(ui, Tone::Neutral);
+    let room = (ui.available_width() - ui.spacing().item_spacing.x - 16.0).max(24.0);
     egui::Frame::new()
-        .fill(visuals.extreme_bg_color)
-        .stroke(Stroke::new(
-            1.0,
-            visuals.widgets.noninteractive.bg_stroke.color,
-        ))
+        .fill(fill)
         .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.set_max_width(room);
+            ui.add(egui::Label::new(semibold(machine).small().color(fg)).truncate());
+        });
+}
+
+/// No click in this frame. egui takes the focus away from a widget when a click lands elsewhere,
+/// and a frame can run twice with the same input: focus asked for in the frame of the click that
+/// opened or closed Settings is asked for again until a frame without one.
+fn settled(ctx: &egui::Context) -> bool {
+    let clicked = ctx.input(|i| i.pointer.any_click());
+    if clicked {
+        ctx.request_repaint();
+    }
+    !clicked
+}
+
+/// A select gets the keyboard focus back when its list closes (Esc, a choice, a click away), as a
+/// native select does: egui leaves the focus nowhere, so Tab started over.
+fn keep_focus(open: &mut Option<egui::Id>, ctx: &egui::Context, combo: &egui::Response) {
+    if egui::ComboBox::is_open(ctx, combo.id) {
+        *open = Some(combo.id);
+    } else if *open == Some(combo.id) {
+        *open = None;
+        combo.request_focus();
+    }
+}
+
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    theme::card_frame(ui)
         .inner_margin(Margin::same(14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -353,14 +499,15 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 fn alert<R>(ui: &mut egui::Ui, tone: Tone, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let (fill, fg) = tone_colors(ui, tone);
+    let (fill, border, fg) = tone_colors(ui, tone);
     egui::Frame::new()
         .fill(fill)
-        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, border))
+        .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().color(fg));
+            ui.label(semibold(title).color(fg));
             ui.add_space(4.0);
             add(ui)
         })
@@ -371,7 +518,7 @@ fn caption(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(RichText::new(text.into()).small().weak());
 }
 
-/// The switch from egui's demo: a pill with a knob.
+/// The switch: a pill with a knob (theme.rs paints it).
 fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let size = egui::vec2(2.2, 1.2) * ui.spacing().interact_size.y;
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -384,29 +531,23 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
             egui::Role::CheckBox,
             ui.is_enabled(),
             *on,
-            "Allow remote control",
+            t("host.allowRemoteControl"),
         )
     });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
-        let visuals = ui.style().interact_selectable(&response, *on);
-        let radius = 0.5 * rect.height();
-        ui.painter().rect(
-            rect,
-            radius,
-            visuals.bg_fill,
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
-        ui.painter().circle(
-            egui::pos2(x, rect.center().y),
-            0.75 * radius,
-            visuals.fg_stroke.color,
-            visuals.fg_stroke,
-        );
+        theme::paint_switch(ui, &response, rect, t, *on);
     }
     response
+}
+
+/// "Full access" or "View only".
+fn access_label(control: bool) -> String {
+    t(if control {
+        "access.full"
+    } else {
+        "access.view"
+    })
 }
 
 fn text(value: &Value, key: &str) -> String {
@@ -423,20 +564,22 @@ fn expires_in(iso: &str) -> String {
         return String::new();
     };
     let left = (at.timestamp() - chrono::Utc::now().timestamp()).max(0);
-    format!("Expires in {}:{:02}", left / 60, left % 60)
+    let time = format!("{}:{:02}", left / 60, left % 60);
+    tf("request.expiresIn", &[("time", time.as_str())])
 }
 
 fn ago(iso: &str) -> String {
     let Ok(at) = chrono::DateTime::parse_from_rfc3339(iso) else {
-        return "never".into();
+        return t("time.never");
     };
     let seconds = (chrono::Utc::now().timestamp() - at.timestamp()).max(0);
-    match seconds {
-        0..=59 => "just now".into(),
-        60..=3599 => format!("{} min ago", seconds / 60),
-        3600..=86_399 => format!("{} h ago", seconds / 3600),
-        _ => format!("{} days ago", seconds / 86_400),
-    }
+    let (key, count) = match seconds {
+        0..=59 => return t("time.justNow"),
+        60..=3599 => ("time.minutesAgo", seconds / 60),
+        3600..=86_399 => ("time.hoursAgo", seconds / 3600),
+        _ => ("time.daysAgo", seconds / 86_400),
+    };
+    tf(key, &[("count", count.to_string().as_str())])
 }
 
 // --- the window -------------------------------------------------------------------------
@@ -449,6 +592,16 @@ impl eframe::App for LinkApp {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             crate::dock::set_open(false);
+        } else if cfg!(target_os = "linux") && ctx.input(|i| i.viewport().close_requested()) {
+            // Linux: closing ends this window's process (its icon is another, icon.rs). It
+            // ends here rather than when eframe is done: on GNOME Wayland the process outlived
+            // its closed window, still registered as the window, so Open and a new launch asked
+            // it to show itself and nothing appeared. A Settings change on its way goes first.
+            let until = Instant::now() + Duration::from_secs(2);
+            while lock(&self.shared).choices.writing && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(0);
         }
         crate::dock::apply();
         if let Some(tray) = &self.tray {
@@ -459,7 +612,17 @@ impl eframe::App for LinkApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        let (overview, requests, password, account, update, error, notice) = {
+        // Esc leaves Settings, unless a list or a confirmation is open (Esc closes that first).
+        // Read before the selects run: they close their list on the same Esc.
+        if self.settings
+            && self.confirm.is_none()
+            && !egui::Popup::is_any_open(ctx)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.settings = false;
+            self.focus = Some(Focus::Gear);
+        }
+        let (overview, requests, password, account, update, error, notice, stored) = {
             let mut state = lock(&self.shared);
             if state
                 .notice
@@ -476,26 +639,72 @@ impl eframe::App for LinkApp {
                 state.update.clone(),
                 state.error.clone(),
                 state.notice.clone(),
+                (
+                    state.choices.shown(Field::Theme).to_string(),
+                    state.choices.shown(Field::Language).to_string(),
+                    state.choices.failed(),
+                ),
             )
         };
         // Countdowns and notices move on their own.
         ctx.request_repaint_after(Duration::from_millis(500));
 
         egui::Panel::top("header").show(ui, |ui| {
+            // Its text isn't selectable, so dragging the title moves the window (macOS).
+            ui.style_mut().interaction.selectable_labels = false;
+            // macOS: the title bar is hidden (main.rs) and its buttons sit over this space.
+            if cfg!(target_os = "macos") {
+                ui.add_space(TRAFFIC_LIGHTS);
+            }
+            // macOS: the whole header (as drawn last frame) moves the window, as the title bar
+            // would; the gear, registered after it, keeps its clicks. A double-click minimizes
+            // when the system says so ("Double-click a window's title bar to"); zooming would
+            // fight the height that follows the content.
+            if cfg!(target_os = "macos") {
+                let header = ui.interact(
+                    self.header,
+                    ui.scope_id().with("move"),
+                    egui::Sense::click_and_drag(),
+                );
+                if header.drag_started() {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                if header.double_clicked() && crate::dock::double_click_minimizes() {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                }
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("RealTimeX Link").strong().size(16.0));
+                ui.add(egui::Image::new((self.icon.id(), egui::vec2(24.0, 24.0))));
+                ui.label(semibold("RealTimeX Link").size(16.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let gear = theme::icon_button(ui, theme::Icon::Gear, &t("settings.title"));
+                    self.chrome[0] = Some(gear.id);
+                    if self.focus == Some(Focus::Gear) {
+                        gear.request_focus();
+                        if settled(ctx) {
+                            self.focus = None;
+                        }
+                    }
+                    if gear.clicked() {
+                        self.settings = !self.settings;
+                        self.focus = Some(if self.settings {
+                            Focus::Back
+                        } else {
+                            Focus::Gear
+                        });
+                    }
                     if let Some(machine) = overview
                         .as_ref()
                         .map(|o| text(o, "machine"))
                         .filter(|m| !m.is_empty())
                     {
-                        badge(ui, &machine, Tone::Neutral);
+                        machine_badge(ui, &machine);
                     }
                 });
             });
             ui.add_space(8.0);
+            self.header = ui.min_rect();
         });
 
         egui::Panel::bottom("footer").show(ui, |ui| {
@@ -504,19 +713,21 @@ impl eframe::App for LinkApp {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Link on its own is the whole point here: RealTimeX is a quiet link.
-                    if installed {
-                        if ui.button("Open RealTimeX").clicked() {
-                            desktop::open_realtimex();
-                        }
-                    } else if ui.link("Get RealTimeX").clicked() {
+                    let open = if installed {
+                        primary_button(ui, &t("footer.openRealtimex"))
+                    } else {
+                        ui.link(t("footer.getRealtimex"))
+                    };
+                    self.chrome[1] = Some(open.id);
+                    if open.clicked() {
                         desktop::open_realtimex();
                     }
                     ui.add(
                         egui::Label::new(
                             RichText::new(if installed {
-                                "Control your other computers from RealTimeX."
+                                t("footer.installedHint")
                             } else {
-                                "Control this computer from RealTimeX on another computer."
+                                t("footer.notInstalledHint")
                             })
                             .small()
                             .weak(),
@@ -529,9 +740,16 @@ impl eframe::App for LinkApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let scroll = egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+            // Settings and the tabs scroll apart, and Settings opens at its top (Back showing).
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt(if self.settings { "settings" } else { "tabs" })
+                .auto_shrink([false, false]);
+            if self.settings && self.focus == Some(Focus::Back) {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            let scroll = scroll.show(ui, |ui| {
+                // The views end early (no daemon, Settings); the focus scroll below still runs.
+                'content: {
                     ui.spacing_mut().item_spacing.y = 10.0;
                     if let Some((message, ok, _)) = &notice {
                         alert(
@@ -543,34 +761,41 @@ impl eframe::App for LinkApp {
                     }
                     let Some(overview) = overview.as_ref() else {
                         match &error {
-                            Some(error) => alert(
-                                ui,
-                                Tone::Warning,
-                                "RealTimeX Link's service isn't running",
-                                |ui| {
+                            Some(error) => {
+                                alert(ui, Tone::Warning, &t("service.notRunningTitle"), |ui| {
                                     ui.label(error);
-                                    caption(ui, "Trying again…");
-                                },
-                            ),
+                                    caption(ui, t("service.retrying"));
+                                })
+                            }
                             None => {
                                 ui.spinner();
                             }
                         }
-                        return;
+                        break 'content;
                     };
                     self.update_ui(ui, ctx, update.as_ref());
                     self.requests_ui(ui, ctx, &requests);
                     self.session_ui(ui, overview);
+                    if self.settings {
+                        self.settings_ui(ui, ctx, &stored);
+                        break 'content;
+                    }
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.tab, Tab::ThisComputer, "This computer");
+                        theme::selectable_value(
+                            ui,
+                            &mut self.tab,
+                            Tab::ThisComputer,
+                            &t("tabs.thisComputer"),
+                        );
                         let count = overview
                             .get("clients")
                             .and_then(Value::as_array)
                             .map_or(0, Vec::len);
-                        ui.selectable_value(
+                        theme::selectable_value(
+                            ui,
                             &mut self.tab,
                             Tab::Computers,
-                            format!("Computers · {count}"),
+                            &tf("tabs.computers", &[("count", count.to_string().as_str())]),
                         );
                     });
                     ui.separator();
@@ -589,7 +814,24 @@ impl eframe::App for LinkApp {
                         }
                         Tab::Computers => self.computers_ui(ui, ctx, overview),
                     }
-                });
+                }
+                let focused = ctx.memory(|memory| memory.focused());
+                // A click moves focus too: only the keyboard's moves scroll.
+                let clicked = ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_released());
+                if focused != self.last_focus {
+                    self.last_focus = focused;
+                    // Only this area's own controls: not the gear or the footer's button, not a
+                    // popup's items.
+                    let rect = focused
+                        .filter(|id| !self.chrome.contains(&Some(*id)))
+                        .and_then(|id| ctx.read_response(id))
+                        .filter(|r| r.layer_id == ui.layer_id())
+                        .map(|r| r.rect);
+                    if let (Some(rect), false) = (rect, clicked) {
+                        ui.scroll_to_rect(rect, None);
+                    }
+                }
+            });
             fit_height(ctx, scroll.content_size.y - scroll.inner_rect.height());
         });
 
@@ -610,26 +852,32 @@ impl LinkApp {
         alert(
             ui,
             Tone::Info,
-            &format!("RealTimeX Link {latest} is available"),
+            &tf("update.available", &[("version", latest.as_str())]),
             |ui| {
                 ui.horizontal(|ui| {
-                    caption(ui, format!("You have {}.", text(update, "current")));
+                    caption(
+                        ui,
+                        tf(
+                            "update.current",
+                            &[("version", text(update, "current").as_str())],
+                        ),
+                    );
                     let page = text(update, "page");
-                    if !page.is_empty() && ui.link("What's new").clicked() {
+                    if !page.is_empty() && ui.link(t("update.whatsNew")).clicked() {
                         desktop::open_url(&page);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         match update.get("busy").and_then(Value::as_str) {
                             Some(busy) => {
                                 ui.label(if busy == "downloading" {
-                                    "Downloading…"
+                                    t("update.downloading")
                                 } else {
-                                    "Installing…"
+                                    t("update.installing")
                                 });
                                 ui.spinner();
                             }
                             None => {
-                                if ui.button(RichText::new("Update").strong()).clicked() {
+                                if primary_button(ui, &t("update.update")).clicked() {
                                     start_update(&self.shared, &self.refresh, ctx);
                                 }
                             }
@@ -637,7 +885,7 @@ impl LinkApp {
                     });
                 });
                 if let Some(error) = error {
-                    ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).1));
+                    ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).2));
                 }
             },
         );
@@ -650,57 +898,60 @@ impl LinkApp {
         let signing_in = account.get("signingIn") == Some(&Value::Bool(true));
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Account").strong().size(15.0));
+                ui.label(semibold(t("account.title")).size(15.0));
                 if signed_in {
-                    badge(ui, "Signed in", Tone::Success);
+                    badge(ui, &t("account.signedIn"), Tone::Success);
                 }
             });
             if let Some(error) = account.get("error").and_then(Value::as_str) {
-                ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).1));
+                ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).2));
             }
             if signed_in {
                 ui.horizontal(|ui| {
                     let email = text(account, "email");
                     ui.label(&email);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Sign out").clicked() {
+                        if ui.button(t("account.signOut")).clicked() {
                             self.confirm = Some(Confirm::SignOut);
                         }
                     });
                 });
                 if text(account, "via") == "realtimex" {
-                    caption(ui, "Signed in through RealTimeX on this computer.");
+                    caption(ui, t("account.viaRealtimex"));
                 }
                 return;
             }
-            caption(ui, "Sign in to your RealTimeX account, so other computers can reach this one through RealTimeX's relay and your own computers can connect without asking.");
+            caption(ui, t("account.pitch"));
             if signing_in {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Finish signing in in your browser…");
+                    ui.label(t("account.finishInBrowser"));
                 });
             }
             ui.horizontal_wrapped(|ui| {
                 let label = if signing_in {
-                    "Open the browser again"
+                    t("account.openBrowserAgain")
                 } else {
-                    "Sign in"
+                    t("account.signIn")
                 };
-                if ui.button(RichText::new(label).strong()).clicked() {
+                if primary_button(ui, &label).clicked() {
                     self.sign_in(ctx);
                 }
                 if let Some(offer) = account.get("offer").and_then(Value::as_str) {
                     let who = if offer.is_empty() {
-                        "RealTimeX's account"
+                        t("account.realtimexAccount")
                     } else {
-                        offer
+                        offer.to_string()
                     };
-                    if ui.button(format!("Continue as {who}")).clicked() {
+                    if ui
+                        .button(tf("account.continueAs", &[("name", who.as_str())]))
+                        .clicked()
+                    {
                         self.act(
                             ctx,
                             "/v1/account/use-realtimex",
                             json!({}),
-                            "Signed in with RealTimeX's account.",
+                            &t("account.signedInWithRealtimex"),
                         );
                     }
                 }
@@ -715,7 +966,7 @@ impl LinkApp {
             let api = lock(&shared).api.clone();
             let answer = match api {
                 Some(api) => api.post("/v1/account/sign-in", json!({})),
-                None => Err(anyhow::anyhow!("RealTimeX Link's service is not running")),
+                None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
             };
             match answer.map(|answer| text(&answer, "url")) {
                 Ok(url) if !url.is_empty() => desktop::open_url(&url),
@@ -735,43 +986,53 @@ impl LinkApp {
             let name = text(request, "clientName");
             let reference = text(request, "ref");
             let same = request.pointer("/account/sameAccount") == Some(&Value::Bool(true));
-            alert(ui, Tone::Info, &format!("{name} wants to connect"), |ui| {
-                let mut detail = vec!["New computer".to_string()];
+            let title = tf("request.wantsToConnect", &[("name", name.as_str())]);
+            alert(ui, Tone::Info, &title, |ui| {
+                let mut detail = vec![t("request.newComputer")];
                 let machine = text(request, "machine");
                 if !machine.is_empty() {
                     detail.push(machine);
                 }
                 detail.push(if same {
-                    "your account".into()
+                    t("request.yourAccount")
                 } else {
-                    "not your account".into()
+                    t("request.notYourAccount")
                 });
                 if let Some(login) = request.get("tailnetLogin").and_then(Value::as_str) {
-                    detail.push(format!("Tailscale user {login}"));
+                    detail.push(tf("request.tailscaleUser", &[("login", login)]));
                 }
                 ui.label(detail.join(" · "));
                 if !same {
-                    ui.label(RichText::new("This computer belongs to someone else. Only allow it if you expect it.").color(tone_colors(ui, Tone::Warning).1));
+                    ui.label(
+                        RichText::new(t("request.someoneElse"))
+                            .color(tone_colors(ui, Tone::Warning).2),
+                    );
                 }
+                let expires = expires_in(&text(request, "expiresAt"));
                 caption(
                     ui,
-                    format!(
-                        "{} · Once allowed, it connects without asking next time.",
-                        expires_in(&text(request, "expiresAt"))
-                    ),
+                    tf("request.remembered", &[("expires", expires.as_str())]),
                 );
                 ui.horizontal_wrapped(|ui| {
                     let decide = |decision: &str, done: String| {
-                        act(&self.shared, &self.refresh, ctx, "/v1/host/connection-requests/decide", json!({ "requestRef": reference, "decision": decision }), &done);
+                        act(
+                            &self.shared,
+                            &self.refresh,
+                            ctx,
+                            "/v1/host/connection-requests/decide",
+                            json!({ "requestRef": reference, "decision": decision }),
+                            &done,
+                        );
                     };
-                    if ui.button(RichText::new("Allow control").strong()).clicked() {
-                        decide("allow-control", format!("{name} can now control this computer. It connects without asking next time."));
+                    let named = [("name", name.as_str())];
+                    if primary_button(ui, &t("request.allowControl")).clicked() {
+                        decide("allow-control", tf("request.allowedControl", &named));
                     }
-                    if ui.button("View only").clicked() {
-                        decide("allow-view", format!("{name} can now view this computer. It connects without asking next time."));
+                    if ui.button(t("request.viewOnly")).clicked() {
+                        decide("allow-view", tf("request.allowedView", &named));
                     }
-                    if ui.button("Deny").clicked() {
-                        decide("deny", format!("Denied. {name} was not let in."));
+                    if ui.button(t("request.deny")).clicked() {
+                        decide("deny", tf("request.denied", &named));
                     }
                 });
             });
@@ -788,12 +1049,13 @@ impl LinkApp {
         alert(
             ui,
             Tone::Warning,
-            &format!("{name} is controlling this computer"),
+            &tf("session.controlling", &[("name", name.as_str())]),
             |ui| {
                 ui.horizontal(|ui| {
-                    caption(ui, format!("Since {}", ago(&text(&session, "since"))));
+                    let since = ago(&text(&session, "since"));
+                    caption(ui, tf("session.since", &[("time", since.as_str())]));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Stop").clicked() {
+                        if ui.button(t("session.stop")).clicked() {
                             self.confirm = Some(Confirm::StopSession(name.clone()));
                         }
                     });
@@ -821,70 +1083,73 @@ impl LinkApp {
             .pointer("/publicExposure/state")
             .and_then(Value::as_str)
             == Some("ready");
+        // The badge (host.state.*) and the line under it (host.description.*).
         let (label, tone, description) = match state.as_str() {
-            "off" => ("Off", Tone::Neutral, ""),
-            "unsupported" => (
-                "Not supported",
-                Tone::Neutral,
-                "Remote control isn't available on this desktop.",
-            ),
-            "error" => (
-                "Error",
-                Tone::Danger,
-                "Something went wrong. Details below.",
-            ),
-            "waiting-tailscale" if relayed && missing.is_empty() => (
-                "Ready",
-                Tone::Success,
-                "Other computers can connect through RealTimeX's relay (Tailscale isn't running).",
-            ),
-            "waiting-tailscale" => (
-                "Waiting",
-                Tone::Warning,
-                "No other computer can connect until Tailscale runs.",
-            ),
-            "starting" => ("Starting", Tone::Neutral, "Getting ready…"),
-            _ if !missing.is_empty() => (
-                "Needs setup",
-                Tone::Warning,
-                "Allow the macOS permissions below, then other computers can connect.",
-            ),
-            _ if relayed => (
-                "Ready",
-                Tone::Success,
-                "Other computers can connect over Tailscale or through RealTimeX's relay.",
-            ),
-            _ => (
-                "Ready",
-                Tone::Success,
-                "Other computers on your Tailscale network can connect.",
-            ),
+            "off" => ("off", Tone::Neutral, ""),
+            "unsupported" => ("unsupported", Tone::Neutral, "unsupported"),
+            "error" => ("error", Tone::Danger, "error"),
+            "waiting-tailscale" if relayed && missing.is_empty() => {
+                ("ready", Tone::Success, "relayOnly")
+            }
+            "waiting-tailscale" => ("waiting", Tone::Warning, "waitingTailscale"),
+            "starting" => ("starting", Tone::Neutral, "starting"),
+            _ if !missing.is_empty() => ("needsSetup", Tone::Warning, "needsPermissions"),
+            _ if relayed => ("ready", Tone::Success, "tailscaleOrRelay"),
+            _ => ("ready", Tone::Success, "tailscale"),
         };
         card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("This computer").strong().size(15.0));
-                badge(ui, label, tone);
+            // The switch and its label sit beside the title, or on a line of their own when the
+            // window is too narrow for both (the minimum width, longer languages).
+            let allow_label = t("host.allowRemoteControl");
+            let mut changed = false;
+            let mut switch = |ui: &mut egui::Ui, allow: &mut bool| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if toggle(ui, &mut allow).changed() {
-                        if allow {
-                            self.act(
-                                ctx,
-                                "/v1/host/settings",
-                                json!({ "allowIncoming": true }),
-                                "Remote control is on.",
-                            );
-                        } else {
-                            self.confirm = Some(Confirm::TurnOff);
-                        }
-                    }
-                    ui.label("Allow remote control");
+                    changed |= toggle(ui, allow).changed();
+                    ui.label(allow_label.as_str());
                 });
+            };
+            let mut beside = true;
+            ui.horizontal(|ui| {
+                ui.label(semibold(t("host.title")).size(15.0));
+                badge(ui, &t(&format!("host.state.{label}")), tone);
+                let needed = egui::WidgetText::from(allow_label.as_str())
+                    .into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::TextStyle::Body,
+                    )
+                    .size()
+                    .x
+                    + 2.2 * ui.spacing().interact_size.y
+                    // Between the label and the switch: the cursor already stands past the
+                    // spacing after the badge.
+                    + ui.spacing().item_spacing.x;
+                beside = ui.available_width() >= needed;
+                if beside {
+                    switch(ui, &mut allow);
+                }
             });
+            if !beside {
+                ui.horizontal(|ui| switch(ui, &mut allow));
+            }
+            if changed {
+                if allow {
+                    self.act(
+                        ctx,
+                        "/v1/host/settings",
+                        json!({ "allowIncoming": true }),
+                        &t("host.turnedOn"),
+                    );
+                } else {
+                    self.confirm = Some(Confirm::TurnOff);
+                }
+            }
             if state == "off" {
-                ui.label("Remote control is off. No other computer can see or use this screen. Turn it on to give another computer this App ID and password.");
+                ui.label(t("host.offExplained"));
                 return;
             }
-            caption(ui, description);
+            caption(ui, t(&format!("host.description.{description}")));
             if state == "unsupported" || state == "error" {
                 let detail = text(overview, "stateDetail");
                 if !detail.is_empty() {
@@ -892,94 +1157,90 @@ impl LinkApp {
                 }
             }
             if !missing.is_empty() {
-                alert(
-                    ui,
-                    Tone::Warning,
-                    "Allow RealTimeX Link to see and control this Mac",
-                    |ui| {
-                        ui.label("macOS asks for this once. Open each setting, turn on RealTimeX Link, then check again.");
-                        for (name, title) in [
-                            ("screenRecording", "Screen Recording"),
-                            ("accessibility", "Accessibility"),
-                        ] {
-                            ui.horizontal(|ui| {
-                                ui.label(title);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if missing.contains(&name) {
-                                            if ui.button("Open Settings").clicked() {
-                                                self.act(
-                                                    ctx,
-                                                    "/v1/host/permissions/request",
-                                                    json!({ "name": name }),
-                                                    "",
-                                                );
-                                                desktop::open_privacy_settings(name);
-                                            }
-                                        } else {
-                                            badge(ui, "Granted", Tone::Success);
+                alert(ui, Tone::Warning, &t("permissions.title"), |ui| {
+                    ui.label(t("permissions.explain"));
+                    for (name, title) in [
+                        ("screenRecording", t("permissions.screenRecording")),
+                        ("accessibility", t("permissions.accessibility")),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(title);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if missing.contains(&name) {
+                                        if ui.button(t("permissions.openSettings")).clicked() {
+                                            self.act(
+                                                ctx,
+                                                "/v1/host/permissions/request",
+                                                json!({ "name": name }),
+                                                "",
+                                            );
+                                            desktop::open_privacy_settings(name);
                                         }
-                                    },
-                                );
-                            });
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                            if ui.button("Check again").clicked() {
-                                let _ = self.refresh.send(());
-                            }
+                                    } else {
+                                        badge(ui, &t("permissions.granted"), Tone::Success);
+                                    }
+                                },
+                            );
                         });
-                    },
-                );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui.button(t("permissions.checkAgain")).clicked() {
+                            let _ = self.refresh.send(());
+                        }
+                    });
+                });
             }
             if state == "waiting-tailscale" {
-                alert(ui, Tone::Info, "Tailscale isn't running", |ui| {
-                    ui.label("Other computers reach this one over your Tailscale network. Start Tailscale and sign in.");
+                alert(ui, Tone::Info, &t("tailscale.notRunningTitle"), |ui| {
+                    ui.label(t("tailscale.notRunning"));
                 });
             }
             ui.add_space(4.0);
-            caption(ui, "App ID");
+            caption(ui, t("host.appId"));
             ui.horizontal(|ui| {
                 let app_id = text(overview, "appId");
                 ui.label(RichText::new(&app_id).monospace().size(17.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Copy").clicked() {
+                    if ui.button(t("common.copy")).clicked() {
                         ctx.copy_text(app_id.clone());
                         lock(&self.shared).notice =
-                            Some(("App ID copied.".into(), true, Instant::now()));
+                            Some((t("host.appIdCopied"), true, Instant::now()));
                     }
                 });
             });
-            caption(ui, "Password");
+            caption(ui, t("host.password"));
             match self.editing_password.as_mut() {
                 Some(draft) => {
                     ui.add(
                         egui::TextEdit::singleline(draft)
-                            .hint_text("New password, at least 8 characters")
+                            .hint_text(t("password.newHint"))
                             .desired_width(f32::INFINITY),
                     );
                     ui.label(
-                        RichText::new(
-                            "Every computer is signed out and must use the new password.",
-                        )
-                        .small()
-                        .color(tone_colors(ui, Tone::Warning).1),
+                        RichText::new(t("password.signsOutAll"))
+                            .small()
+                            .color(tone_colors(ui, Tone::Warning).2),
                     );
                     let short = draft.chars().count() < 8;
                     let mut done = false;
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(!short, egui::Button::new("Save")).clicked() {
+                        if ui
+                            .add_enabled(!short, egui::Button::new(t("common.save")))
+                            .clicked()
+                        {
                             act(
                                 &self.shared,
                                 &self.refresh,
                                 ctx,
                                 "/v1/host/password/set",
                                 json!({ "password": draft.clone() }),
-                                "Password changed. Every computer must sign in again.",
+                                &t("password.changed"),
                             );
                             done = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(t("common.cancel")).clicked() {
                             done = true;
                         }
                     });
@@ -996,13 +1257,17 @@ impl LinkApp {
                         };
                         ui.label(RichText::new(shown).monospace().size(17.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Copy").clicked() {
+                            if ui.button(t("common.copy")).clicked() {
                                 ctx.copy_text(password.to_string());
                                 lock(&self.shared).notice =
-                                    Some(("Password copied.".into(), true, Instant::now()));
+                                    Some((t("password.copied"), true, Instant::now()));
                             }
                             if ui
-                                .button(if self.show_password { "Hide" } else { "Show" })
+                                .button(if self.show_password {
+                                    t("common.hide")
+                                } else {
+                                    t("common.show")
+                                })
                                 .clicked()
                             {
                                 self.show_password = !self.show_password;
@@ -1010,89 +1275,88 @@ impl LinkApp {
                         });
                     });
                     ui.horizontal(|ui| {
-                        if ui.link("New password").clicked() {
+                        if ui.link(t("password.new")).clicked() {
                             self.confirm = Some(Confirm::NewPassword);
                         }
-                        if ui.link("Set my own").clicked() {
+                        if ui.link(t("password.setOwn")).clicked() {
                             self.editing_password = Some(String::new());
                         }
                         let changed = text(overview, "passwordChangedAt");
                         if !changed.is_empty() {
-                            caption(ui, format!("Changed {}", ago(&changed)));
+                            caption(
+                                ui,
+                                tf("password.changedAgo", &[("time", ago(&changed).as_str())]),
+                            );
                         }
                     });
                 }
             }
             ui.separator();
-            ui.label(RichText::new("When a new computer asks to connect").strong());
+            ui.label(semibold(t("policy.title")));
             let policy = text(overview, "newComputerPolicy");
             let policies = [
-                (
-                    "ask",
-                    "Ask me",
-                    "You allow or deny each one here; it expires after a minute",
-                ),
+                ("ask", t("policy.ask"), t("policy.askHelp")),
                 (
                     "own-account",
-                    "Allow my own computers without asking",
-                    "New computers on your account are let in at once; others ask",
+                    t("policy.ownAccount"),
+                    t("policy.ownAccountHelp"),
                 ),
                 (
                     "password-only",
-                    "Password only",
-                    "New computers need the App ID and password; no requests",
+                    t("policy.passwordOnly"),
+                    t("policy.passwordOnlyHelp"),
                 ),
             ];
             let mut chosen = policy.clone();
             let current = policies
                 .iter()
                 .find(|(id, ..)| *id == policy)
-                .map_or("Ask me", |(_, label, _)| label);
-            egui::ComboBox::from_id_salt("policy")
+                .map_or_else(|| t("policy.ask"), |(_, label, _)| label.clone());
+            let combo = egui::ComboBox::from_id_salt("policy")
                 .width(ui.available_width())
                 .selected_text(current)
                 .show_ui(ui, |ui| {
                     for (id, label, help) in policies {
-                        ui.selectable_value(&mut chosen, id.to_string(), label)
+                        theme::selectable_value(ui, &mut chosen, id.to_string(), &label)
                             .on_hover_text(help);
                     }
                 });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
             if chosen != policy {
                 self.act(
                     ctx,
                     "/v1/host/settings",
                     json!({ "newComputerPolicy": chosen }),
-                    "Saved.",
+                    &t("common.saved"),
                 );
             }
-            ui.label(RichText::new("Access for new computers").strong());
+            ui.label(semibold(t("access.title")));
             let control =
                 overview.pointer("/defaultPermissions/control") == Some(&Value::Bool(true));
             let mut access = control;
-            egui::ComboBox::from_id_salt("access")
+            let combo = egui::ComboBox::from_id_salt("access")
                 .width(ui.available_width())
-                .selected_text(if control { "Full access" } else { "View only" })
+                .selected_text(access_label(control))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut access, true, "Full access")
-                        .on_hover_text(
-                            "See the screen, use the mouse, keyboard, clipboard and files",
-                        );
-                    ui.selectable_value(&mut access, false, "View only")
-                        .on_hover_text("See the screen only");
+                    theme::selectable_value(ui, &mut access, true, &access_label(true))
+                        .on_hover_text(t("access.fullHelp"));
+                    theme::selectable_value(ui, &mut access, false, &access_label(false))
+                        .on_hover_text(t("access.viewHelp"));
                 });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
             if access != control {
                 self.act(
                     ctx,
                     "/v1/host/settings",
                     json!({ "defaultPermissions": { "view": true, "control": access } }),
-                    "New computers get this access. Computers already here keep theirs.",
+                    &t("access.defaultsSaved"),
                 );
             }
         });
     }
 
     fn computers_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, overview: &Value) {
-        caption(ui, "Each one signed in with the password, or you allowed it. Changing the password signs them all out.");
+        caption(ui, t("computers.explain"));
         let clients = overview
             .get("clients")
             .and_then(Value::as_array)
@@ -1100,9 +1364,7 @@ impl LinkApp {
             .unwrap_or_default();
         if clients.is_empty() {
             card(ui, |ui| {
-                ui.label(
-                    "No computers yet. Give another computer this App ID and password to connect.",
-                );
+                ui.label(t("computers.none"));
             });
         }
         for client in clients {
@@ -1112,14 +1374,14 @@ impl LinkApp {
             let control = client.pointer("/permissions/control") == Some(&Value::Bool(true));
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&name).strong());
+                    ui.label(semibold(&name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if revoked {
-                            badge(ui, "Blocked", Tone::Danger);
+                            badge(ui, &t("computers.blocked"), Tone::Danger);
                         } else if control {
-                            badge(ui, "Full access", Tone::Info);
+                            badge(ui, &access_label(true), Tone::Info);
                         } else {
-                            badge(ui, "View only", Tone::Neutral);
+                            badge(ui, &access_label(false), Tone::Neutral);
                         }
                     });
                 });
@@ -1128,29 +1390,33 @@ impl LinkApp {
                 if !machine.is_empty() {
                     detail.push(machine);
                 }
-                detail.push(format!("last used {}", ago(&text(&client, "lastUsedAt"))));
+                let used = ago(&text(&client, "lastUsedAt"));
+                detail.push(tf("computers.lastUsed", &[("time", used.as_str())]));
                 match text(&client, "admittedBy").as_str() {
-                    "password" => detail.push("added with the password".into()),
-                    "request" => detail.push("you allowed it".into()),
-                    "account" => detail.push("your account".into()),
+                    "password" => detail.push(t("computers.addedWithPassword")),
+                    "request" => detail.push(t("computers.youAllowed")),
+                    "account" => detail.push(t("request.yourAccount")),
                     _ => {}
                 }
                 caption(ui, detail.join(" · "));
                 let mut access = control;
                 ui.add_enabled_ui(!revoked, |ui| {
-                    egui::ComboBox::from_id_salt(("access", &id))
+                    let combo = egui::ComboBox::from_id_salt(("access", &id))
                         .width(ui.available_width())
-                        .selected_text(if control { "Full access" } else { "View only" })
+                        .selected_text(access_label(control))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut access, true, "Full access");
-                            ui.selectable_value(&mut access, false, "View only");
+                            theme::selectable_value(ui, &mut access, true, &access_label(true));
+                            theme::selectable_value(ui, &mut access, false, &access_label(false));
                         });
+                    keep_focus(&mut self.open_combo, ctx, &combo.response);
                 });
                 if access != control {
-                    let done = format!(
-                        "{name} now has {}.",
-                        if access { "full access" } else { "view only" }
-                    );
+                    let key = if access {
+                        "computers.nowFull"
+                    } else {
+                        "computers.nowView"
+                    };
+                    let done = tf(key, &[("name", name.as_str())]);
                     self.act(
                         ctx,
                         "/v1/host/clients/permissions",
@@ -1158,20 +1424,43 @@ impl LinkApp {
                         &done,
                     );
                 }
+                let named = [("name", name.as_str())];
                 ui.horizontal(|ui| {
-                    if !revoked && ui.button("Disconnect").clicked() {
-                        self.act(ctx, "/v1/host/clients/disconnect", json!({ "id": id }), &format!("{name} was disconnected. It can connect again; block it to stop that."));
+                    if !revoked && ui.button(t("computers.disconnect")).clicked() {
+                        self.act(
+                            ctx,
+                            "/v1/host/clients/disconnect",
+                            json!({ "id": id }),
+                            &tf("computers.disconnected", &named),
+                        );
                     }
                     if revoked {
-                        if ui.button("Allow again").clicked() {
-                            self.act(ctx, "/v1/host/clients/allow", json!({ "id": id }), &format!("{name} can connect again."));
+                        if ui.button(t("computers.allowAgain")).clicked() {
+                            self.act(
+                                ctx,
+                                "/v1/host/clients/allow",
+                                json!({ "id": id }),
+                                &tf("computers.allowedAgain", &named),
+                            );
                         }
-                    } else if ui.button("Block").clicked() {
-                        self.act(ctx, "/v1/host/clients/revoke", json!({ "id": id }), &format!("{name} can't connect until you allow it again."));
+                    } else if ui.button(t("computers.block")).clicked() {
+                        self.act(
+                            ctx,
+                            "/v1/host/clients/revoke",
+                            json!({ "id": id }),
+                            &tf("computers.blockedDone", &named),
+                        );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Remove").on_hover_text(format!("Remove {name}")).clicked() {
-                            self.confirm = Some(Confirm::Remove { id: id.clone(), name: name.clone() });
+                        if ui
+                            .button(t("computers.remove"))
+                            .on_hover_text(tf("computers.removeHover", &named))
+                            .clicked()
+                        {
+                            self.confirm = Some(Confirm::Remove {
+                                id: id.clone(),
+                                name: name.clone(),
+                            });
                         }
                     });
                 });
@@ -1179,55 +1468,146 @@ impl LinkApp {
         }
     }
 
+    /// Settings, in place of the tabs: Back, then the theme and the language. A change is saved
+    /// at once (POST /v1/appearance); RealTimeX's own changes show on the next poll.
+    fn settings_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        (stored_theme, language, failed): &(String, String, Vec<(Field, String)>),
+    ) {
+        ui.horizontal(|ui| {
+            let back = theme::icon_button(ui, theme::Icon::ArrowLeft, &t("settings.back"));
+            if self.focus == Some(Focus::Back) {
+                back.request_focus();
+                if settled(ctx) {
+                    self.focus = None;
+                }
+            }
+            if back.clicked() {
+                self.settings = false;
+                self.focus = Some(Focus::Gear);
+            }
+            ui.label(semibold(t("settings.title")).size(15.0));
+        });
+        ui.separator();
+        if !failed.is_empty() {
+            alert(ui, Tone::Danger, &t("settings.saveFailedTitle"), |ui| {
+                ui.label(t("settings.saveFailed"));
+                if ui.button(t("settings.tryAgain")).clicked() {
+                    for (field, value) in failed {
+                        save_setting(&self.shared, &self.refresh, ctx, *field, value);
+                    }
+                }
+            });
+        }
+        card(ui, |ui| {
+            ui.label(semibold(t("settings.theme")));
+            caption(ui, t("settings.themeHelp"));
+            let theme_label = |value: &str| {
+                t(match value {
+                    "light" => "settings.themeLight",
+                    "dark" => "settings.themeDark",
+                    _ => "settings.themeSystem",
+                })
+            };
+            let mut chosen = stored_theme.clone();
+            let combo = egui::ComboBox::from_id_salt("theme")
+                .width(ui.available_width())
+                .selected_text(theme_label(stored_theme.as_str()))
+                .show_ui(ui, |ui| {
+                    for value in ["system", "light", "dark"] {
+                        theme::selectable_value(
+                            ui,
+                            &mut chosen,
+                            value.to_string(),
+                            &theme_label(value),
+                        );
+                    }
+                });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
+            if chosen != *stored_theme {
+                save_setting(&self.shared, &self.refresh, ctx, Field::Theme, &chosen);
+            }
+            ui.add_space(8.0);
+            ui.label(semibold(t("settings.language")));
+            caption(ui, t("settings.languageHelp"));
+            // The stored language, as the list names it: "system", a locale shown here, or one
+            // that can't be (the select then says English, and the note why).
+            let unavailable = crate::i18n::unavailable(language);
+            let current = if language == "system" || language.is_empty() {
+                "system".to_string()
+            } else if unavailable.is_some() {
+                language.clone()
+            } else {
+                crate::i18n::effective_locale(language).code.to_string()
+            };
+            let system_default = tf(
+                "settings.systemDefault",
+                &[("language", crate::i18n::effective_locale("system").endonym)],
+            );
+            let selected = match current.as_str() {
+                "system" => system_default.clone(),
+                _ => crate::i18n::effective_locale(language).endonym.to_string(),
+            };
+            let mut chosen = current.clone();
+            let combo = egui::ComboBox::from_id_salt("language")
+                .width(ui.available_width())
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    theme::selectable_value(ui, &mut chosen, "system".to_string(), &system_default);
+                    for locale in crate::i18n::offered_languages() {
+                        theme::selectable_value_in(
+                            ui,
+                            &mut chosen,
+                            locale.code.to_string(),
+                            locale.endonym,
+                            crate::cjk::endonym_family(locale.code),
+                        );
+                    }
+                });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
+            if let Some(name) = &unavailable {
+                caption(ui, tf("settings.cantShow", &[("language", name.as_str())]));
+            }
+            if chosen != current {
+                save_setting(&self.shared, &self.refresh, ctx, Field::Language, &chosen);
+            }
+            if desktop::realtimex_app().is_some() {
+                ui.add_space(4.0);
+                caption(ui, t("settings.realtimexNote"));
+            }
+        });
+    }
+
     /// Changes that end someone's access ask first.
     fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(confirm) = &self.confirm else { return };
-        let (title, message, action) = match confirm {
-            Confirm::TurnOff => (
-                "Turn off remote control?".to_string(),
-                "No other computer can see or use this screen until you turn it on again. Any session ends now.".to_string(),
-                "Turn off",
-            ),
-            Confirm::NewPassword => (
-                "Make a new password?".to_string(),
-                "Every computer is signed out and must use the new password.".to_string(),
-                "New password",
-            ),
-            Confirm::StopSession(name) => (
-                format!("Stop {name}'s session?"),
-                "It stops seeing and controlling this computer now. It can connect again unless you block it.".to_string(),
-                "Stop",
-            ),
-            Confirm::Remove { name, .. } => (
-                "Remove computer".to_string(),
-                format!("Remove {name}? Its session ends. With the password it can connect again as a new computer."),
-                "Remove",
-            ),
-            Confirm::SignOut => (
-                "Sign out?".to_string(),
-                "Your own computers ask before connecting again, and the relay can't be set up again until you sign in. Computers already here keep their access.".to_string(),
-                "Sign out",
-            ),
+        // confirm.<which>.title, .message and .action; {name} where there is one.
+        let (which, name) = match confirm {
+            Confirm::TurnOff => ("turnOff", ""),
+            Confirm::NewPassword => ("newPassword", ""),
+            Confirm::StopSession(name) => ("stop", name.as_str()),
+            Confirm::Remove { name, .. } => ("remove", name.as_str()),
+            Confirm::SignOut => ("signOut", ""),
         };
+        let part = |part: &str| tf(&format!("confirm.{which}.{part}"), &[("name", name)]);
+        let (title, message, action) = (part("title"), part("message"), part("action"));
         let mut close = false;
         let mut confirmed = false;
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
             ui.set_max_width(340.0);
-            ui.label(RichText::new(title).strong().size(15.0));
+            ui.label(semibold(title).size(15.0));
             ui.label(message);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
-                    .button(
-                        RichText::new(action)
-                            .strong()
-                            .color(tone_colors(ui, Tone::Danger).1),
-                    )
+                    .button(semibold(action).color(tone_colors(ui, Tone::Danger).2))
                     .clicked()
                 {
                     confirmed = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t("common.cancel")).clicked() {
                     close = true;
                 }
             });
@@ -1238,29 +1618,32 @@ impl LinkApp {
                     ctx,
                     "/v1/host/settings",
                     json!({ "allowIncoming": false }),
-                    "Remote control is off. No other computer can connect.",
+                    &t("host.turnedOff"),
                 ),
                 Some(Confirm::NewPassword) => self.act(
                     ctx,
                     "/v1/host/password/regenerate",
                     json!({}),
-                    "New password. Every computer must sign in again.",
+                    &t("password.regenerated"),
                 ),
                 Some(Confirm::StopSession(name)) => self.act(
                     ctx,
                     "/v1/host/stop-session",
                     json!({}),
-                    &format!("{name}'s session ended."),
+                    &tf("session.ended", &[("name", name.as_str())]),
                 ),
                 Some(Confirm::Remove { id, name }) => self.act(
                     ctx,
                     "/v1/host/clients/remove",
                     json!({ "id": id }),
-                    &format!("{name} was removed."),
+                    &tf("computers.removed", &[("name", name.as_str())]),
                 ),
-                Some(Confirm::SignOut) => {
-                    self.act(ctx, "/v1/account/sign-out", json!({}), "Signed out.")
-                }
+                Some(Confirm::SignOut) => self.act(
+                    ctx,
+                    "/v1/account/sign-out",
+                    json!({}),
+                    &t("account.signedOut"),
+                ),
                 None => {}
             }
         } else if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

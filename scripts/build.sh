@@ -59,8 +59,13 @@ else
     cp "$BUILT/$bin" "$OUTPUT_DIR/$bin"
     chmod +x "$OUTPUT_DIR/$bin"
   done
-  # The menu entry's and the autostart entry's icon (rtx-linkd's install.rs, autostart.rs).
+  # The autostart entry's icon (rtx-linkd's autostart.rs) and the icon theme's sizes, which its
+  # install.rs puts into hicolor for the menu entry and the dock.
   cp assets/icon-256.png "$OUTPUT_DIR/icon.png"
+  mkdir -p "$OUTPUT_DIR/icons"
+  for size in 16 24 32 48 64 128 256 512; do
+    cp "assets/icon-$size.png" "$OUTPUT_DIR/icons/$size.png"
+  done
   OUT="$OUTPUT_DIR"
 fi
 "$OUT/rtx-linkd" --version

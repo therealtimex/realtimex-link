@@ -115,12 +115,14 @@ fn upgrade_tokens(mut client: Client) -> Client {
     client
 }
 
+/// A token entry past its expiry. One without a readable `expiresAt` (saved before tokens
+/// expired) counts as expired too: it would otherwise work forever. Its client signs in again.
 fn expired(entry: &Value, now: i64) -> bool {
     entry
         .get("expiresAt")
         .and_then(Value::as_str)
         .and_then(parse_iso)
-        .is_some_and(|at| at.timestamp_millis() <= now)
+        .is_none_or(|at| at.timestamp_millis() <= now)
 }
 
 pub struct Connected {
@@ -348,6 +350,24 @@ impl ClientStore {
                 return Some(KeyState::Reset);
             }
             Some(KeyState::Ok(public(client)))
+        })
+    }
+
+    /// A saved client with this client id holds a client key that still works (not revoked, from
+    /// the current password generation): only that key proves the client is who it says.
+    pub fn has_working_key(&self, client_id: &str) -> bool {
+        let id = clean_text(Some(&json!(client_id)), "");
+        if id.is_empty() {
+            return false;
+        }
+        let generation = self.generation();
+        self.with(|clients| {
+            clients.iter().any(|c| {
+                str_of(c, "clientId") == id
+                    && c.get("revoked") != Some(&Value::Bool(true))
+                    && !str_of(c, "keyHash").is_empty()
+                    && c.get("keyGeneration").and_then(Value::as_i64) == Some(generation)
+            })
         })
     }
 
@@ -588,7 +608,8 @@ mod tests {
                 STORE_KEY,
                 &json!([{
                     "id": "a1", "clientId": "c1", "name": "Mac", "permissions": { "view": true, "control": true },
-                    "revoked": false, "tokenHash": hash_token(token), "lastActor": "agent", "custom": 7
+                    "revoked": false, "tokenHash": hash_token(token), "lastActor": "agent", "custom": 7,
+                    "tokenExpiresAt": "2999-01-01T00:00:00.000Z"
                 }]),
             )
             .unwrap();
@@ -599,5 +620,43 @@ mod tests {
         assert_eq!(clients.list()[0]["custom"], 7);
         clients.sign_out("a1").unwrap();
         assert!(clients.authenticate(token, None).is_none());
+    }
+
+    #[test]
+    fn tokens_without_an_expiry_are_expired() {
+        let (dir, _) = store();
+        let saved = Arc::new(Store::open(dir.path()).unwrap());
+        saved
+            .set(
+                STORE_KEY,
+                &json!([{
+                    "id": "a1", "clientId": "c1", "name": "Mac", "permissions": { "view": true },
+                    "revoked": false, "tokenHash": hash_token("legacy-token"), "lastActor": "person"
+                }, {
+                    "id": "a2", "clientId": "c2", "name": "PC", "permissions": { "view": true },
+                    "revoked": false,
+                    "tokens": { "person": { "hash": hash_token("odd-token"), "expiresAt": "soon" } }
+                }]),
+            )
+            .unwrap();
+        let clients = ClientStore::new(saved);
+        for token in ["legacy-token", "odd-token"] {
+            assert!(clients.authenticate(token, None).is_none(), "{token}");
+            // Known and expired: the controller is told to sign in again.
+            assert!(clients.token_expired(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn only_a_current_client_key_makes_a_client_id_taken() {
+        let (_dir, clients) = store();
+        let defaults = json!({ "view": true });
+        connect(&clients, "ctl-1", "person", &defaults);
+        assert!(clients.has_working_key("ctl-1"));
+        assert!(!clients.has_working_key("ctl-2"));
+        assert!(!clients.has_working_key(""));
+        // A password change resets keys: the saved client may come back through a request.
+        clients.key_generation.store(1, Ordering::SeqCst);
+        assert!(!clients.has_working_key("ctl-1"));
     }
 }

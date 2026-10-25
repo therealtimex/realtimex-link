@@ -9,7 +9,7 @@ platform: linux
 version: ${VERSION}
 section: net
 priority: optional
-maintainer: RealTimeX <support@realtimex.ai>
+maintainer: RealTimeX <info@realtimex.ai>
 vendor: RealTimeX
 homepage: https://realtimex.ai
 license: Apache-2.0
@@ -32,6 +32,10 @@ contents:
       mode: 0755
   - src: ${PAYLOAD}/icon.png
     dst: /usr/lib/realtimex-link/payload/icon.png
+    file_info:
+      mode: 0644
+  - src: ${PAYLOAD}/icons/*.png
+    dst: /usr/lib/realtimex-link/payload/icons/
     file_info:
       mode: 0644
 scripts:

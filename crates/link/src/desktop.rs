@@ -27,12 +27,19 @@ pub fn realtimex_app() -> Option<PathBuf> {
 }
 
 fn spawn(program: &str, args: &[&str]) {
-    let _ = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: this window has no console, so `cmd /C start` would open one.
+        command.creation_flags(0x0800_0000);
+    }
+    let _ = command.spawn();
 }
 
 pub fn open_url(url: &str) {

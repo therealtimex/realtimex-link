@@ -40,6 +40,9 @@ const SESSION_GAP_MS: i64 = 10 * 60 * 1000;
 /// macOS permissions are read in a fresh helper process (a grant reaches only processes started
 /// after it); the window asks for the overview every few seconds, so the answer is kept this long.
 const PERMISSIONS_FOR: Duration = Duration::from_secs(10);
+/// The window's light/dark theme as RealTimeX set it (absent: follow the OS).
+const APPEARANCE_KEY: &str = "appearance";
+const LANGUAGE_KEY: &str = "language";
 
 pub mod keys {
     pub const PASSWORD: &str = "password";
@@ -337,12 +340,14 @@ impl Host {
     // --- sign-in ------------------------------------------------------------
 
     /// POST /connect (ADR-2611 §1.3), first match wins: client key, password, password-only
-    /// refusal, else a pending request.
+    /// refusal, else a pending request. `password_blocked`: too many wrong passwords lately
+    /// (router.rs), which refuses the password branch only.
     pub async fn admit(
         &self,
         body: &Value,
         address: &str,
         via: &str,
+        password_blocked: bool,
     ) -> Result<Admitted, ApiError> {
         if !self.state().allow_incoming {
             return Ok(Admitted::refuse(
@@ -414,6 +419,15 @@ impl Host {
         }
         let supplied = text("password");
         if !supplied.is_empty() {
+            if password_blocked {
+                // As the router's other 429s say it.
+                return Ok(Admitted {
+                    status: 429,
+                    body: json!({ "error": "Too many failed attempts" }),
+                    wrong_password: false,
+                    retry_after: None,
+                });
+            }
             if !password::same(&self.password(), &supplied) {
                 let mut refused =
                     Admitted::refuse(401, "wrong-password", "Wrong App ID or password");
@@ -481,6 +495,8 @@ impl Host {
             via: via.to_string(),
             remote_address: Some(address.to_string()),
             tailnet_login: login,
+            // Asking again for an open request (RealTimeX sends the requestId it was given).
+            request_id: Some(text("requestId")).filter(|id| !id.is_empty()),
         });
         match created {
             Ok((request, _)) => Ok(Admitted {
@@ -500,6 +516,10 @@ impl Host {
                 refused.retry_after = error.retry_after;
                 Ok(refused)
             }
+            // A request is open for this client ID and this caller didn't show its requestId.
+            Err(error) if error.code.as_deref() == Some("request-conflict") => Ok(
+                Admitted::refuse(409, "request-conflict", &error.message),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -567,6 +587,13 @@ impl Host {
     }
 
     /// Allow (control or view only) or deny; the requester's next poll claims the result.
+    ///
+    /// Allowing marks the request "deciding" first, so a second allow can't admit the client
+    /// again and replace the credentials just approved. A request names its client ID itself: when
+    /// that ID is a saved client whose key still works, the request never proved that key, so
+    /// allowing it admits a new client instead of changing (and taking over) the saved one. A
+    /// saved client whose key a password change reset has no working credential to protect: it
+    /// comes back through a request as itself.
     pub async fn decide_connection_request(
         &self,
         reference: &str,
@@ -574,13 +601,10 @@ impl Host {
     ) -> Result<Value, ApiError> {
         let settled =
             || ApiError::coded(409, "request-settled", "This request was already settled");
-        let request = self
-            .requests
-            .by_ref(reference)
-            .filter(|r| r.status == "pending")
-            .ok_or_else(settled)?;
         if decision == "deny" {
-            self.requests.deny(&request.reference);
+            if !self.requests.deny(reference) {
+                return Err(settled());
+            }
             return Ok(json!({ "status": "denied" }));
         }
         if decision != "allow-control" && decision != "allow-view" {
@@ -588,18 +612,33 @@ impl Host {
                 "decision must be allow-control, allow-view or deny",
             ));
         }
+        let request = self
+            .requests
+            .begin_decision(reference)
+            .ok_or_else(settled)?;
         let grant = json!({ "view": true, "control": decision == "allow-control" });
+        let client_id = if self.clients.has_working_key(&request.client_id) {
+            crate::util::uuid()
+        } else {
+            request.client_id.clone()
+        };
         let who = Who {
-            client_id: request.client_id.clone(),
+            client_id,
             name: Some(json!(request.client_name)),
             machine: Some(json!(request.machine)),
             actor: "person",
             address: request.remote_address.clone().unwrap_or_default(),
             via: request.via.clone(),
         };
-        let admitted = self.admit_client(&who, "request", Some(&grant), true)?;
+        let admitted = match self.admit_client(&who, "request", Some(&grant), true) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.requests.undecide(&request.reference);
+                return Err(error);
+            }
+        };
         if admitted.status != 200 {
-            self.requests.deny(&request.reference);
+            self.requests.deny_decided(&request.reference);
             return Ok(json!({ "status": "denied" }));
         }
         if !self
@@ -698,9 +737,7 @@ impl Host {
     pub async fn set_allow_incoming(&self, allow: bool) -> Result<(), ApiError> {
         self.state().allow_incoming = allow;
         self.save_settings()?;
-        if allow {
-            self.start_at_login();
-        }
+        self.follow_hosting_at_login();
         if !allow {
             // Viewers are cut off first, then capture stops.
             self.end_streams(|_| true).await;
@@ -714,21 +751,65 @@ impl Host {
     }
 
     /// Hosting on means this computer should be reachable after a restart too: Link starts at
-    /// login. RealTimeX turns this on as well; on its own, Link has to. A copy with its own data
-    /// folder (development, tests) leaves the login item alone.
-    fn start_at_login(&self) {
-        if !crate::paths::is_standard()
-            || crate::autostart::app_binary().is_none()
-            || crate::autostart::enabled()
-        {
-            return;
+    /// login. Hosting off, nothing needs Link at login, so the item goes (autostart.rs). Turned
+    /// off through POST /v1/autostart, it stays off. A copy with its own data folder
+    /// (development, tests) leaves the login item alone.
+    fn sync_login_item(&self) -> anyhow::Result<()> {
+        if !crate::paths::is_standard() {
+            return Ok(());
         }
-        match crate::autostart::set(true) {
-            Ok(()) => (self.log)("[remote-control] RealTimeX Link starts at login"),
-            Err(error) => (self.log)(&format!(
-                "[remote-control] couldn't start at login: {error:#}"
-            )),
+        let hosting = self.state().allow_incoming;
+        let opted_out = crate::autostart::opted_out(&self.store);
+        match crate::autostart::follow(hosting, opted_out)? {
+            crate::autostart::Change::Add => {
+                (self.log)("[remote-control] RealTimeX Link starts at login");
+            }
+            crate::autostart::Change::Remove => {
+                (self.log)("[remote-control] RealTimeX Link no longer starts at login");
+            }
+            crate::autostart::Change::Keep => {}
         }
+        Ok(())
+    }
+
+    fn follow_hosting_at_login(&self) {
+        if let Err(error) = self.sync_login_item() {
+            (self.log)(&format!(
+                "[remote-control] couldn't update starting at login: {error:#}"
+            ));
+        }
+    }
+
+    /// POST /v1/autostart: off is kept (the login item stays away whatever hosting does); on
+    /// lets it follow hosting again.
+    pub fn set_start_at_login(&self, on: bool) -> Result<(), ApiError> {
+        crate::autostart::set_opted_out(&self.store, !on)?;
+        self.sync_login_item()?;
+        Ok(())
+    }
+
+    pub fn start_at_login_opted_out(&self) -> bool {
+        crate::autostart::opted_out(&self.store)
+    }
+
+    /// Light, dark or system (the OS's, the default): RealTimeX's theme, which it posts on start
+    /// and when it changes (POST /v1/appearance), so Link's window looks like RealTimeX's.
+    pub fn appearance(&self) -> &'static str {
+        appearance(&self.store)
+    }
+
+    pub fn set_appearance(&self, theme: &str) -> Result<(), ApiError> {
+        set_appearance(&self.store, theme)
+    }
+
+    /// The window's language, a BCP-47 tag (vi, zh-cn, pt-br), or system (the OS's, the
+    /// default): RealTimeX's, posted with its theme, or the one chosen in Link's Settings.
+    pub fn language(&self) -> String {
+        language(&self.store)
+    }
+
+    pub fn set_language(&self, tag: &str) -> Result<(), ApiError> {
+        set_language(&self.store, tag)
     }
 
     // --- lifecycle ----------------------------------------------------------
@@ -739,9 +820,7 @@ impl Host {
             self.state().last_error = Some(error.message);
         }
         self.reconcile().await;
-        if self.state().allow_incoming {
-            self.start_at_login();
-        }
+        self.follow_hosting_at_login();
         self.relay.start();
         self.updater.start();
         let weak = Arc::downgrade(self);
@@ -1116,5 +1195,96 @@ fn desktop_label(available: bool) -> String {
         "macos" => "macOS".into(),
         "windows" => "Windows".into(),
         other => other.into(),
+    }
+}
+
+fn appearance(store: &Store) -> &'static str {
+    match store.get(APPEARANCE_KEY).as_ref().and_then(Value::as_str) {
+        Some("light") => "light",
+        Some("dark") => "dark",
+        _ => "system",
+    }
+}
+
+fn set_appearance(store: &Store, theme: &str) -> Result<(), ApiError> {
+    match theme {
+        "light" | "dark" => store.set(APPEARANCE_KEY, &json!(theme))?,
+        "system" => store.remove(APPEARANCE_KEY)?,
+        _ => return Err(ApiError::bad_request("theme must be light, dark or system")),
+    }
+    Ok(())
+}
+
+fn language(store: &Store) -> String {
+    store
+        .get(LANGUAGE_KEY)
+        .as_ref()
+        .and_then(Value::as_str)
+        .map_or_else(|| "system".to_string(), str::to_string)
+}
+
+fn set_language(store: &Store, tag: &str) -> Result<(), ApiError> {
+    if tag == "system" {
+        store.remove(LANGUAGE_KEY)?;
+        return Ok(());
+    }
+    let tag = language_tag(tag)
+        .ok_or_else(|| ApiError::bad_request("language must be a language tag or system"))?;
+    store.set(LANGUAGE_KEY, &json!(tag))?;
+    Ok(())
+}
+
+/// A BCP-47 tag, lowercase with hyphens ("zh_TW" -> "zh-tw"): a 2–3 letter language, then
+/// subtags of 1–8 letters or digits. The window picks the closest of its translations.
+pub(crate) fn language_tag(tag: &str) -> Option<String> {
+    let tag = tag.trim().replace('_', "-").to_ascii_lowercase();
+    let mut subtags = tag.split('-');
+    let language = subtags.next()?;
+    let language_ok =
+        (2..=3).contains(&language.len()) && language.bytes().all(|b| b.is_ascii_lowercase());
+    let rest_ok = subtags.all(|subtag| {
+        (1..=8).contains(&subtag.len()) && subtag.bytes().all(|b| b.is_ascii_alphanumeric())
+    });
+    (language_ok && rest_ok).then_some(tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_is_a_tag_realtimex_or_settings_set_and_system_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(language(&store), "system");
+        set_language(&store, "vi").unwrap();
+        assert_eq!(language(&store), "vi");
+        set_language(&store, "zh_TW").unwrap();
+        assert_eq!(language(&store), "zh-tw");
+        set_language(&store, "pt-BR").unwrap();
+        assert_eq!(language(&store), "pt-br");
+        for bad in ["", "x", "english!", "en--us", "toolong-language", "e1"] {
+            assert!(set_language(&store, bad).is_err(), "{bad}");
+        }
+        assert_eq!(language(&store), "pt-br");
+        set_language(&store, "system").unwrap();
+        assert_eq!(language(&store), "system");
+        assert_eq!(store.get(LANGUAGE_KEY), None);
+    }
+
+    #[test]
+    fn appearance_is_what_realtimex_set_and_system_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(appearance(&store), "system");
+        set_appearance(&store, "dark").unwrap();
+        assert_eq!(appearance(&store), "dark");
+        set_appearance(&store, "light").unwrap();
+        assert_eq!(appearance(&store), "light");
+        assert!(set_appearance(&store, "blue").is_err());
+        assert_eq!(appearance(&store), "light");
+        set_appearance(&store, "system").unwrap();
+        assert_eq!(appearance(&store), "system");
+        assert_eq!(store.get(APPEARANCE_KEY), None);
     }
 }
