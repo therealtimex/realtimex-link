@@ -692,74 +692,79 @@ impl eframe::App for LinkApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let scroll = egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 10.0;
-                    if let Some((message, ok, _)) = &notice {
-                        alert(
-                            ui,
-                            if *ok { Tone::Success } else { Tone::Danger },
-                            message,
-                            |_| {},
-                        );
-                    }
-                    let Some(overview) = overview.as_ref() else {
-                        match &error {
-                            Some(error) => {
-                                alert(ui, Tone::Warning, &t("service.notRunningTitle"), |ui| {
-                                    ui.label(error);
-                                    caption(ui, t("service.retrying"));
-                                })
-                            }
-                            None => {
-                                ui.spinner();
-                            }
+            // Settings and the tabs scroll apart, and Settings opens at its top (Back showing).
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt(if self.settings { "settings" } else { "tabs" })
+                .auto_shrink([false, false]);
+            if self.settings && self.focus == Some(Focus::Back) {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            let scroll = scroll.show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+                if let Some((message, ok, _)) = &notice {
+                    alert(
+                        ui,
+                        if *ok { Tone::Success } else { Tone::Danger },
+                        message,
+                        |_| {},
+                    );
+                }
+                let Some(overview) = overview.as_ref() else {
+                    match &error {
+                        Some(error) => {
+                            alert(ui, Tone::Warning, &t("service.notRunningTitle"), |ui| {
+                                ui.label(error);
+                                caption(ui, t("service.retrying"));
+                            })
                         }
-                        return;
-                    };
-                    self.update_ui(ui, ctx, update.as_ref());
-                    self.requests_ui(ui, ctx, &requests);
-                    self.session_ui(ui, overview);
-                    if self.settings {
-                        self.settings_ui(ui, ctx, &stored);
-                        return;
-                    }
-                    ui.horizontal(|ui| {
-                        theme::selectable_value(
-                            ui,
-                            &mut self.tab,
-                            Tab::ThisComputer,
-                            &t("tabs.thisComputer"),
-                        );
-                        let count = overview
-                            .get("clients")
-                            .and_then(Value::as_array)
-                            .map_or(0, Vec::len);
-                        theme::selectable_value(
-                            ui,
-                            &mut self.tab,
-                            Tab::Computers,
-                            &tf("tabs.computers", &[("count", count.to_string().as_str())]),
-                        );
-                    });
-                    ui.separator();
-                    match self.tab {
-                        Tab::ThisComputer => {
-                            // On its own and not signed in yet, signing in comes first.
-                            let signed_in = account.as_ref().and_then(|a| a.get("signedIn"))
-                                == Some(&Value::Bool(true));
-                            if !signed_in && desktop::realtimex_app().is_none() {
-                                self.account_ui(ui, ctx, account.as_ref());
-                                self.this_computer_ui(ui, ctx, overview, &password);
-                            } else {
-                                self.this_computer_ui(ui, ctx, overview, &password);
-                                self.account_ui(ui, ctx, account.as_ref());
-                            }
+                        None => {
+                            ui.spinner();
                         }
-                        Tab::Computers => self.computers_ui(ui, ctx, overview),
                     }
+                    return;
+                };
+                self.update_ui(ui, ctx, update.as_ref());
+                self.requests_ui(ui, ctx, &requests);
+                self.session_ui(ui, overview);
+                if self.settings {
+                    self.settings_ui(ui, ctx, &stored);
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    theme::selectable_value(
+                        ui,
+                        &mut self.tab,
+                        Tab::ThisComputer,
+                        &t("tabs.thisComputer"),
+                    );
+                    let count = overview
+                        .get("clients")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    theme::selectable_value(
+                        ui,
+                        &mut self.tab,
+                        Tab::Computers,
+                        &tf("tabs.computers", &[("count", count.to_string().as_str())]),
+                    );
                 });
+                ui.separator();
+                match self.tab {
+                    Tab::ThisComputer => {
+                        // On its own and not signed in yet, signing in comes first.
+                        let signed_in = account.as_ref().and_then(|a| a.get("signedIn"))
+                            == Some(&Value::Bool(true));
+                        if !signed_in && desktop::realtimex_app().is_none() {
+                            self.account_ui(ui, ctx, account.as_ref());
+                            self.this_computer_ui(ui, ctx, overview, &password);
+                        } else {
+                            self.this_computer_ui(ui, ctx, overview, &password);
+                            self.account_ui(ui, ctx, account.as_ref());
+                        }
+                    }
+                    Tab::Computers => self.computers_ui(ui, ctx, overview),
+                }
+            });
             fit_height(ctx, scroll.content_size.y - scroll.inner_rect.height());
         });
 
