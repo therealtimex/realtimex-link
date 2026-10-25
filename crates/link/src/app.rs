@@ -341,6 +341,9 @@ pub struct LinkApp {
     last_focus: Option<egui::Id>,
     /// The select whose list is open: it gets the focus back when the list closes.
     open_combo: Option<egui::Id>,
+    /// The header's and the footer's controls (the gear, Open/Get RealTimeX): never scrolled
+    /// to, they are always in view.
+    chrome: [Option<egui::Id>; 2],
     show_password: bool,
     editing_password: Option<String>,
     confirm: Option<Confirm>,
@@ -383,6 +386,7 @@ impl LinkApp {
             focus: None,
             last_focus: None,
             open_combo: None,
+            chrome: [None; 2],
             show_password: false,
             editing_password: None,
             confirm: None,
@@ -665,6 +669,7 @@ impl eframe::App for LinkApp {
                 ui.label(semibold("RealTimeX Link").size(16.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let gear = theme::icon_button(ui, theme::Icon::Gear, &t("settings.title"));
+                    self.chrome[0] = Some(gear.id);
                     if self.focus == Some(Focus::Gear) {
                         gear.request_focus();
                         if settled(ctx) {
@@ -698,11 +703,13 @@ impl eframe::App for LinkApp {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Link on its own is the whole point here: RealTimeX is a quiet link.
-                    if installed {
-                        if primary_button(ui, &t("footer.openRealtimex")).clicked() {
-                            desktop::open_realtimex();
-                        }
-                    } else if ui.link(t("footer.getRealtimex")).clicked() {
+                    let open = if installed {
+                        primary_button(ui, &t("footer.openRealtimex"))
+                    } else {
+                        ui.link(t("footer.getRealtimex"))
+                    };
+                    self.chrome[1] = Some(open.id);
+                    if open.clicked() {
                         desktop::open_realtimex();
                     }
                     ui.add(
@@ -803,10 +810,12 @@ impl eframe::App for LinkApp {
                 let clicked = ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_released());
                 if focused != self.last_focus {
                     self.last_focus = focused;
-                    // Only this area's own controls: not the header's gear, not a popup's items.
+                    // Only this area's own controls: not the gear or the footer's button, not a
+                    // popup's items.
                     let rect = focused
+                        .filter(|id| !self.chrome.contains(&Some(*id)))
                         .and_then(|id| ctx.read_response(id))
-                        .filter(|r| r.layer_id == ui.layer_id() && !self.header.intersects(r.rect))
+                        .filter(|r| r.layer_id == ui.layer_id())
                         .map(|r| r.rect);
                     if let (Some(rect), false) = (rect, clicked) {
                         ui.scroll_to_rect(rect, None);
