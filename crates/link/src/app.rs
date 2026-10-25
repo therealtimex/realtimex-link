@@ -462,6 +462,17 @@ fn machine_badge(ui: &mut egui::Ui, machine: &str) {
         });
 }
 
+/// No click in this frame. egui takes the focus away from a widget when a click lands elsewhere,
+/// and a frame can run twice with the same input: focus asked for in the frame of the click that
+/// opened or closed Settings is asked for again until a frame without one.
+fn settled(ctx: &egui::Context) -> bool {
+    let clicked = ctx.input(|i| i.pointer.any_click());
+    if clicked {
+        ctx.request_repaint();
+    }
+    !clicked
+}
+
 /// A select gets the keyboard focus back when its list closes (Esc, a choice, a click away), as a
 /// native select does: egui leaves the focus nowhere, so Tab started over.
 fn keep_focus(open: &mut Option<egui::Id>, ctx: &egui::Context, combo: &egui::Response) {
@@ -656,7 +667,9 @@ impl eframe::App for LinkApp {
                     let gear = theme::icon_button(ui, theme::Icon::Gear, &t("settings.title"));
                     if self.focus == Some(Focus::Gear) {
                         gear.request_focus();
-                        self.focus = None;
+                        if settled(ctx) {
+                            self.focus = None;
+                        }
                     }
                     if gear.clicked() {
                         self.settings = !self.settings;
@@ -1446,7 +1459,9 @@ impl LinkApp {
             let back = theme::icon_button(ui, theme::Icon::ArrowLeft, &t("settings.back"));
             if self.focus == Some(Focus::Back) {
                 back.request_focus();
-                self.focus = None;
+                if settled(ctx) {
+                    self.focus = None;
+                }
             }
             if back.clicked() {
                 self.settings = false;
