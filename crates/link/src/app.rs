@@ -592,6 +592,16 @@ impl eframe::App for LinkApp {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             crate::dock::set_open(false);
+        } else if cfg!(target_os = "linux") && ctx.input(|i| i.viewport().close_requested()) {
+            // Linux: closing ends this window's process (its icon is another, icon.rs). It
+            // ends here rather than when eframe is done: on GNOME Wayland the process outlived
+            // its closed window, still registered as the window, so Open and a new launch asked
+            // it to show itself and nothing appeared. A Settings change on its way goes first.
+            let until = Instant::now() + Duration::from_secs(2);
+            while lock(&self.shared).choices.writing && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(0);
         }
         crate::dock::apply();
         if let Some(tray) = &self.tray {
