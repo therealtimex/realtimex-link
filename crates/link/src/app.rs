@@ -1287,6 +1287,7 @@ impl LinkApp {
                             .on_hover_text(help);
                     }
                 });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
             if chosen != policy {
                 self.act(
                     ctx,
@@ -1308,6 +1309,7 @@ impl LinkApp {
                     theme::selectable_value(ui, &mut access, false, &access_label(false))
                         .on_hover_text(t("access.viewHelp"));
                 });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
             if access != control {
                 self.act(
                     ctx,
@@ -1330,8 +1332,6 @@ impl LinkApp {
             card(ui, |ui| {
                 ui.label(t("computers.none"));
             });
-            keep_focus(&mut self.open_combo, ctx, &combo.response);
-            keep_focus(&mut self.open_combo, ctx, &combo.response);
         }
         for client in clients {
             let id = text(&client, "id");
@@ -1374,6 +1374,7 @@ impl LinkApp {
                             theme::selectable_value(ui, &mut access, true, &access_label(true));
                             theme::selectable_value(ui, &mut access, false, &access_label(false));
                         });
+                    keep_focus(&mut self.open_combo, ctx, &combo.response);
                 });
                 if access != control {
                     let key = if access {
@@ -1428,7 +1429,6 @@ impl LinkApp {
                             });
                         }
                     });
-                    keep_focus(&mut self.open_combo, ctx, &combo.response);
                 });
             });
         }
@@ -1489,6 +1489,7 @@ impl LinkApp {
                         );
                     }
                 });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
             if chosen != *stored_theme {
                 save_setting(&self.shared, &self.refresh, ctx, Field::Theme, &chosen);
             }
@@ -1529,6 +1530,7 @@ impl LinkApp {
                         );
                     }
                 });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
             if let Some(name) = &unavailable {
                 caption(ui, tf("settings.cantShow", &[("language", name.as_str())]));
             }
@@ -1573,8 +1575,6 @@ impl LinkApp {
                     close = true;
                 }
             });
-            keep_focus(&mut self.open_combo, ctx, &combo.response);
-            keep_focus(&mut self.open_combo, ctx, &combo.response);
         });
         if confirmed {
             match self.confirm.take() {
