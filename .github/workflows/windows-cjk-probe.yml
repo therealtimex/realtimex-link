@@ -1,0 +1,105 @@
+# Test only, not for merge (#1, 0.1.11 QA): Windows CJK evidence on a GitHub runner while the
+# shared Windows machine is unavailable. Uses the CI builds of the release candidate (d3a706d,
+# CJK on) and its one-line control (c7ee629, OFFER_CJK = false). Runner evidence only.
+name: Windows CJK probe
+
+on:
+  push:
+    branches: [test/1-windows-cjk-runner]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ON_RUN: "40154567599"
+      OFF_RUN: "40157796143"
+    steps:
+      - name: Builds
+        shell: pwsh
+        run: |
+          gh run download $env:ON_RUN -n realtimex-link-windows-x86_64 -D on
+          gh run download $env:OFF_RUN -n realtimex-link-windows-x86_64 -D off
+          Get-FileHash on\rtx-link.exe, off\rtx-link.exe | Format-Table -AutoSize
+          New-Item -ItemType Directory -Force out | Out-Null
+          "CJK fonts on this runner:" | Tee-Object -FilePath out\fonts.txt
+          foreach ($f in 'msyh.ttc','msjh.ttc','YuGothR.ttc','meiryo.ttc','malgun.ttf') {
+            "$f $(Test-Path (Join-Path $env:WINDIR "Fonts\$f"))" | Tee-Object -FilePath out\fonts.txt -Append
+          }
+      - name: Probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System; using System.Runtime.InteropServices;
+          public static class W {
+            [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+            [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+          }
+          '@
+          $data = Join-Path $env:APPDATA 'RealTimeX Link'
+          function Stop-Window { Get-Process rtx-link -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 800 }
+          function Open-Window($dir) {
+            Stop-Window
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process (Join-Path (Resolve-Path $dir) 'rtx-link.exe') -PassThru
+            while ($sw.ElapsedMilliseconds -lt 20000) {
+              $h = [W]::FindWindow($null, 'RealTimeX Link')
+              if ($h -ne [IntPtr]::Zero -and [W]::IsWindowVisible($h)) { break }
+              Start-Sleep -Milliseconds 2
+            }
+            [pscustomobject]@{ ms = $sw.Elapsed.TotalMilliseconds; pid = $p.Id }
+          }
+          function Set-Language($lang) {
+            $port = (Get-Content (Join-Path $data 'linkd.json') | ConvertFrom-Json).port
+            $token = (Get-Content (Join-Path $data 'api-token') -Raw).Trim()
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$port/v1/appearance" `
+              -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' `
+              -Body (@{ language = $lang } | ConvertTo-Json) | Out-Null
+          }
+          function Shot($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("out\$name.png"); $bmp.Dispose()
+          }
+          Add-Type -AssemblyName System.Windows.Forms
+          # Warm up: the first start also starts rtx-linkd (kept for every run after).
+          Open-Window on | Out-Null; Start-Sleep 3; Set-Language 'system'
+          Open-Window off | Out-Null; Start-Sleep 2
+          # Startup (gate e): alternating, counterbalanced pairs, English.
+          $rows = @()
+          foreach ($i in 1..8) {
+            $order = if ($i % 2) { 'on','off' } else { 'off','on' }
+            foreach ($v in $order) { $r = Open-Window $v; Start-Sleep -Milliseconds 1500; $rows += [pscustomobject]@{ round = $i; build = $v; ms = [math]::Round($r.ms, 2) } }
+          }
+          Stop-Window
+          $rows | Format-Table -AutoSize | Out-String | Tee-Object -FilePath out\startup.txt
+          foreach ($v in 'on','off') {
+            $m = ($rows | Where-Object build -eq $v | Measure-Object ms -Average -Minimum -Maximum)
+            $sorted = ($rows | Where-Object build -eq $v).ms | Sort-Object
+            "$v avg $([math]::Round($m.Average,2)) min $($m.Minimum) max $($m.Maximum) median $($sorted[[int]($sorted.Count/2)])" | Tee-Object -FilePath out\startup.txt -Append
+          }
+          # Rendering (gate a) and memory (gate d), CJK on build.
+          foreach ($lang in 'en','ja','zh','zh-TW','ko') {
+            Set-Language $lang
+            $r = Open-Window on
+            Start-Sleep 6
+            $ws = [math]::Round((Get-Process -Id $r.pid).WorkingSet64 / 1MB, 1)
+            $pm = [math]::Round((Get-Process -Id $r.pid).PrivateMemorySize64 / 1MB, 1)
+            "$lang workingSet ${ws}MB private ${pm}MB" | Tee-Object -FilePath out\memory.txt -Append
+            Shot "lang-$lang"
+          }
+          Stop-Window
+          Set-Language 'system'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: windows-cjk-probe
+          path: out
