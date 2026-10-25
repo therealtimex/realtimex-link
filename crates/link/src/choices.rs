@@ -33,7 +33,8 @@ struct Choice {
     sending: Option<String>,
     /// A change the daemon didn't take: Try again sends it.
     failed: Option<String>,
-    /// Counts changes: a status read from before the latest one is stale for this field.
+    /// Counts changes and the daemon's answers to them: a status read started before the latest
+    /// one is stale for this field.
     edits: u64,
 }
 
@@ -99,6 +100,8 @@ impl Choices {
         let Some(value) = choice.sending.take() else {
             return;
         };
+        // A status read that started before this answer may predate the change.
+        choice.edits += 1;
         if taken {
             choice.confirmed = value;
         } else if choice.wanted.is_none() {
@@ -163,6 +166,26 @@ mod tests {
         choices.status(choices.edits(), "dark", "system");
         assert_eq!(choices.shown(Field::Theme), "dark");
         assert!(choices.failed().is_empty());
+    }
+
+    #[test]
+    fn a_status_read_started_during_a_write_does_not_replace_it() {
+        let mut choices = Choices::default();
+        choices.status(choices.edits(), "light", "system");
+        choices.choose(Field::Theme, "dark");
+        let _ = choices.next_write();
+        // GET /v1/status starts while Dark is on its way, and answers after it was taken.
+        let read = choices.edits();
+        choices.finished(Field::Theme, true);
+        choices.status(read, "light", "system");
+        assert_eq!(choices.shown(Field::Theme), "dark");
+        // Dark is what the daemon has: a later refusal goes back to it.
+        choices.choose(Field::Theme, "system");
+        send_all(&mut choices, false);
+        assert_eq!(choices.shown(Field::Theme), "dark");
+        // The next read, started after the answer, is taken as it is.
+        choices.status(choices.edits(), "dark", "system");
+        assert_eq!(choices.shown(Field::Theme), "dark");
     }
 
     #[test]
