@@ -1026,25 +1026,51 @@ impl LinkApp {
             _ => ("ready", Tone::Success, "tailscale"),
         };
         card(ui, |ui| {
+            // The switch and its label sit beside the title, or on a line of their own when the
+            // window is too narrow for both (the minimum width, longer languages).
+            let allow_label = t("host.allowRemoteControl");
+            let mut changed = false;
+            let mut switch = |ui: &mut egui::Ui, allow: &mut bool| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    changed |= toggle(ui, allow).changed();
+                    ui.label(allow_label.as_str());
+                });
+            };
+            let mut beside = true;
             ui.horizontal(|ui| {
                 ui.label(semibold(t("host.title")).size(15.0));
                 badge(ui, &t(&format!("host.state.{label}")), tone);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if toggle(ui, &mut allow).changed() {
-                        if allow {
-                            self.act(
-                                ctx,
-                                "/v1/host/settings",
-                                json!({ "allowIncoming": true }),
-                                &t("host.turnedOn"),
-                            );
-                        } else {
-                            self.confirm = Some(Confirm::TurnOff);
-                        }
-                    }
-                    ui.label(t("host.allowRemoteControl"));
-                });
+                let needed = egui::WidgetText::from(allow_label.as_str())
+                    .into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::TextStyle::Body,
+                    )
+                    .size()
+                    .x
+                    + 2.2 * ui.spacing().interact_size.y
+                    + 2.0 * ui.spacing().item_spacing.x;
+                beside = ui.available_width() >= needed;
+                if beside {
+                    switch(ui, &mut allow);
+                }
             });
+            if !beside {
+                ui.horizontal(|ui| switch(ui, &mut allow));
+            }
+            if changed {
+                if allow {
+                    self.act(
+                        ctx,
+                        "/v1/host/settings",
+                        json!({ "allowIncoming": true }),
+                        &t("host.turnedOn"),
+                    );
+                } else {
+                    self.confirm = Some(Confirm::TurnOff);
+                }
+            }
             if state == "off" {
                 ui.label(t("host.offExplained"));
                 return;
