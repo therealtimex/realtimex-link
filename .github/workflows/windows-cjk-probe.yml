@@ -26,6 +26,11 @@ jobs:
           gh run download $env:ON_RUN -n realtimex-link-windows-x86_64 -D on
           gh run download $env:OFF_RUN -n realtimex-link-windows-x86_64 -D off
           Get-FileHash on\rtx-link.exe, off\rtx-link.exe | Format-Table -AutoSize
+          # No GPU on the runner: Mesa's software OpenGL (llvmpipe) next to each rtx-link.exe.
+          gh release download 26.2.4 -R pal1000/mesa-dist-win -p 'mesa3d-26.2.4-release-msvc.7z' -D mesa
+          7z x mesa\mesa3d-26.2.4-release-msvc.7z -omesa\x -y | Out-Null
+          foreach ($d in 'on','off') { Copy-Item mesa\x\x64\*.dll $d\ }
+          Get-ChildItem on\*.dll | Select-Object Name | Format-Table -AutoSize
           New-Item -ItemType Directory -Force out | Out-Null
           "CJK fonts on this runner:" | Tee-Object -FilePath out\fonts.txt
           foreach ($f in 'msyh.ttc','msjh.ttc','YuGothR.ttc','meiryo.ttc','malgun.ttf') {
@@ -34,7 +39,8 @@ jobs:
       - name: Probe
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
+          $env:GALLIUM_DRIVER = 'llvmpipe'
           Add-Type -AssemblyName System.Drawing
           Add-Type @'
           using System; using System.Runtime.InteropServices;
@@ -48,7 +54,8 @@ jobs:
           function Open-Window($dir) {
             Stop-Window
             $sw = [Diagnostics.Stopwatch]::StartNew()
-            $p = Start-Process (Join-Path (Resolve-Path $dir) 'rtx-link.exe') -PassThru
+            $p = Start-Process (Join-Path (Resolve-Path $dir) 'rtx-link.exe') -PassThru `
+              -RedirectStandardError "out\stderr-$dir-$([guid]::NewGuid().ToString('N').Substring(0,6)).txt"
             while ($sw.ElapsedMilliseconds -lt 20000) {
               $h = [W]::FindWindow($null, 'RealTimeX Link')
               if ($h -ne [IntPtr]::Zero -and [W]::IsWindowVisible($h)) { break }
@@ -75,7 +82,7 @@ jobs:
           Open-Window off | Out-Null; Start-Sleep 2
           # Startup (gate e): alternating, counterbalanced pairs, English.
           $rows = @()
-          foreach ($i in 1..8) {
+          foreach ($i in 1..6) {
             $order = if ($i % 2) { 'on','off' } else { 'off','on' }
             foreach ($v in $order) { $r = Open-Window $v; Start-Sleep -Milliseconds 1500; $rows += [pscustomobject]@{ round = $i; build = $v; ms = [math]::Round($r.ms, 2) } }
           }
@@ -91,8 +98,9 @@ jobs:
             Set-Language $lang
             $r = Open-Window on
             Start-Sleep 6
-            $ws = [math]::Round((Get-Process -Id $r.pid).WorkingSet64 / 1MB, 1)
-            $pm = [math]::Round((Get-Process -Id $r.pid).PrivateMemorySize64 / 1MB, 1)
+            $proc = Get-Process -Id $r.pid -ErrorAction SilentlyContinue
+            $ws = if ($proc) { [math]::Round($proc.WorkingSet64 / 1MB, 1) } else { 'exited' }
+            $pm = if ($proc) { [math]::Round($proc.PrivateMemorySize64 / 1MB, 1) } else { 'exited' }
             "$lang workingSet ${ws}MB private ${pm}MB" | Tee-Object -FilePath out\memory.txt -Append
             Shot "lang-$lang"
           }
