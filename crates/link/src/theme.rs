@@ -447,6 +447,8 @@ fn portal_theme(reply: &str) -> Option<egui::Theme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{offered_languages, strings, Script};
+    use skrifa::{FontRef, MetadataProvider};
 
     #[test]
     fn the_portal_colour_scheme_is_dark_only_when_dark_is_preferred() {
@@ -460,13 +462,6 @@ mod tests {
             None
         );
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::i18n::{offered_languages, strings, Script};
-    use skrifa::{FontRef, MetadataProvider};
 
     /// Every character of every locale shown with the bundled fonts, and their names, is in Plus
     /// Jakarta Sans or the Cyrillic subset: never egui's fallback font or a missing glyph.
