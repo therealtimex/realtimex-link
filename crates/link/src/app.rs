@@ -1122,7 +1122,9 @@ impl LinkApp {
                     .size()
                     .x
                     + 2.2 * ui.spacing().interact_size.y
-                    + 2.0 * ui.spacing().item_spacing.x;
+                    // Between the label and the switch: the cursor already stands past the
+                    // spacing after the badge.
+                    + ui.spacing().item_spacing.x;
                 beside = ui.available_width() >= needed;
                 if beside {
                     switch(ui, &mut allow);
