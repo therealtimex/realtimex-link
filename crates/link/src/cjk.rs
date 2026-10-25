@@ -12,7 +12,7 @@ use skrifa::string::StringId;
 use skrifa::{FontRef, MetadataProvider};
 
 /// The off switch.
-pub const OFFER_CJK: bool = true;
+pub const OFFER_CJK: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
