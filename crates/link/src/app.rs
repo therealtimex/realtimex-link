@@ -339,6 +339,8 @@ pub struct LinkApp {
     /// The widget that had keyboard focus last frame: one that gets it out of view is scrolled
     /// to (egui doesn't, so Tab could move to a control below the fold).
     last_focus: Option<egui::Id>,
+    /// The select whose list is open: it gets the focus back when the list closes.
+    open_combo: Option<egui::Id>,
     show_password: bool,
     editing_password: Option<String>,
     confirm: Option<Confirm>,
@@ -380,6 +382,7 @@ impl LinkApp {
             header: egui::Rect::NOTHING,
             focus: None,
             last_focus: None,
+            open_combo: None,
             show_password: false,
             editing_password: None,
             confirm: None,
@@ -457,6 +460,17 @@ fn machine_badge(ui: &mut egui::Ui, machine: &str) {
             ui.set_max_width(room);
             ui.add(egui::Label::new(semibold(machine).small().color(fg)).truncate());
         });
+}
+
+/// A select gets the keyboard focus back when its list closes (Esc, a choice, a click away), as a
+/// native select does: egui leaves the focus nowhere, so Tab started over.
+fn keep_focus(open: &mut Option<egui::Id>, ctx: &egui::Context, combo: &egui::Response) {
+    if egui::ComboBox::is_open(ctx, combo.id) {
+        *open = Some(combo.id);
+    } else if *open == Some(combo.id) {
+        *open = None;
+        combo.request_focus();
+    }
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -1264,7 +1278,7 @@ impl LinkApp {
                 .iter()
                 .find(|(id, ..)| *id == policy)
                 .map_or_else(|| t("policy.ask"), |(_, label, _)| label.clone());
-            egui::ComboBox::from_id_salt("policy")
+            let combo = egui::ComboBox::from_id_salt("policy")
                 .width(ui.available_width())
                 .selected_text(current)
                 .show_ui(ui, |ui| {
@@ -1285,7 +1299,7 @@ impl LinkApp {
             let control =
                 overview.pointer("/defaultPermissions/control") == Some(&Value::Bool(true));
             let mut access = control;
-            egui::ComboBox::from_id_salt("access")
+            let combo = egui::ComboBox::from_id_salt("access")
                 .width(ui.available_width())
                 .selected_text(access_label(control))
                 .show_ui(ui, |ui| {
@@ -1316,6 +1330,8 @@ impl LinkApp {
             card(ui, |ui| {
                 ui.label(t("computers.none"));
             });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
         }
         for client in clients {
             let id = text(&client, "id");
@@ -1351,7 +1367,7 @@ impl LinkApp {
                 caption(ui, detail.join(" · "));
                 let mut access = control;
                 ui.add_enabled_ui(!revoked, |ui| {
-                    egui::ComboBox::from_id_salt(("access", &id))
+                    let combo = egui::ComboBox::from_id_salt(("access", &id))
                         .width(ui.available_width())
                         .selected_text(access_label(control))
                         .show_ui(ui, |ui| {
@@ -1412,6 +1428,7 @@ impl LinkApp {
                             });
                         }
                     });
+                    keep_focus(&mut self.open_combo, ctx, &combo.response);
                 });
             });
         }
@@ -1459,7 +1476,7 @@ impl LinkApp {
                 })
             };
             let mut chosen = stored_theme.clone();
-            egui::ComboBox::from_id_salt("theme")
+            let combo = egui::ComboBox::from_id_salt("theme")
                 .width(ui.available_width())
                 .selected_text(theme_label(stored_theme.as_str()))
                 .show_ui(ui, |ui| {
@@ -1497,7 +1514,7 @@ impl LinkApp {
                 _ => crate::i18n::effective_locale(language).endonym.to_string(),
             };
             let mut chosen = current.clone();
-            egui::ComboBox::from_id_salt("language")
+            let combo = egui::ComboBox::from_id_salt("language")
                 .width(ui.available_width())
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
@@ -1556,6 +1573,8 @@ impl LinkApp {
                     close = true;
                 }
             });
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
+            keep_focus(&mut self.open_combo, ctx, &combo.response);
         });
         if confirmed {
             match self.confirm.take() {
