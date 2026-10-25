@@ -10,6 +10,7 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Viewpo
 use serde_json::{json, Value};
 
 use crate::api::Api;
+use crate::choices::{Choices, Field};
 use crate::desktop;
 use crate::i18n::{t, tf};
 use crate::theme::{self, primary_button, semibold, tone_colors, Tone};
@@ -36,12 +37,9 @@ pub struct Snapshot {
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
     pub show_window: Option<u64>,
-    /// The theme and language as stored (GET /v1/status): "light", "dark", "system"; a tag or
-    /// "system". Settings shows them.
-    pub theme: String,
-    pub language: String,
-    /// A Settings change the daemon didn't take: sent again by Try again.
-    pub settings_error: Option<Value>,
+    /// The theme ("light", "dark", "system") and the language (a tag or "system") the window
+    /// and Settings show, and Settings' changes on their way to the daemon.
+    pub choices: Choices,
 }
 
 pub type Shared = Arc<Mutex<Snapshot>>;
@@ -109,45 +107,40 @@ pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) 
     });
 }
 
-/// A Settings change ({theme} or {language}), sent at once. The select shows it right away; when
-/// the daemon doesn't take it, the select goes back to `previous` and Settings offers Try again.
+/// A Settings change, shown at once and sent after any still on its way (one at a time, in
+/// order). When the daemon doesn't take it, Settings goes back and offers Try again.
 pub fn save_setting(
     shared: &Shared,
     refresh: &Sender<()>,
     ctx: &egui::Context,
-    body: Value,
-    previous: Option<(String, String)>,
+    field: Field,
+    value: &str,
 ) {
-    let (shared, refresh, ctx) = (shared.clone(), refresh.clone(), ctx.clone());
-    {
-        let mut state = lock(&shared);
-        if let Some(theme) = body.get("theme").and_then(Value::as_str) {
-            state.theme = theme.to_string();
-        }
-        if let Some(language) = body.get("language").and_then(Value::as_str) {
-            state.language = language.to_string();
-        }
+    let start = {
+        let mut state = lock(shared);
+        state.choices.choose(field, value);
+        !std::mem::replace(&mut state.choices.writing, true)
+    };
+    // The poll applies it to the window now, without waiting for the daemon.
+    let _ = refresh.send(());
+    if !start {
+        return;
     }
-    std::thread::spawn(move || {
-        let api = lock(&shared).api.clone();
-        let result = match api {
-            Some(api) => api.post("/v1/appearance", body.clone()),
-            None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
-        };
-        {
+    let (shared, refresh, ctx) = (shared.clone(), refresh.clone(), ctx.clone());
+    std::thread::spawn(move || loop {
+        let (api, next) = {
             let mut state = lock(&shared);
-            match result {
-                Ok(_) => state.settings_error = None,
-                Err(_) => {
-                    match previous {
-                        Some((field, value)) if field == "theme" => state.theme = value,
-                        Some((_, value)) => state.language = value,
-                        None => {}
-                    }
-                    state.settings_error = Some(body);
-                }
+            let next = state.choices.next_write();
+            if next.is_none() {
+                state.choices.writing = false;
             }
-        }
+            (state.api.clone(), next)
+        };
+        let Some((field, value)) = next else { break };
+        let mut body = serde_json::Map::new();
+        body.insert(field.key().to_string(), json!(value));
+        let taken = api.is_some_and(|api| api.post("/v1/appearance", Value::Object(body)).is_ok());
+        lock(&shared).choices.finished(field, taken);
         let _ = refresh.send(());
         ctx.request_repaint();
     });
@@ -167,12 +160,12 @@ pub fn register(api: &Api) -> bool {
     !answer.is_ok_and(|answer| answer["owner"] == false)
 }
 
-/// RealTimeX's theme, which the window follows (GET /v1/status "appearance"): "light", "dark" or
-/// "system"; an older daemon has none, which is the system's.
-fn theme_preference(status: Option<&Value>) -> egui::ThemePreference {
-    match status.and_then(|status| status["appearance"].as_str()) {
-        Some("light") => egui::ThemePreference::Light,
-        Some("dark") => egui::ThemePreference::Dark,
+/// The theme the window follows: "light", "dark", or anything else the system's (an older daemon
+/// has none).
+fn theme_preference(theme: &str) -> egui::ThemePreference {
+    match theme {
+        "light" => egui::ThemePreference::Light,
+        "dark" => egui::ThemePreference::Dark,
         _ => egui::ThemePreference::System,
     }
 }
@@ -203,28 +196,37 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             },
         };
         if let Some(api) = api {
+            let edits = lock(&shared).choices.edits();
             let status = api.get("/v1/status").ok();
-            let preference = match theme_preference(status.as_ref()) {
+            // The stored theme and language (RealTimeX's, or chosen in Settings), unless a change
+            // was made since this read started; an older daemon has no language. A failed read
+            // changes nothing: the window keeps what it shows.
+            let (theme, language) = {
+                let mut state = lock(&shared);
+                if let Some(status) = &status {
+                    let field = |name: &str| status[name].as_str().unwrap_or("system");
+                    state
+                        .choices
+                        .status(edits, field("appearance"), field("language"));
+                }
+                (
+                    state.choices.shown(Field::Theme).to_string(),
+                    state.choices.shown(Field::Language).to_string(),
+                )
+            };
+            // The fonts first (a CJK language's), so its text never shows without them.
+            let next = crate::i18n::effective_locale(&language);
+            if !std::ptr::eq(next, crate::i18n::current()) {
+                theme::apply_fonts(&ctx, next);
+            }
+            if crate::i18n::set_language(&language) {
+                ctx.request_repaint();
+            }
+            let preference = match theme_preference(&theme) {
                 egui::ThemePreference::System => theme::system_theme()
                     .map_or(egui::ThemePreference::System, egui::ThemePreference::from),
                 preference => preference,
             };
-            // The stored theme and language (RealTimeX's, or chosen in Settings); an older daemon
-            // has no language. Kept as they are when the status can't be read.
-            let stored = status.as_ref().map(|status| {
-                let field = |name: &str| status[name].as_str().unwrap_or("system").to_string();
-                (field("appearance"), field("language"))
-            });
-            if let Some((_, language)) = &stored {
-                // The fonts first (a CJK language's), so its text never shows without them.
-                let next = crate::i18n::effective_locale(language);
-                if !std::ptr::eq(next, crate::i18n::current()) {
-                    theme::apply_fonts(&ctx, next);
-                }
-                if crate::i18n::set_language(language) {
-                    ctx.request_repaint();
-                }
-            }
             if appearance != Some(preference) {
                 ctx.set_theme(preference);
                 // The title bar too (the Linux one is drawn by winit, Windows' by the system).
@@ -252,10 +254,6 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let mut state = lock(&shared);
             state.account = account;
             state.update = update;
-            if let Some((theme, language)) = stored {
-                state.theme = theme;
-                state.language = language;
-            }
             match overview {
                 Ok(overview) => {
                     state.overview = Some(overview);
@@ -599,9 +597,9 @@ impl eframe::App for LinkApp {
                 state.error.clone(),
                 state.notice.clone(),
                 (
-                    state.theme.clone(),
-                    state.language.clone(),
-                    state.settings_error.clone(),
+                    state.choices.shown(Field::Theme).to_string(),
+                    state.choices.shown(Field::Language).to_string(),
+                    state.choices.failed(),
                 ),
             )
         };
@@ -1373,7 +1371,7 @@ impl LinkApp {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        (stored_theme, language, error): &(String, String, Option<Value>),
+        (stored_theme, language, failed): &(String, String, Vec<(Field, String)>),
     ) {
         ui.horizontal(|ui| {
             let back = theme::icon_button(ui, theme::Icon::ArrowLeft, &t("settings.back"));
@@ -1388,11 +1386,13 @@ impl LinkApp {
             ui.label(semibold(t("settings.title")).size(15.0));
         });
         ui.separator();
-        if let Some(body) = error {
+        if !failed.is_empty() {
             alert(ui, Tone::Danger, &t("settings.saveFailedTitle"), |ui| {
                 ui.label(t("settings.saveFailed"));
                 if ui.button(t("settings.tryAgain")).clicked() {
-                    save_setting(&self.shared, &self.refresh, ctx, body.clone(), None);
+                    for (field, value) in failed {
+                        save_setting(&self.shared, &self.refresh, ctx, *field, value);
+                    }
                 }
             });
         }
@@ -1421,13 +1421,7 @@ impl LinkApp {
                     }
                 });
             if chosen != *stored_theme {
-                save_setting(
-                    &self.shared,
-                    &self.refresh,
-                    ctx,
-                    json!({ "theme": chosen }),
-                    Some(("theme".into(), stored_theme.clone())),
-                );
+                save_setting(&self.shared, &self.refresh, ctx, Field::Theme, &chosen);
             }
             ui.add_space(8.0);
             ui.label(semibold(t("settings.language")));
@@ -1470,13 +1464,7 @@ impl LinkApp {
                 caption(ui, tf("settings.cantShow", &[("language", name.as_str())]));
             }
             if chosen != current {
-                save_setting(
-                    &self.shared,
-                    &self.refresh,
-                    ctx,
-                    json!({ "language": chosen }),
-                    Some(("language".into(), language.clone())),
-                );
+                save_setting(&self.shared, &self.refresh, ctx, Field::Language, &chosen);
             }
             if desktop::realtimex_app().is_some() {
                 ui.add_space(4.0);
