@@ -442,6 +442,21 @@ fn badge(ui: &mut egui::Ui, text: &str, tone: Tone) {
         });
 }
 
+/// The computer's name in the header: it takes only the room the title and the gear leave, and
+/// a long name ends in "…" with the whole name on hover.
+fn machine_badge(ui: &mut egui::Ui, machine: &str) {
+    let (fill, _, fg) = tone_colors(ui, Tone::Neutral);
+    let room = (ui.available_width() - ui.spacing().item_spacing.x - 16.0).max(24.0);
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.set_max_width(room);
+            ui.add(egui::Label::new(semibold(machine).small().color(fg)).truncate());
+        });
+}
+
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     theme::card_frame(ui)
         .inner_margin(Margin::same(14))
@@ -640,7 +655,7 @@ impl eframe::App for LinkApp {
                         .map(|o| text(o, "machine"))
                         .filter(|m| !m.is_empty())
                     {
-                        badge(ui, &machine, Tone::Neutral);
+                        machine_badge(ui, &machine);
                     }
                 });
             });
