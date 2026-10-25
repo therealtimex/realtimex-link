@@ -336,6 +336,9 @@ pub struct LinkApp {
     /// The header's area last frame: on macOS it moves the window.
     header: egui::Rect,
     focus: Option<Focus>,
+    /// The widget that had keyboard focus last frame: one that gets it out of view is scrolled
+    /// to (egui doesn't, so Tab could move to a control below the fold).
+    last_focus: Option<egui::Id>,
     show_password: bool,
     editing_password: Option<String>,
     confirm: Option<Confirm>,
@@ -376,6 +379,7 @@ impl LinkApp {
             settings: false,
             header: egui::Rect::NOTHING,
             focus: None,
+            last_focus: None,
             show_password: false,
             editing_password: None,
             confirm: None,
@@ -763,6 +767,18 @@ impl eframe::App for LinkApp {
                         }
                     }
                     Tab::Computers => self.computers_ui(ui, ctx, overview),
+                }
+                let focused = ctx.memory(|memory| memory.focused());
+                if focused != self.last_focus {
+                    self.last_focus = focused;
+                    // Only this area's own controls: not the header's gear, not a popup's items.
+                    let rect = focused
+                        .and_then(|id| ctx.read_response(id))
+                        .filter(|r| r.layer_id == ui.layer_id() && !self.header.intersects(r.rect))
+                        .map(|r| r.rect);
+                    if let Some(rect) = rect {
+                        ui.scroll_to_rect(rect, None);
+                    }
                 }
             });
             fit_height(ctx, scroll.content_size.y - scroll.inner_rect.height());
