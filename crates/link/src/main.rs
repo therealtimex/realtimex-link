@@ -44,7 +44,10 @@ fn main() -> eframe::Result {
         #[cfg(target_os = "linux")]
         if answer.is_ok_and(|answer| answer["tray"] == false) {
             if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).arg("--background").spawn();
+                let _ = std::process::Command::new(exe)
+                    .arg("--background")
+                    .args(api::instance_args())
+                    .spawn();
             }
         }
     }

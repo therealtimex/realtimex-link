@@ -20,6 +20,7 @@ mod files;
 mod host;
 mod identity;
 mod install;
+mod instance;
 mod local_api;
 mod lock;
 mod owner;
@@ -92,6 +93,7 @@ async fn main() {
         data_dir,
         version: version.clone(),
         port,
+        label: arg_value(&args, "--label"),
         log,
         backend: None,
     })

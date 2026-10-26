@@ -252,6 +252,12 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         "running": state.host.settings().keep_running,
         // GET /v1/exposure's answer.
         "exposure": state.host.relay.exposure(),
+        // Which Link this is (instance.rs): { default, label }.
+        "instance": crate::instance::status(),
+        // The tray's Quit wording: RealTimeX owns this Link (it starts it again while Keep
+        // running is on), or a login item starts it.
+        "realtimexPresent": crate::owner::present(&state.host.store),
+        "autostartEnabled": crate::paths::is_standard() && crate::autostart::enabled(),
     }))
 }
 
@@ -538,14 +544,15 @@ async fn account_token(State(state): State<Shared>, Body64(body): Body64) -> Ans
     }
 }
 
-/// { installId }: RealTimeX is being uninstalled. Link is its own again and offers its own
-/// sign-in and sign-out (§6.2).
+/// { installId }: the owning RealTimeX lets this Link go (Host::release_by_realtimex).
+/// { released, droppedExposure }; 409 adopted-other from anyone but the owner, and when no
+/// RealTimeX owns Link ("not yours, nothing to release").
 async fn account_release(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let install_id = body.get("installId").and_then(Value::as_str).unwrap_or("");
-    crate::owner::check(&state.host.store, install_id)?;
-    crate::owner::release(&state.host.store)?;
-    (state.host.log)("[sign-in] RealTimeX released RealTimeX Link");
-    Ok(Json(json!({ "released": true })))
+    let dropped = state.host.release_by_realtimex(install_id).await?;
+    Ok(Json(
+        json!({ "released": true, "droppedExposure": dropped }),
+    ))
 }
 
 /// Start Link's own sign-in: { url } for the browser, which comes back to a one-time local port.
@@ -588,12 +595,37 @@ async fn sign_out(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     Ok(Json(json!({})))
 }
 
-/// Link's own updates (update.rs): { current, latest, available, page, busy, error, checkedAt }.
+/// Link's own updates (update.rs): { current, latest, available, page, busy, error, checkedAt,
+/// selfUpdate }. Only the default instance updates itself (instance.rs); another answers
+/// { current, available: false, selfUpdate: false } and refuses check and install.
 async fn update_status(State(state): State<Shared>) -> Answer {
-    Ok(Json(state.host.updater.status()))
+    if !crate::paths::is_standard() {
+        return Ok(Json(json!({
+            "current": state.version,
+            "available": false,
+            "selfUpdate": false,
+        })));
+    }
+    let mut status = state.host.updater.status();
+    if let Some(fields) = status.as_object_mut() {
+        fields.insert("selfUpdate".into(), json!(true));
+    }
+    Ok(Json(status))
+}
+
+fn only_the_default_instance_updates() -> ApiResult<()> {
+    if crate::paths::is_standard() {
+        return Ok(());
+    }
+    Err(ApiError::coded(
+        409,
+        "not-default-instance",
+        "Only the default RealTimeX Link updates itself",
+    ))
 }
 
 async fn update_check(State(state): State<Shared>) -> Answer {
+    only_the_default_instance_updates()?;
     let status = state
         .host
         .updater
@@ -606,6 +638,7 @@ async fn update_check(State(state): State<Shared>) -> Answer {
 /// Update now: { started } (the new Link starts itself), or { open } with the release page for
 /// the window to open (Linux).
 async fn update_install(State(state): State<Shared>) -> Answer {
+    only_the_default_instance_updates()?;
     let answer = state
         .host
         .updater
@@ -628,12 +661,15 @@ async fn use_realtimex(State(state): State<Shared>) -> Answer {
 
 /// Start at login (autostart.rs): { enabled, available, optedOut }. Available: rtx-link is
 /// installed next to this daemon, in the installed Link, so there is something to start. Opted
-/// out: turned off here, so hosting doesn't add it back.
+/// out: turned off here, so hosting doesn't add it back. Only the default instance has a login
+/// item (instance.rs): another answers enabled and available false, defaultInstance false.
 async fn autostart(State(state): State<Shared>) -> Answer {
+    let standard = crate::paths::is_standard();
     Ok(Json(json!({
-        "enabled": crate::autostart::enabled(),
-        "available": crate::autostart::available(),
+        "enabled": standard && crate::autostart::enabled(),
+        "available": standard && crate::autostart::available(),
         "optedOut": state.host.start_at_login_opted_out(),
+        "defaultInstance": standard,
     })))
 }
 
