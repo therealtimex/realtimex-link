@@ -1639,6 +1639,7 @@ impl Relay {
         }
         // Finished streams answered END themselves; drop their entries now and then.
         streams.retain(|_, stream| !stream.task.is_finished() || stream.discarding);
+        send.keep_answered(|id| streams.contains_key(&id));
         match frame.kind {
             frame::OPEN | frame::WS_OPEN => {
                 let websocket = frame.kind == frame::WS_OPEN;
@@ -2418,7 +2419,8 @@ pub(crate) struct Sender {
     data: mpsc::Sender<Message>,
     control: mpsc::UnboundedSender<Message>,
     /// Streams whose response HEADERS went out: a stream gets one, whoever answers it (the
-    /// relay ends the whole connection on a second).
+    /// relay ends the whole connection on a second). Kept while the stream is (no END or RESET
+    /// clears it: an aborted writer's END may never go out), forgotten once it is gone.
     answered: Arc<Mutex<HashSet<u32>>>,
 }
 
@@ -2458,11 +2460,14 @@ impl Sender {
         lock(&self.answered).remove(&stream);
     }
 
+    /// Forget the streams that are gone: no writer of theirs is left, and no overflow can
+    /// answer them again.
+    fn keep_answered(&self, live: impl Fn(u32) -> bool) {
+        lock(&self.answered).retain(|stream| live(*stream));
+    }
+
     /// One frame, in its stream's order. False: the connection is gone.
     async fn raw(&self, kind: u8, stream: u32, payload: &[u8], flags: u8) -> bool {
-        if kind == frame::END {
-            lock(&self.answered).remove(&stream);
-        }
         self.data
             .send(Message::Binary(encode(kind, stream, payload, flags).into()))
             .await
@@ -2509,7 +2514,6 @@ impl Sender {
     }
 
     fn refuse(&self, stream: u32, reason: &str) {
-        lock(&self.answered).remove(&stream);
         self.urgent_meta(frame::RESET, stream, &json!({ "error": reason }));
     }
 
@@ -3124,6 +3128,101 @@ mod tests {
         }
         assert_eq!(resets.len(), 1);
         assert_eq!((resets[0].kind, resets[0].stream), (frame::RESET, 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_overflow_while_the_answer_waits_to_end_never_answers_twice() {
+        // Room for one frame: stream 7's HEADERS fills it, so its END has to wait.
+        let (data, mut sent) = mpsc::channel(1);
+        let (control, mut urgent) = mpsc::unbounded_channel();
+        let send = Sender::new(data, control);
+        assert!(
+            send.meta(frame::HEADERS, 7, &json!({ "status": 200 }))
+                .await
+        );
+        let (ending, ending_rx) = tokio::sync::oneshot::channel();
+        let handler = {
+            let send = send.clone();
+            tokio::spawn(async move {
+                let _ = ending.send(());
+                send.raw(frame::END, 7, &[], 0).await;
+            })
+        };
+        ending_rx.await.unwrap();
+        // Blocked in raw(END) behind the full queue.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handler.is_finished());
+        let (tx, _rx) = mpsc::channel(4);
+        let mut stream = Stream {
+            input: Some(Input::Body(tx)),
+            received: 0,
+            limit: 4,
+            parts: Vec::new(),
+            text: false,
+            task: handler,
+            discarding: false,
+        };
+        // The body runs over: the handler is aborted (its END never goes out).
+        assert_eq!(
+            stream.body(bytes::Bytes::from_static(b"12345")).await,
+            Err(TOO_LARGE)
+        );
+        stream.refuse_as_too_large(7, &send);
+        (&mut stream.task).await.unwrap();
+        // Another stream on the same connection still gets its 413, while the queue drains.
+        let (tx, _rx) = mpsc::channel(4);
+        let mut other = Stream {
+            input: Some(Input::Body(tx)),
+            received: 0,
+            limit: 4,
+            parts: Vec::new(),
+            text: false,
+            task: tokio::spawn(std::future::pending()),
+            discarding: false,
+        };
+        assert_eq!(
+            other.body(bytes::Bytes::from_static(b"12345")).await,
+            Err(TOO_LARGE)
+        );
+        other.refuse_as_too_large(9, &send);
+        let mut decoder = Decoder::default();
+        let mut frames = Vec::new();
+        loop {
+            tokio::select! {
+                Some(Message::Binary(chunk)) = sent.recv() => {
+                    frames.extend(decoder.feed(&chunk).unwrap());
+                }
+                _ = &mut other.task => break,
+            }
+        }
+        while let Ok(Message::Binary(chunk)) = sent.try_recv() {
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        let of = |id: u32, kind: u8| {
+            frames
+                .iter()
+                .filter(|f| f.stream == id && f.kind == kind)
+                .count()
+        };
+        // Stream 7: the one HEADERS it had, no second one.
+        assert_eq!(of(7, frame::HEADERS), 1);
+        assert_eq!(of(9, frame::HEADERS), 1);
+        assert_eq!(of(9, frame::END), 1);
+        let status = frames
+            .iter()
+            .find(|f| f.stream == 9 && f.kind == frame::HEADERS)
+            .map(|f| serde_json::from_slice::<Value>(&f.payload).unwrap()["status"].clone());
+        assert_eq!(status, Some(json!(413)));
+        // Stream 7 ends on its own: one RESET, for it alone.
+        let mut resets = Vec::new();
+        while let Ok(Message::Binary(chunk)) = urgent.try_recv() {
+            resets.extend(Decoder::default().feed(&chunk).unwrap());
+        }
+        assert_eq!(resets.len(), 1);
+        assert_eq!((resets[0].kind, resets[0].stream), (frame::RESET, 7));
+        // Gone streams are forgotten; a live one keeps its answer.
+        send.keep_answered(|id| id == 9);
+        assert_eq!(*lock(&send.answered), HashSet::from([9]));
     }
 
     #[tokio::test]
