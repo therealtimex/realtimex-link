@@ -22,6 +22,7 @@ mod identity;
 mod install;
 mod local_api;
 mod lock;
+mod owner;
 mod password;
 mod paths;
 mod relay;

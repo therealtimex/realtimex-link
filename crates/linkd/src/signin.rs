@@ -161,6 +161,8 @@ impl SignIn {
             "signingIn": signing_in,
             "error": pending.error,
             "offer": lock(&self.offered).as_ref().map(|(_, email)| email.clone()),
+            // §6.2: RealTimeX owns this Link; the window offers no sign-out or other account.
+            "managedByRealtimex": host.as_ref().is_some_and(|host| crate::owner::present(&host.store)),
         })
     }
 
@@ -415,6 +417,58 @@ impl SignIn {
     /// Sign out: end the sign-in at accounts.realtimex.ai too, forget the account, and take
     /// RealTimeX's handover only when the person picks it again.
     pub async fn sign_out(&self) -> Result<()> {
+        self.end(false).await
+    }
+
+    /// RealTimeX signed out (§6.2): Link is signed out too, but takes RealTimeX's next handover.
+    pub async fn sign_out_for_realtimex(&self) -> Result<()> {
+        self.end(true).await
+    }
+
+    /// RealTimeX's handover replaces any sign-in Link made itself (§6.2: the handover wins).
+    pub async fn replace_with_handover(&self, token: &str) -> Result<()> {
+        let host = self.host()?;
+        if self.signed_in() {
+            self.end_session().await?;
+        }
+        host.store.remove(keys::HANDOVER_OFF)?;
+        *lock(&self.offered) = None;
+        host.relay.set_account(token)
+    }
+
+    /// Revoke and forget Link's own session (its refresh token), nothing else.
+    async fn end_session(&self) -> Result<()> {
+        let host = self.host()?;
+        if let Some(task) = lock(&self.pending).task.take() {
+            task.abort();
+        }
+        let mut access = self.access.lock().await;
+        let refresh = host
+            .store
+            .get(keys::SESSION)
+            .and_then(|session| host.open_secret(session.get("refreshToken")?));
+        if let Some(refresh) = refresh {
+            if let Err(error) = token_post(
+                &endpoint("revoke"),
+                vec![
+                    ("client_id", CLIENT_ID.into()),
+                    ("token", refresh),
+                    ("token_type_hint", "refresh_token".into()),
+                ],
+            )
+            .await
+            {
+                (host.log)(&format!("[sign-in] revoking failed: {error:#}"));
+            }
+        }
+        *access = None;
+        host.store.remove(keys::SESSION)?;
+        Ok(())
+    }
+
+    /// Signed out here (`for_realtimex`: by RealTimeX, whose next handover is taken; otherwise
+    /// in Link, after which RealTimeX's handover is only offered).
+    async fn end(&self, for_realtimex: bool) -> Result<()> {
         let host = self.host()?;
         if let Some(task) = lock(&self.pending).task.take() {
             task.abort();
@@ -443,8 +497,14 @@ impl SignIn {
         *access = None;
         host.store.remove(keys::SESSION)?;
         host.store.remove(crate::identity::keys::ACCOUNT)?;
-        host.store.set(keys::HANDOVER_OFF, &json!(true))?;
+        if for_realtimex {
+            host.store.remove(keys::HANDOVER_OFF)?;
+        } else {
+            host.store.set(keys::HANDOVER_OFF, &json!(true))?;
+        }
+        *lock(&self.offered) = None;
         host.relay.forget_account();
+        host.relay.wake();
         lock(&self.pending).error = None;
         (host.log)("[sign-in] signed out");
         Ok(())

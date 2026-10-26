@@ -111,6 +111,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/account/token", post(account_token))
         .route("/v1/account/sign-in", post(sign_in))
         .route("/v1/account/sign-out", post(sign_out))
+        .route("/v1/account/release", post(account_release))
         .route("/v1/account/use-realtimex", post(use_realtimex))
         .route("/v1/update", get(update_status))
         .route("/v1/update/check", post(update_check))
@@ -396,10 +397,11 @@ async fn clear_origin(State(state): State<Shared>) -> Answer {
 /// signed-out or adopted-other.
 async fn adopt_exposure(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let text = |name: &str| body.get(name).and_then(Value::as_str).unwrap_or("").trim();
+    let exposure_id = Some(text("exposureId")).filter(|id| !id.is_empty());
     let answer = state
         .host
         .relay
-        .adopt(text("exposureId"), text("installId"), text("account"))
+        .adopt(exposure_id, text("installId"), text("account"))
         .await?;
     Ok(Json(answer))
 }
@@ -491,19 +493,51 @@ async fn account(State(state): State<Shared>) -> Answer {
     Ok(Json(state.host.signin.status()))
 }
 
-/// The signed-in account's access token, from RealTimeX: { token, apiBase }. It signs Link in
-/// unless Link has its own sign-in or was signed out here (then { accepted: false }: offered).
+/// The signed-in account's access token, from RealTimeX: { token, apiBase?, installId? }.
+/// With its installId (§6.2, §6.3 A1) the first RealTimeX install to hand over owns Link, and
+/// its handover always replaces Link's own sign-in; another install gets 409 adopted-other.
+/// Without one (an older RealTimeX) it is ignored once there is an owner, and otherwise signs
+/// Link in only while Link has no sign-in of its own ({ accepted: false }: offered).
 async fn account_token(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let token = body
         .get("token")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("token is required"))?;
-    let accepted = state
-        .host
-        .relay
-        .handover(token, body.get("apiBase").and_then(Value::as_str))
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    Ok(Json(json!({ "accepted": accepted })))
+    let api_base = body.get("apiBase").and_then(Value::as_str);
+    let store = &state.host.store;
+    match body.get("installId").and_then(Value::as_str) {
+        Some(install_id) => {
+            crate::owner::claim(store, install_id, crate::util::now_ms())?;
+            state
+                .host
+                .relay
+                .take_handover(token, api_base)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            Ok(Json(json!({ "accepted": true })))
+        }
+        None if crate::owner::present(store) => {
+            Ok(Json(json!({ "accepted": false, "ignored": true })))
+        }
+        None => {
+            let accepted = state
+                .host
+                .relay
+                .handover(token, api_base)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            Ok(Json(json!({ "accepted": accepted })))
+        }
+    }
+}
+
+/// { installId }: RealTimeX is being uninstalled. Link is its own again and offers its own
+/// sign-in and sign-out (§6.2).
+async fn account_release(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let install_id = body.get("installId").and_then(Value::as_str).unwrap_or("");
+    crate::owner::check(&state.host.store, install_id)?;
+    crate::owner::release(&state.host.store)?;
+    (state.host.log)("[sign-in] RealTimeX released RealTimeX Link");
+    Ok(Json(json!({ "released": true })))
 }
 
 /// Start Link's own sign-in: { url } for the browser, which comes back to a one-time local port.
@@ -517,10 +551,28 @@ async fn sign_in(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({ "url": url })))
 }
 
-async fn sign_out(State(state): State<Shared>) -> Answer {
-    state
-        .host
-        .signin
+async fn sign_out(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let host = &state.host;
+    if crate::owner::present(&host.store) {
+        // RealTimeX owns Link (§6.2): only it signs Link out, and its next handover signs Link in.
+        let install_id = body
+            .get("installId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ApiError::coded(
+                    409,
+                    "managed-by-realtimex",
+                    "RealTimeX manages this account; sign out in RealTimeX",
+                )
+            })?;
+        crate::owner::check(&host.store, install_id)?;
+        host.signin
+            .sign_out_for_realtimex()
+            .await
+            .map_err(|error| ApiError::new(500, error.to_string()))?;
+        return Ok(Json(json!({})));
+    }
+    host.signin
         .sign_out()
         .await
         .map_err(|error| ApiError::new(500, error.to_string()))?;
