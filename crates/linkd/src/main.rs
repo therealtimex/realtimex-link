@@ -7,6 +7,7 @@
 use rtx_glibc_compat as _;
 
 mod actions;
+mod artifacts;
 mod autostart;
 mod backend;
 mod clients;
@@ -34,6 +35,7 @@ mod tailscale;
 mod transfers;
 mod update;
 mod util;
+mod webhooks;
 
 use std::path::PathBuf;
 use std::sync::Arc;

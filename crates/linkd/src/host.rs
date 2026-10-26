@@ -866,6 +866,15 @@ impl Host {
         self.follow_hosting_at_login();
         self.relay.start();
         self.updater.start();
+        // The webhook inbox keeps deliveries for a week (webhooks.rs).
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            loop {
+                let before = crate::util::now_ms() - crate::webhooks::RETENTION_MS;
+                let _ = store.inbox_prune(before);
+                tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            }
+        });
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {

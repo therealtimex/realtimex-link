@@ -191,6 +191,8 @@ pub struct Relay {
     unsupported: Mutex<HashSet<String>>,
     /// RealTimeX's servers, while it runs (origin.rs).
     pub origin: origin::Registry,
+    /// Webhook deliveries per endpoint and minute, while the inbox takes them (webhooks.rs).
+    rates: Arc<crate::webhooks::Rates>,
     /// One adoption at a time.
     adopting: tokio::sync::Mutex<()>,
     /// A task is enrolling the surfaces the exposure still lacks (`converge`).
@@ -228,6 +230,7 @@ impl Relay {
             restart: AtomicBool::new(false),
             unsupported: Mutex::new(HashSet::new()),
             origin: origin::Registry::default(),
+            rates: Arc::default(),
             adopting: tokio::sync::Mutex::new(()),
             recoveries: Mutex::new(Vec::new()),
             converging: AtomicBool::new(false),
@@ -1419,11 +1422,18 @@ impl Relay {
             })
         } else if request.surface == REMOTE_CONTROL {
             tokio::spawn(async move { in_process(id, request, rx, routes, send).await })
+        } else if let Some(store) = self.served_here(&request) {
+            // Published artifacts and the widget's assets: Link's own, RealTimeX open or not.
+            tokio::spawn(async move { serve_here(id, request, store, send).await })
         } else {
             let target = self.origin.target(&request.surface);
             let registry = self.origin.clone_handle();
+            let inbox = self.host.upgrade().map(|host| origin::Inbox {
+                store: host.store.clone(),
+                rates: self.rates.clone(),
+            });
             tokio::spawn(async move {
-                origin::http(id, request, rx, target, registry, send).await;
+                origin::http(id, request, rx, target, registry, inbox, send).await;
             })
         };
         Stream {
@@ -1433,6 +1443,41 @@ impl Relay {
             parts: Vec::new(),
             text: false,
             task,
+        }
+    }
+}
+
+impl Relay {
+    /// The store, when Link answers this request itself (artifacts.rs `serves`).
+    fn served_here(&self, request: &RelayRequest) -> Option<Arc<crate::store::Store>> {
+        let host = self.host.upgrade()?;
+        let pathname = request.path.split(['?', '#']).next().unwrap_or("");
+        crate::artifacts::serves(&host.store, &request.surface, pathname)
+            .then(|| host.store.clone())
+    }
+}
+
+/// A published artifact (surface a) or one of the widget's assets (surface e), from disk.
+async fn serve_here(id: u32, request: RelayRequest, store: Arc<crate::store::Store>, send: Sender) {
+    let answer = tokio::task::spawn_blocking(move || {
+        let pathname = request
+            .path
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if request.surface == "e" {
+            crate::artifacts::embed_asset(&store, &request.method, &pathname, &request.headers)
+        } else {
+            crate::artifacts::artifact(&store, &request.method, &pathname, &request.headers)
+        }
+    })
+    .await;
+    match answer {
+        Ok(answer) => origin::send_answer(id, answer, &send).await,
+        Err(error) => {
+            send.meta(frame::RESET, id, &json!({ "error": error.to_string() }))
+                .await;
         }
     }
 }

@@ -43,6 +43,10 @@ pub const FEATURES: &[&str] = &[
     "exposure",
     "origin",
     "shared",
+    // M2: PUT /v1/artifacts (Link serves published artifacts and the widget's assets). M3: PUT
+    // /v1/webhooks, GET /v1/inbox, POST /v1/inbox/ack (the webhook inbox).
+    "artifacts",
+    "webhooks",
 ];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
 /// caller's nonce (see `hello_proof`).
@@ -93,6 +97,16 @@ pub fn router(state: Shared) -> Router {
                 .put(set_shared)
                 .layer(DefaultBodyLimit::max(MAX_LIST_BYTES)),
         )
+        .route(
+            "/v1/artifacts",
+            axum::routing::put(set_artifacts).layer(DefaultBodyLimit::max(MAX_LIST_BYTES)),
+        )
+        .route(
+            "/v1/webhooks",
+            axum::routing::put(set_webhooks).layer(DefaultBodyLimit::max(MAX_LIST_BYTES)),
+        )
+        .route("/v1/inbox", get(inbox))
+        .route("/v1/inbox/ack", post(inbox_ack))
         .route("/v1/account", get(account))
         .route("/v1/account/token", post(account_token))
         .route("/v1/account/sign-in", post(sign_in))
@@ -399,9 +413,14 @@ async fn exposure_notice_seen(State(state): State<Shared>) -> Answer {
 /// "Shared from this computer", as RealTimeX last pushed it, and whether RealTimeX runs:
 /// { items, origin }.
 async fn shared(State(state): State<Shared>) -> Answer {
+    let store = &state.host.store;
     Ok(Json(json!({
-        "items": crate::shared::get(&state.host.store),
+        "items": crate::shared::get(store),
         "origin": state.host.relay.origin.registered(),
+        // What Link itself does while RealTimeX is closed (M2, M3).
+        "servedArtifacts": crate::artifacts::published_count(store),
+        "webhookEndpoints": crate::webhooks::endpoint_count(store),
+        "waiting": crate::webhooks::waiting(store),
     })))
 }
 
@@ -412,6 +431,58 @@ async fn set_shared(State(state): State<Shared>, Body64(body): Body64) -> Answer
     let items = crate::shared::parse(&body)?;
     crate::shared::set(&state.host.store, &items)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// { exposureId, items: [{ id, dir, entry, status, expiresAt? }], embedAssetsDir? }: the
+/// published artifacts Link serves on surface a, and the widget's assets on surface e
+/// (artifacts.rs). The whole list, replacing the last one.
+async fn set_artifacts(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    same_exposure(&state, &body)?;
+    let kept = crate::artifacts::parse(&body)?;
+    crate::artifacts::set(&state.host.store, &kept)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// { exposureId, items: [{ tokens, enabled, maxBodyBytes, perMinute, ackStatus, handshake,
+/// verifyTokenSha256? }] }: the webhook endpoints the inbox takes deliveries for while
+/// RealTimeX isn't running (webhooks.rs). The whole list, replacing the last one.
+async fn set_webhooks(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    same_exposure(&state, &body)?;
+    let kept = crate::webhooks::parse(&body)?;
+    crate::webhooks::set(&state.host.store, &kept)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// ?after=<id>&limit=<1..100>: kept deliveries, oldest first: { items, total }.
+async fn inbox(
+    State(state): State<Shared>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Answer {
+    let limit = query
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(50);
+    let page = crate::webhooks::inbox_page(
+        &state.host.store,
+        query.get("after").map(String::as_str),
+        limit,
+    )?;
+    Ok(Json(page))
+}
+
+/// { exposureId, ids }: RealTimeX has these deliveries; they go. { acked }.
+async fn inbox_ack(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    same_exposure(&state, &body)?;
+    let ids: Vec<String> = body
+        .get("ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad_request("ids must be a list"))?
+        .iter()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .take(1000)
+        .collect();
+    let acked = state.host.store.inbox_ack(&ids)?;
+    Ok(Json(json!({ "acked": acked })))
 }
 
 /// The account Link is signed in to (signin.rs): { signedIn, via, email, name, signingIn, error,

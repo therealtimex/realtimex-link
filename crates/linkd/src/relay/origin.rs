@@ -27,6 +27,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{frame, response_headers, RelayRequest, Sender, TEXT_FLAG};
+use crate::artifacts::{Answer, Body};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a public client waits before trying an offline computer again.
@@ -221,13 +222,14 @@ pub(super) async fn http(
     body: mpsc::Receiver<bytes::Bytes>,
     target: Option<Target>,
     registry: Registry,
+    inbox: Option<Inbox>,
     send: Sender,
 ) {
     let Some(target) = target else {
-        return offline(id, &request, &send).await;
+        return unanswered(id, request, body, inbox, &send).await;
     };
     let Some(stream) = connect(&target, &registry).await else {
-        return offline(id, &request, &send).await;
+        return unanswered(id, request, body, inbox, &send).await;
     };
     let (mut sender, connection) =
         match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
@@ -409,6 +411,104 @@ pub(super) async fn websocket(
             },
         }
     }
+}
+
+/// Where webhook deliveries go while RealTimeX can't take them (webhooks.rs).
+#[derive(Clone)]
+pub(super) struct Inbox {
+    pub store: std::sync::Arc<crate::store::Store>,
+    pub rates: std::sync::Arc<crate::webhooks::Rates>,
+}
+
+/// RealTimeX isn't there: a webhook delivery or handshake goes to the inbox, anything else is
+/// "desktop offline".
+async fn unanswered(
+    id: u32,
+    request: RelayRequest,
+    mut body: mpsc::Receiver<bytes::Bytes>,
+    inbox: Option<Inbox>,
+    send: &Sender,
+) {
+    let pathname = request.path.split(['?', '#']).next().unwrap_or("");
+    let Some(inbox) =
+        inbox.filter(|_| request.surface == "h" && crate::webhooks::token_of(pathname).is_some())
+    else {
+        return offline(id, &request, send).await;
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.recv().await {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > crate::webhooks::MAX_BODY {
+            break;
+        }
+    }
+    // The client's own headers as received, with the address the relay named.
+    let mut headers = request.headers.clone();
+    headers.push(("x-forwarded-for".into(), request.client.to_string()));
+    let (method, path) = (request.method.clone(), request.path.clone());
+    let answer = tokio::task::spawn_blocking(move || {
+        crate::webhooks::receive(&inbox.store, &inbox.rates, &method, &path, &headers, &bytes)
+    })
+    .await;
+    match answer {
+        Ok(answer) => send_answer(id, answer, send).await,
+        Err(error) => reset(id, send, &error.to_string()).await,
+    }
+}
+
+/// An answer Link gives itself (artifacts.rs, webhooks.rs), a file streamed in frames.
+pub(super) async fn send_answer(id: u32, answer: Answer, send: &Sender) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let headers: serde_json::Map<String, Value> = answer
+        .headers
+        .into_iter()
+        .map(|(name, value)| (name, Value::String(value)))
+        .collect();
+    if !send
+        .meta(
+            frame::HEADERS,
+            id,
+            &json!({ "status": answer.status, "headers": headers }),
+        )
+        .await
+    {
+        return;
+    }
+    match answer.body {
+        Body::Bytes(bytes) => {
+            if !bytes.is_empty() && !send.data(frame::DATA, id, &bytes, 0).await {
+                return;
+            }
+        }
+        Body::File {
+            path,
+            start,
+            length,
+        } => {
+            let file = tokio::fs::File::open(&path).await;
+            let Ok(mut file) = file else {
+                return reset(id, send, "the file went away").await;
+            };
+            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                return reset(id, send, "the file went away").await;
+            }
+            let mut left = length;
+            let mut buffer = vec![0u8; 64 * 1024];
+            while left > 0 {
+                let want = left.min(buffer.len() as u64) as usize;
+                match file.read(&mut buffer[..want]).await {
+                    Ok(0) | Err(_) => return reset(id, send, "the file changed").await,
+                    Ok(read) => {
+                        if !send.data(frame::DATA, id, &buffer[..read], 0).await {
+                            return;
+                        }
+                        left -= read as u64;
+                    }
+                }
+            }
+        }
+    }
+    send.raw(frame::END, id, &[], 0).await;
 }
 
 async fn reset(id: u32, send: &Sender, reason: &str) {
@@ -606,6 +706,7 @@ mod tests {
             mpsc::channel(1).1,
             None,
             Registry::default(),
+            None,
             send,
         )
         .await;
@@ -655,7 +756,7 @@ mod tests {
         let mut request = request();
         request.surface = "a".into();
         request.path = "/ar/x/index.html".into();
-        http(9, request, rx, registry.target("a"), registry, send).await;
+        http(9, request, rx, registry.target("a"), registry, None, send).await;
         let seen = server.await.unwrap();
         assert!(seen.starts_with("get /ar/x/index.html http/1.1"));
         assert!(seen.contains(&format!("host: 127.0.0.1:{port}")));
