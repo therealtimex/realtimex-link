@@ -1488,7 +1488,7 @@ impl Relay {
             }
             let _ = sink.close().await;
         });
-        let send = Sender { data, control };
+        let send = Sender::new(data, control);
         send.urgent_meta(
             frame::HELLO,
             0,
@@ -1647,6 +1647,7 @@ impl Relay {
                 if let Some(old) = streams.remove(&frame.stream) {
                     old.task.abort();
                 }
+                send.opened(frame.stream);
                 match connection.request(&value, websocket) {
                     Ok(request) => {
                         let stream = self.open(frame.stream, request, routes.clone(), send.clone());
@@ -1787,16 +1788,22 @@ impl Relay {
 
 const TOO_LARGE: &str = "request body too large";
 
-/// A request body over its surface's limit (README: 413 beyond).
+/// A request body over its surface's limit (README: 413 beyond). When its response already
+/// began (a handler answering before reading the body), it can't become a 413: that stream
+/// alone is reset.
 async fn too_large(id: u32, send: &Sender) {
-    origin::answer(
-        id,
-        send,
-        413,
-        "application/json",
-        json!({ "error": "Request body too large" }).to_string(),
-    )
-    .await;
+    let head = json!({
+        "status": 413,
+        "headers": { "content-type": "application/json", "cache-control": "no-store" },
+    });
+    if !send.meta(frame::HEADERS, id, &head).await {
+        send.refuse(id, TOO_LARGE);
+        return;
+    }
+    let body = json!({ "error": "Request body too large" }).to_string();
+    if send.data(frame::DATA, id, body.as_bytes(), 0).await {
+        send.raw(frame::END, id, &[], 0).await;
+    }
 }
 
 /// A published artifact (surface a) or one of the widget's assets (surface e), from disk.
@@ -2410,6 +2417,9 @@ impl Ended {
 pub(crate) struct Sender {
     data: mpsc::Sender<Message>,
     control: mpsc::UnboundedSender<Message>,
+    /// Streams whose response HEADERS went out: a stream gets one, whoever answers it (the
+    /// relay ends the whole connection on a second).
+    answered: Arc<Mutex<HashSet<u32>>>,
 }
 
 fn encode(kind: u8, stream: u32, payload: &[u8], flags: u8) -> Vec<u8> {
@@ -2435,15 +2445,36 @@ fn meta_payload(value: &Value) -> Vec<u8> {
 }
 
 impl Sender {
+    fn new(data: mpsc::Sender<Message>, control: mpsc::UnboundedSender<Message>) -> Self {
+        Self {
+            data,
+            control,
+            answered: Arc::default(),
+        }
+    }
+
+    /// A new stream with this ID: nothing answered it yet.
+    fn opened(&self, stream: u32) {
+        lock(&self.answered).remove(&stream);
+    }
+
     /// One frame, in its stream's order. False: the connection is gone.
     async fn raw(&self, kind: u8, stream: u32, payload: &[u8], flags: u8) -> bool {
+        if kind == frame::END {
+            lock(&self.answered).remove(&stream);
+        }
         self.data
             .send(Message::Binary(encode(kind, stream, payload, flags).into()))
             .await
             .is_ok()
     }
 
+    /// False also for a second HEADERS on a stream: its response already began, and nothing
+    /// is sent.
     async fn meta(&self, kind: u8, stream: u32, value: &Value) -> bool {
+        if kind == frame::HEADERS && !lock(&self.answered).insert(stream) {
+            return false;
+        }
         self.raw(kind, stream, &meta_payload(value), 0).await
     }
 
@@ -2478,6 +2509,7 @@ impl Sender {
     }
 
     fn refuse(&self, stream: u32, reason: &str) {
+        lock(&self.answered).remove(&stream);
         self.urgent_meta(frame::RESET, stream, &json!({ "error": reason }));
     }
 
@@ -2971,7 +3003,7 @@ mod tests {
     async fn frames_round_trip_across_messages() {
         let (data, mut sent) = mpsc::channel(8);
         let (control, _) = mpsc::unbounded_channel();
-        let send = Sender { data, control };
+        let send = Sender::new(data, control);
         assert!(
             send.meta(frame::HEADERS, 7, &json!({ "status": 200 }))
                 .await
@@ -2999,7 +3031,7 @@ mod tests {
     async fn a_websocket_message_keeps_its_boundary_and_text_flag() {
         let (data, mut sent) = mpsc::channel(8);
         let (control, _) = mpsc::unbounded_channel();
-        let send = Sender { data, control };
+        let send = Sender::new(data, control);
         let message = vec![b'x'; MAX_DATA_FRAME + 10];
         assert!(send.data(frame::WS_DATA, 3, &message, TEXT_FLAG).await);
         let mut decoder = Decoder::default();
@@ -3030,6 +3062,70 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_overflow_after_the_response_began_resets_only_that_stream() {
+        let (data, mut sent) = mpsc::channel(32);
+        let (control, mut urgent) = mpsc::unbounded_channel();
+        let send = Sender::new(data, control);
+        let stream_of = |task: JoinHandle<()>, (tx, _rx): (mpsc::Sender<bytes::Bytes>, _)| Stream {
+            input: Some(Input::Body(tx)),
+            received: 0,
+            limit: 4,
+            parts: Vec::new(),
+            text: false,
+            task,
+            discarding: false,
+        };
+        // Stream 7's handler answers before reading the body, and keeps answering.
+        let (began, began_rx) = tokio::sync::oneshot::channel();
+        let handler = {
+            let send = send.clone();
+            tokio::spawn(async move {
+                assert!(
+                    send.meta(frame::HEADERS, 7, &json!({ "status": 200 }))
+                        .await
+                );
+                let _ = began.send(());
+                std::future::pending::<()>().await;
+            })
+        };
+        began_rx.await.unwrap();
+        let mut answering = stream_of(handler, mpsc::channel(4));
+        // Stream 9's handler hasn't answered.
+        let mut quiet = stream_of(tokio::spawn(std::future::pending()), mpsc::channel(4));
+        for (id, stream) in [(7u32, &mut answering), (9, &mut quiet)] {
+            assert_eq!(
+                stream.body(bytes::Bytes::from_static(b"12345")).await,
+                Err(TOO_LARGE)
+            );
+            stream.refuse_as_too_large(id, &send);
+            (&mut stream.task).await.unwrap();
+        }
+        let mut decoder = Decoder::default();
+        let mut frames = Vec::new();
+        while let Ok(Message::Binary(chunk)) = sent.try_recv() {
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        let headers = |id: u32| {
+            frames
+                .iter()
+                .filter(|f| f.kind == frame::HEADERS && f.stream == id)
+                .map(|f| serde_json::from_slice::<Value>(&f.payload).unwrap()["status"].clone())
+                .collect::<Vec<_>>()
+        };
+        // One HEADERS each: 7 keeps the response it began, 9 gets 413.
+        assert_eq!(headers(7), [json!(200)]);
+        assert_eq!(headers(9), [json!(413)]);
+        assert!(frames.iter().any(|f| f.kind == frame::END && f.stream == 9));
+        // Only stream 7 is reset; the connection goes on.
+        let mut resets = Vec::new();
+        while let Ok(Message::Binary(chunk)) = urgent.try_recv() {
+            resets.extend(Decoder::default().feed(&chunk).unwrap());
+        }
+        assert_eq!(resets.len(), 1);
+        assert_eq!((resets[0].kind, resets[0].stream), (frame::RESET, 7));
+    }
+
     #[tokio::test]
     async fn a_body_over_its_limit_is_refused() {
         let (tx, _rx) = mpsc::channel(4);
@@ -3052,7 +3148,7 @@ mod tests {
         // reach the client as the relay's 502).
         let (data, mut sent) = mpsc::channel(8);
         let (control, mut urgent) = mpsc::unbounded_channel();
-        let send = Sender { data, control };
+        let send = Sender::new(data, control);
         stream.refuse_as_too_large(7, &send);
         assert!(stream.discarding && stream.input.is_none());
         for _ in 0..3 {

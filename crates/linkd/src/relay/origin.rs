@@ -699,7 +699,7 @@ mod tests {
     async fn without_an_origin_a_browser_gets_the_offline_page() {
         let (data, mut sent) = mpsc::channel(8);
         let (control, _) = mpsc::unbounded_channel();
-        let send = Sender { data, control };
+        let send = Sender::new(data, control);
         http(
             5,
             request(),
@@ -750,7 +750,7 @@ mod tests {
         });
         let (data, mut sent) = mpsc::channel(8);
         let (control, _) = mpsc::unbounded_channel();
-        let send = Sender { data, control };
+        let send = Sender::new(data, control);
         let (body, rx) = mpsc::channel(1);
         drop(body);
         let mut request = request();
