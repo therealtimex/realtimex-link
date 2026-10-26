@@ -1,4 +1,4 @@
-//! The window: This computer and Computers, a request from a new computer, who is in control,
+//! The window: This computer and Clients, a request from a new computer, who is in control,
 //! and Open RealTimeX / Get RealTimeX. State comes from rtx-linkd every 1.5 s; each change is one
 //! request to it, made off the UI thread.
 
@@ -318,7 +318,7 @@ fn fit_height(ctx: &egui::Context, extra: f32) {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     ThisComputer,
-    Computers,
+    Clients,
 }
 
 /// Where keyboard focus goes next frame: Back when Settings opens, the gear when it closes.
@@ -825,8 +825,8 @@ impl eframe::App for LinkApp {
                         theme::selectable_value(
                             ui,
                             &mut self.tab,
-                            Tab::Computers,
-                            &tf("tabs.computers", &[("count", count.to_string().as_str())]),
+                            Tab::Clients,
+                            &tf("tabs.clients", &[("count", count.to_string().as_str())]),
                         );
                     });
                     ui.separator();
@@ -845,7 +845,7 @@ impl eframe::App for LinkApp {
                                 self.account_ui(ui, ctx, account.as_ref());
                             }
                         }
-                        Tab::Computers => self.computers_ui(ui, ctx, overview),
+                        Tab::Clients => self.clients_ui(ui, ctx, overview),
                     }
                 }
                 let focused = ctx.memory(|memory| memory.focused());
@@ -1388,8 +1388,8 @@ impl LinkApp {
         });
     }
 
-    fn computers_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, overview: &Value) {
-        caption(ui, t("computers.explain"));
+    fn clients_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, overview: &Value) {
+        caption(ui, t("clients.description"));
         let clients = overview
             .get("clients")
             .and_then(Value::as_array)
@@ -1397,7 +1397,7 @@ impl LinkApp {
             .unwrap_or_default();
         if clients.is_empty() {
             card(ui, |ui| {
-                ui.label(t("computers.none"));
+                ui.label(t("clients.none"));
             });
         }
         for client in clients {
@@ -1410,7 +1410,7 @@ impl LinkApp {
                     ui.label(semibold(&name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if revoked {
-                            badge(ui, &t("computers.blocked"), Tone::Danger);
+                            badge(ui, &t("clients.blocked"), Tone::Danger);
                         } else if control {
                             badge(ui, &access_label(true), Tone::Info);
                         } else {
@@ -1424,10 +1424,10 @@ impl LinkApp {
                     detail.push(machine);
                 }
                 let used = ago(&text(&client, "lastUsedAt"));
-                detail.push(tf("computers.lastUsed", &[("time", used.as_str())]));
+                detail.push(tf("clients.lastUsed", &[("time", used.as_str())]));
                 match text(&client, "admittedBy").as_str() {
-                    "password" => detail.push(t("computers.addedWithPassword")),
-                    "request" => detail.push(t("computers.youAllowed")),
+                    "password" => detail.push(t("clients.addedWithPassword")),
+                    "request" => detail.push(t("clients.youAllowed")),
                     "account" => detail.push(t("request.yourAccount")),
                     _ => {}
                 }
@@ -1445,9 +1445,9 @@ impl LinkApp {
                 });
                 if access != control {
                     let key = if access {
-                        "computers.nowFull"
+                        "clients.nowFull"
                     } else {
-                        "computers.nowView"
+                        "clients.nowView"
                     };
                     let done = tf(key, &[("name", name.as_str())]);
                     self.act(
@@ -1459,35 +1459,35 @@ impl LinkApp {
                 }
                 let named = [("name", name.as_str())];
                 ui.horizontal(|ui| {
-                    if !revoked && ui.button(t("computers.disconnect")).clicked() {
+                    if !revoked && ui.button(t("clients.disconnect")).clicked() {
                         self.act(
                             ctx,
                             "/v1/host/clients/disconnect",
                             json!({ "id": id }),
-                            &tf("computers.disconnected", &named),
+                            &tf("clients.disconnected", &named),
                         );
                     }
                     if revoked {
-                        if ui.button(t("computers.allowAgain")).clicked() {
+                        if ui.button(t("clients.allowAgain")).clicked() {
                             self.act(
                                 ctx,
                                 "/v1/host/clients/allow",
                                 json!({ "id": id }),
-                                &tf("computers.allowedAgain", &named),
+                                &tf("clients.allowedAgain", &named),
                             );
                         }
-                    } else if ui.button(t("computers.block")).clicked() {
+                    } else if ui.button(t("clients.block")).clicked() {
                         self.act(
                             ctx,
                             "/v1/host/clients/revoke",
                             json!({ "id": id }),
-                            &tf("computers.blockedDone", &named),
+                            &tf("clients.blockedDone", &named),
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .button(t("computers.remove"))
-                            .on_hover_text(tf("computers.removeHover", &named))
+                            .button(t("clients.remove"))
+                            .on_hover_text(tf("clients.removeHover", &named))
                             .clicked()
                         {
                             self.confirm = Some(Confirm::Remove {
@@ -1683,7 +1683,7 @@ impl LinkApp {
                     ctx,
                     "/v1/host/clients/remove",
                     json!({ "id": id }),
-                    &tf("computers.removed", &[("name", name.as_str())]),
+                    &tf("clients.removed", &[("name", name.as_str())]),
                 ),
                 Some(Confirm::SignOut) => self.act(
                     ctx,

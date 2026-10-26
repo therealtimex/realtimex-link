@@ -3,7 +3,7 @@
 //! Link, and Quit,
 //! which stops hosting (closing the window does not). How the window opens and text is copied is
 //! up to the process that shows the icon (Actions): the window's own on macOS and Windows, a
-//! separate window process on Linux (icon.rs).
+//! separate window process on Linux (icon.rs); copying is clipboard.rs's on both.
 
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -34,7 +34,13 @@ impl Actions {
                 show.send_viewport_cmd(ViewportCommand::Visible(true));
                 show.send_viewport_cmd(ViewportCommand::Focus);
             }),
-            copy: Box::new(move |text| copy.copy_text(text)),
+            // Straight to the clipboard: hidden, the window draws no frame to carry egui's copy.
+            // Should that fail, egui's copy lands once the window draws again.
+            copy: Box::new(move |text| {
+                if crate::clipboard::copy(&text).is_err() {
+                    copy.copy_text(text);
+                }
+            }),
         }
     }
 }

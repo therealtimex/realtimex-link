@@ -11,6 +11,7 @@ mod api;
 mod app;
 mod choices;
 mod cjk;
+mod clipboard;
 mod desktop;
 mod dock;
 mod i18n;

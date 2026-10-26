@@ -11,7 +11,10 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+# "clipboard": the system clipboard for the window's Copy buttons and pasting into its fields
+# (arboard; smithay-clipboard on Wayland). Without it egui keeps copies in a clipboard of its own,
+# so Copy put nothing on the system's (realtimex-link#6).
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard"] }
 # eframe's own winit, with the Adwaita title bar on Wayland: GNOME draws no server-side decorations,
 # and without this feature winit falls back to plain rectangles for its buttons. X11, macOS and
 # Windows are unaffected (the window manager or OS draws the title bar).
@@ -20,6 +23,9 @@ serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3.5.0", features = ["json"] }
 rtx-glibc-compat = { path = "../glibc-compat" }
+# The tray's Copy App ID and password (clipboard.rs), the same arboard egui uses. Linux: Wayland's
+# data-control protocol where the compositor has it, else X11.
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 # The local API's /v1/hello proof (HMAC-SHA256) and its nonce; already rtx-linkd's and rustls'.
 ring = "0.17"
 # The menu bar (macOS) and tray (Windows, Linux) icon. On Linux the StatusNotifierItem backend
