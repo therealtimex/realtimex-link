@@ -30,30 +30,44 @@ pub fn open_window() {
     }
 }
 
-/// Copy with the desktop's own tool (wl-copy on Wayland, xclip on X11); without one, the window
-/// opens instead, where the App ID and password can be copied.
+/// Copy from this long-lived process (clipboard.rs keeps serving the text to whoever pastes it):
+/// Wayland's data-control protocol where the compositor has it, else X11 (on GNOME's Wayland
+/// through Xwayland, whose clipboard it shares). Failing that, the desktop's own tool; without
+/// one, the window opens instead, where the App ID and password can be copied.
 fn copy(text: String) {
+    if crate::clipboard::copy(&text).is_ok() || copy_with_tool(&text) {
+        return;
+    }
+    open_window();
+}
+
+/// wl-copy on Wayland, xclip on X11: each forks to keep serving the text once we have closed its
+/// input, so the copy holds when the command returns. Whether it did, by its exit status.
+fn copy_with_tool(text: &str) -> bool {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let (program, args): (&str, &[&str]) = if wayland {
-        ("wl-copy", &[])
-    } else {
-        ("xclip", &["-selection", "clipboard"])
-    };
+    let (program, args) = tool(wayland);
     let child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    match child {
-        Ok(mut child) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
-        Err(_) => open_window(),
+    let Ok(mut child) = child else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        // Dropped at the end of this block: the tool reads to the end before it forks.
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    child.wait().is_ok_and(|status| status.success())
+}
+
+fn tool(wayland: bool) -> (&'static str, &'static [&'static str]) {
+    if wayland {
+        ("wl-copy", &[])
+    } else {
+        ("xclip", &["-selection", "clipboard"])
     }
 }
 
