@@ -423,6 +423,30 @@ mod tests {
     }
 
     #[test]
+    fn the_clients_tab_uses_realtimexs_name_and_description() {
+        // RealTimeX's settings.sharing.remoteControl.clients and clientsDescription: "Computers"
+        // read as RealTimeX's "Other computers" (realtimex-link#6).
+        let vi = LOCALES.iter().position(|l| l.code == "vi").unwrap();
+        assert_eq!(
+            fill(&lookup(ENGLISH, "tabs.clients"), &[("count", "2")]),
+            "Clients · 2"
+        );
+        assert_eq!(lookup(vi, "tabs.clients"), "Client · {count}");
+        assert_eq!(
+            lookup(ENGLISH, "clients.description"),
+            "Computers that signed in with this App ID and password. Each one has its own permission."
+        );
+        for (index, locale) in LOCALES.iter().enumerate() {
+            assert!(table(index).contains_key("tabs.clients"), "{}", locale.code);
+            assert!(
+                !table(index).contains_key("tabs.computers"),
+                "{}",
+                locale.code
+            );
+        }
+    }
+
+    #[test]
     fn system_languages_are_read_from_posix_and_apple_formats() {
         assert_eq!(posix_language("vi_VN.UTF-8").as_deref(), Some("vi_VN"));
         assert_eq!(posix_language("de_DE@euro").as_deref(), Some("de_DE"));
