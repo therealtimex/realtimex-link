@@ -489,7 +489,15 @@ async fn inbox_ack(State(state): State<Shared>, Body64(body): Body64) -> Answer 
 
 /// The account Link is signed in to (signin.rs): { signedIn, via, email, name, signingIn, error,
 /// offer }.
-async fn account(State(state): State<Shared>) -> Answer {
+/// ?check=1 (the window opening): whether RealTimeX is still present is checked first, which
+/// decides whether Sign out shows (owner.rs).
+async fn account(
+    State(state): State<Shared>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Answer {
+    if query.contains_key("check") && crate::owner::check_presence(&state.host.store) {
+        state.host.relay.wake();
+    }
     Ok(Json(state.host.signin.status()))
 }
 
@@ -553,6 +561,7 @@ async fn sign_in(State(state): State<Shared>) -> Answer {
 
 async fn sign_out(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let host = &state.host;
+    crate::owner::check_presence(&host.store);
     if crate::owner::present(&host.store) {
         // RealTimeX owns Link (§6.2): only it signs Link out, and its next handover signs Link in.
         let install_id = body

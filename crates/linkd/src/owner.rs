@@ -5,7 +5,8 @@
 //! refused (adopted-other); a handover without an installId (an older RealTimeX) is ignored once
 //! there is an owner.
 //!
-//! "Present" ends with POST /v1/account/release (RealTimeX's uninstallers send it), or when
+//! "Present" ends with POST /v1/account/release (RealTimeX's uninstallers send it), or, checked on
+//! demand (at start, when the window opens, before a sign-out), when
 //! RealTimeX's executable is gone from where its installers put it (macOS has no uninstaller),
 //! or after 30 days without a handover. A handover in the last 24 h counts as present whatever
 //! the executable check says (dev:all runs RealTimeX from source).
@@ -108,7 +109,8 @@ pub fn lapsed(owner: &Owner, now: i64, installed: bool) -> bool {
     since > LAPSE_MS || (since > RECENT_MS && !installed)
 }
 
-/// Check (at start and every 6 h) whether RealTimeX is still present; release it when not.
+/// Check whether RealTimeX is still present, and release it when not: at Link's start, when the
+/// window opens (GET /v1/account?check=1) and before a sign-out. No timer.
 /// Answers whether it was released.
 pub fn check_presence(store: &Store) -> bool {
     let Some(owner) = get(store) else {

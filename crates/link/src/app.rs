@@ -43,6 +43,8 @@ pub struct Snapshot {
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
     pub show_window: Option<u64>,
+    /// Check whether RealTimeX still owns Link with the next account read (the window opened).
+    pub check_presence: bool,
     /// The theme ("light", "dark", "system") and the language (a tag or "system") the window
     /// and Settings show, and Settings' changes on their way to the daemon.
     pub choices: Choices,
@@ -181,7 +183,11 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
     // poll (the window shows English until then).
     std::thread::spawn(crate::cjk::scan);
     let mut appearance = None;
+    // Whether RealTimeX still owns Link is checked when the window opens or is shown again
+    // (realtimex-ai-app#2836 §6.3 A3); the icon on its own shows no account.
+    let mut check_presence = ROLE.get().copied().unwrap_or("window") == "window";
     loop {
+        check_presence |= std::mem::take(&mut lock(&shared).check_presence);
         let api = lock(&shared).api.clone();
         let api = match api {
             Some(api) => Some(api),
@@ -248,6 +254,7 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let seen = std::mem::replace(&mut lock(&shared).show_window, shown);
             if let (Some(seen), Some(shown)) = (seen, shown) {
                 if shown > seen {
+                    check_presence = true;
                     crate::dock::set_open(true);
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -257,7 +264,13 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let overview = api.get("/v1/host/overview");
             let requests = api.get("/v1/host/connection-requests");
             let password = api.get("/v1/host/password");
-            let account = api.get("/v1/account").ok();
+            let account = api
+                .get(if std::mem::take(&mut check_presence) {
+                    "/v1/account?check=1"
+                } else {
+                    "/v1/account"
+                })
+                .ok();
             let update = api.get("/v1/update").ok();
             let mut state = lock(&shared);
             state.account = account;
@@ -365,6 +378,9 @@ pub struct LinkApp {
     tray: Option<crate::tray::Tray>,
     /// The app icon in the header.
     icon: egui::TextureHandle,
+    /// Whether the window had the focus last frame: gaining it (opened, shown again) checks
+    /// whether RealTimeX still owns Link.
+    focused: bool,
 }
 
 impl LinkApp {
@@ -405,6 +421,7 @@ impl LinkApp {
             show_password: false,
             editing_password: None,
             confirm: None,
+            focused: false,
         }
     }
 
@@ -614,6 +631,13 @@ impl eframe::App for LinkApp {
             std::process::exit(0);
         }
         crate::dock::apply();
+        let focused = ctx.input(|i| i.viewport().focused) == Some(true);
+        if focused && !std::mem::replace(&mut self.focused, focused) {
+            lock(&self.shared).check_presence = true;
+            let _ = self.refresh.send(());
+        } else {
+            self.focused = focused;
+        }
         if let Some(tray) = &self.tray {
             let state = lock(&self.shared);
             tray.update(

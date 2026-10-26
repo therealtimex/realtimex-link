@@ -866,21 +866,11 @@ impl Host {
         self.follow_hosting_at_login();
         self.relay.start();
         self.updater.start();
-        // Whether RealTimeX is still here to own Link (§6.3 A3): at start and every 6 h.
-        let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            loop {
-                let Some(host) = weak.upgrade() else { return };
-                if crate::owner::check_presence(&host.store) {
-                    (host.log)(
-                        "[sign-in] RealTimeX is gone: RealTimeX Link manages its own account again",
-                    );
-                    host.relay.wake();
-                }
-                drop(host);
-                tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
-            }
-        });
+        // Whether RealTimeX is still here to own Link (§6.3 A3): checked when needed (here, when
+        // the window opens, before a sign-out), never on a timer.
+        if crate::owner::check_presence(&self.store) {
+            (self.log)("[sign-in] RealTimeX is gone: RealTimeX Link manages its own account again");
+        }
         // The webhook inbox keeps deliveries for a week (webhooks.rs).
         let store = self.store.clone();
         tokio::spawn(async move {
