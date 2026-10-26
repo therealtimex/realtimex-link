@@ -544,12 +544,14 @@ async fn account_token(State(state): State<Shared>, Body64(body): Body64) -> Ans
     }
 }
 
-/// { installId }: the owning RealTimeX lets this Link go (Host::release_by_realtimex).
-/// { released, droppedExposure }; 409 adopted-other from anyone but the owner, and when no
-/// RealTimeX owns Link ("not yours, nothing to release").
+/// { installId, movesTo? }: the owning RealTimeX lets this Link go (Host::release_by_realtimex):
+/// it is uninstalled, or with movesTo "instance" a dev RealTimeX moves its exposure to a Link
+/// instance of its own. { released, droppedExposure }; 409 adopted-other from anyone but the
+/// owner, and when no RealTimeX owns Link ("not yours, nothing to release").
 async fn account_release(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let install_id = body.get("installId").and_then(Value::as_str).unwrap_or("");
-    let dropped = state.host.release_by_realtimex(install_id).await?;
+    let moves = moves_to_instance(&body)?;
+    let dropped = state.host.release_by_realtimex(install_id, moves).await?;
     Ok(Json(
         json!({ "released": true, "droppedExposure": dropped }),
     ))
@@ -646,6 +648,15 @@ async fn update_install(State(state): State<Shared>) -> Answer {
         .await
         .map_err(|error| ApiError::new(500, error.to_string()))?;
     Ok(Json(answer))
+}
+
+/// Release's movesTo: absent (uninstalled) or "instance" (a dev RealTimeX's own Link instance).
+fn moves_to_instance(body: &Value) -> ApiResult<bool> {
+    match body.get("movesTo") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(to)) if to == "instance" => Ok(true),
+        Some(_) => Err(ApiError::bad_request("movesTo must be \"instance\"")),
+    }
 }
 
 /// "Continue as …": sign in with the account RealTimeX offered.
@@ -857,6 +868,15 @@ async fn stop_session(State(state): State<Shared>) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_moves_only_to_an_instance() {
+        assert!(!moves_to_instance(&json!({ "installId": "x" })).unwrap());
+        assert!(moves_to_instance(&json!({ "movesTo": "instance" })).unwrap());
+        let bogus = moves_to_instance(&json!({ "movesTo": "bogus" })).unwrap_err();
+        assert_eq!(bogus.status, 400);
+        assert!(moves_to_instance(&json!({ "movesTo": true })).is_err());
+    }
 
     #[test]
     fn bearer_prefix_in_any_case() {

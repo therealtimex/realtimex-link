@@ -840,15 +840,23 @@ impl Host {
         crate::autostart::opted_out(&self.store)
     }
 
-    /// The owning RealTimeX lets this Link go (POST /v1/account/release): it is being uninstalled,
-    /// or a dev RealTimeX moves to a Link instance of its own (instance.rs). Link is its own again
-    /// and offers its own sign-in and sign-out (§6.2). In this order, so a crash part-way leaves a
-    /// release RealTimeX can retry: the exposure adopted from it goes (it may live in another
-    /// instance next, and must not be taken back from there), Link signs out for RealTimeX (no
-    /// token: nothing to recover or enroll until the next handover), and only then the owner
-    /// record goes. Answers the dropped exposure's ID. 409 adopted-other from anyone but the
-    /// owner, and when no RealTimeX owns Link.
-    pub async fn release_by_realtimex(&self, install_id: &str) -> Result<Option<String>, ApiError> {
+    /// The owning RealTimeX lets this Link go (POST /v1/account/release). Link is its own again
+    /// and offers its own sign-in and sign-out (§6.2).
+    /// - Uninstalled (`moves` false): only the owner record goes; Link keeps its App ID, its
+    ///   exposure and its sign-in, and keeps serving.
+    /// - A dev RealTimeX moving to a Link instance of its own (`moves`, instance.rs): the exposure
+    ///   adopted from it goes too (that instance adopts it next, and this one must never take it
+    ///   back), and Link signs out for RealTimeX (no token: nothing to recover or enroll until the
+    ///   next handover). In that order, the owner record last, so a crash part-way leaves a
+    ///   release RealTimeX can retry.
+    ///
+    /// Answers the dropped exposure's ID. 409 adopted-other from anyone but the owner, and when
+    /// no RealTimeX owns Link.
+    pub async fn release_by_realtimex(
+        &self,
+        install_id: &str,
+        moves: bool,
+    ) -> Result<Option<String>, ApiError> {
         if !crate::owner::present(&self.store) {
             return Err(ApiError::coded(
                 409,
@@ -857,13 +865,20 @@ impl Host {
             ));
         }
         crate::owner::check(&self.store, install_id)?;
-        let dropped = self.relay.release_adopted().map_err(ApiError::internal)?;
-        self.signin
-            .sign_out_for_realtimex()
-            .await
-            .map_err(|error| ApiError::new(500, error.to_string()))?;
+        let mut dropped = None;
+        if moves {
+            dropped = self.relay.release_adopted().map_err(ApiError::internal)?;
+            self.signin
+                .sign_out_for_realtimex()
+                .await
+                .map_err(|error| ApiError::new(500, error.to_string()))?;
+        }
         crate::owner::release(&self.store)?;
-        (self.log)("[sign-in] RealTimeX released RealTimeX Link");
+        (self.log)(if moves {
+            "[sign-in] RealTimeX released RealTimeX Link for an instance of its own"
+        } else {
+            "[sign-in] RealTimeX released RealTimeX Link"
+        });
         Ok(dropped)
     }
 
