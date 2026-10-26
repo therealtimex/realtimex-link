@@ -2903,7 +2903,6 @@ mod tests {
     /// A Host in a temporary folder, signed in (as RealTimeX's handover) to account `u1` against
     /// the Marketplace at `base`, with Link's own d-only exposure.
     fn signed_in_host(dir: &std::path::Path, base: &str) -> Arc<Host> {
-        use base64::Engine;
         let host = Host::new(
             Arc::new(crate::store::Store::open(dir).unwrap()),
             crate::secret_box::SecretBox::new(dir),
@@ -2917,9 +2916,9 @@ mod tests {
         );
         host.load_identity().unwrap();
         *lock(&host.relay.api_base) = Some(base.to_string());
-        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"sub":"u1","email":"u1@example.com","exp":4000000000}"#);
-        host.relay.set_account(&format!("h.{claims}.s")).unwrap();
+        host.relay.set_account(&token("u1")).unwrap();
+        // RealTimeX's install rtx-install owns this Link (§6.3 A1).
+        crate::owner::claim(&host.store, "rtx-install", crate::util::now_ms()).unwrap();
         host.relay
             .save(&host, &view("linkOwn", &["d"], "own-credential"))
             .unwrap();
@@ -2927,6 +2926,16 @@ mod tests {
             .set(keys::INSTALL_ID, &json!("link-install"))
             .unwrap();
         host
+    }
+
+    /// An access token for account `subject` (unsigned: Link only reads its claims).
+    fn token(subject: &str) -> String {
+        use base64::Engine;
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({ "sub": subject, "email": format!("{subject}@example.com"), "exp": 4000000000u64 })
+                .to_string(),
+        );
+        format!("h.{claims}.s")
     }
 
     async fn eventually(what: &str, check: impl Fn() -> bool) {
@@ -2959,7 +2968,7 @@ mod tests {
         let relay = host.relay.clone();
 
         let pending = relay
-            .adopt("rtxExposure", "rtx-install", "u1")
+            .adopt(Some("rtxExposure"), "rtx-install", "u1")
             .await
             .unwrap_err();
         assert_eq!(
@@ -2977,7 +2986,7 @@ mod tests {
         relay.retire_own();
         // Adopting again while incomplete is still pending.
         let again = relay
-            .adopt("rtxExposure", "rtx-install", "u1")
+            .adopt(Some("rtxExposure"), "rtx-install", "u1")
             .await
             .unwrap_err();
         assert_eq!(again.code.as_deref(), Some("adopt-pending"));
@@ -2992,7 +3001,7 @@ mod tests {
         relay.mark_serving(&relay.connection(&host).unwrap());
         assert_eq!(relay.exposure()["state"], "online");
         let ok = relay
-            .adopt("rtxExposure", "rtx-install", "u1")
+            .adopt(Some("rtxExposure"), "rtx-install", "u1")
             .await
             .unwrap();
         assert_eq!(ok["appId"], "rtxExposure");
@@ -3201,6 +3210,101 @@ mod tests {
             assert_eq!(connection.credential, current);
             assert!(connection.carries(&SURFACES));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn realtimexs_handover_wins_and_an_account_switch_drops_the_exposure() {
+        let (base, _seen) = marketplace(|_, _, _, _, _| (404, json!({}))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let subject = || {
+            host.store.get(crate::identity::keys::ACCOUNT).unwrap()["subject"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // The same account again: nothing changes.
+        relay.take_handover(&token("u1"), None).await.unwrap();
+        assert_eq!(relay.exposure_id().as_deref(), Some("linkOwn"));
+        // Another install is refused and changes nothing (§6.3 A1).
+        let other = crate::owner::claim(&host.store, "rtx-other", 1).unwrap_err();
+        assert_eq!(other.code.as_deref(), Some("adopted-other"));
+        // The owner switches accounts: Link takes the new one and drops the previous account's
+        // exposure, credential and all, keeping its ID as a former one (§6.3 A4).
+        relay.take_handover(&token("u2"), None).await.unwrap();
+        assert_eq!(subject(), "u2");
+        assert_eq!(relay.exposure_id(), None);
+        assert!(host.store.get(keys::CREDENTIAL).is_none());
+        assert!(host.store.get(keys::INSTALL_ID).is_none());
+        assert!(host.former_app_ids().contains(&"linkOwn".to_string()));
+        let exposure = relay.exposure();
+        assert_eq!(exposure["notice"]["kind"], "switched");
+        assert_eq!(exposure["notice"]["from"], "linkOwn");
+        relay.notice_seen().unwrap();
+        assert!(relay.exposure()["notice"].is_null());
+        // A token that isn't one is refused.
+        assert!(relay.take_handover("not a token", None).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn realtimex_signing_out_stops_link_and_waiting_for_it_is_said() {
+        let (base, _seen) = marketplace(|_, _, _, _, _| (404, json!({}))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        assert!(Relay::wanted(&host));
+        host.signin.sign_out_for_realtimex().await.unwrap();
+        assert!(!Relay::wanted(&host));
+        assert_eq!(relay.exposure()["state"], "signed-out");
+        // Its next handover signs Link in again (not only offered).
+        relay.take_handover(&token("u1"), None).await.unwrap();
+        assert!(Relay::wanted(&host));
+        // Enrolling needs a token RealTimeX hasn't handed over (§6.3 A5).
+        relay.set_status("error", Some(WAITING_FOR_REALTIMEX.into()));
+        assert_eq!(relay.exposure()["error"]["code"], "waiting-for-realtimex");
+        // Released (uninstalled): Link is its own again.
+        crate::owner::release(&host.store).unwrap();
+        assert_eq!(host.signin.status()["managedByRealtimex"], false);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adopting_without_an_exposure_creates_one_under_realtimexs_install() {
+        let (base, seen) = marketplace(|method, path, _, body, _| match (method, path) {
+            ("POST", "/v1/relay-exposures")
+                if body["installId"] == "rtx-install" && body["connectorCredential"].is_null() =>
+            {
+                (200, view("newExposure", &SURFACES, "created"))
+            }
+            ("POST", "/v1/relay-exposures") if body["connectorCredential"] == "created" => {
+                (200, view("newExposure", &SURFACES, "created"))
+            }
+            _ => (404, json!({ "message": "unexpected" })),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let answer = relay.adopt(None, "rtx-install", "u1").await.unwrap();
+        assert_eq!(answer["appId"], "newExposure");
+        assert!(answer["formerAppIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("linkOwn")));
+        assert_eq!(host.store.get(keys::INSTALL_ID), Some(json!("rtx-install")));
+        assert!(relay.complete());
+        let created = seen.lock().unwrap()[0].3.clone();
+        assert_eq!(created["surfaces"], json!(SURFACES));
+        // Again: the same answer, nothing new.
+        assert_eq!(
+            relay.adopt(None, "rtx-install", "u1").await.unwrap()["appId"],
+            "newExposure"
+        );
+        // Another install, or the wrong account, is refused.
+        let other = relay.adopt(None, "rtx-other", "u1").await.unwrap_err();
+        assert_eq!(other.code.as_deref(), Some("adopted-other"));
+        let stranger = relay.adopt(None, "rtx-install", "u9").await.unwrap_err();
+        assert_eq!(stranger.code.as_deref(), Some("signed-out"));
     }
 
     #[test]

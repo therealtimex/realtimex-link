@@ -1,7 +1,9 @@
 //! What realtimex-ai-app#2836 adds to the window (prototype v3): "RealTimeX Link" with its
-//! On/Off switch above the tabs, the one-time "This computer now has one App ID", and the
+//! On/Off switch above the tabs, the one-time "This computer now has one App ID" (or, after
+//! RealTimeX switched accounts, that the previous account's links are offline), and the
 //! read-only "Shared from this computer" card, written here from what RealTimeX pushed
-//! (GET /v1/shared) and whether RealTimeX runs now.
+//! (GET /v1/shared), whether RealTimeX runs now, and what Link does itself while it is closed:
+//! published artifacts stay up and webhooks are kept for RealTimeX.
 
 use super::*;
 
@@ -37,25 +39,45 @@ fn counted(key: &str, count: u64) -> String {
 }
 
 /// The card's rows from RealTimeX's items (already in the card's order, rtx-linkd's shared.rs).
-/// `open`: RealTimeX runs (an origin is registered).
-fn rows(items: &Value, open: bool) -> Vec<Row> {
+/// `open`: RealTimeX runs (an origin is registered); `waiting`: webhook deliveries Link keeps
+/// for RealTimeX.
+fn rows(items: &Value, open: bool, waiting: u64) -> Vec<Row> {
     let up = || (t("shared.up"), Tone::Success);
     let offline = || (t("shared.offline"), Tone::Neutral);
     let mut rows = Vec::new();
     for item in items.as_array().into_iter().flatten() {
         let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
         let row = match kind {
-            // Served by RealTimeX until Link serves their folders itself (realtimex-link#6 M2).
+            // Link serves them from their folders itself, RealTimeX open or not.
             "artifacts" => Row {
                 name: t("shared.artifacts"),
-                detail: counted("shared.published", count(item)),
-                badge: if open { up() } else { offline() },
+                detail: format!(
+                    "{} · {}",
+                    counted("shared.published", count(item)),
+                    t("shared.artifactsStayUp")
+                ),
+                badge: up(),
             },
-            "webhooks" => Row {
-                name: t("shared.webhooks"),
-                detail: counted("shared.endpoints", count(item)),
-                badge: if open { up() } else { offline() },
-            },
+            // Taken live, or kept by Link while RealTimeX is closed.
+            "webhooks" => {
+                let endpoints = counted("shared.endpoints", count(item));
+                if open || waiting == 0 {
+                    Row {
+                        name: t("shared.webhooks"),
+                        detail: format!("{endpoints} · {}", t("shared.webhooksKept")),
+                        badge: up(),
+                    }
+                } else {
+                    Row {
+                        name: t("shared.webhooks"),
+                        detail: format!(
+                            "{endpoints} · {}",
+                            counted("shared.deliveriesKept", waiting)
+                        ),
+                        badge: (counted("shared.waiting", waiting), Tone::Info),
+                    }
+                }
+            }
             "widget" => {
                 let widgets = counted("shared.widgets", count(item));
                 let sites = names(item);
@@ -158,11 +180,22 @@ impl LinkApp {
         };
         let app_id = text(notice, "appId");
         let from = text(notice, "from");
-        alert(ui, Tone::Info, &t("moved.title"), |ui| {
-            ui.label(tf(
-                "moved.message",
-                &[("appId", app_id.as_str()), ("old", from.as_str())],
-            ));
+        // RealTimeX switched accounts (§6.3 A4): the previous account's links went offline.
+        let switched = text(notice, "kind") == "switched";
+        let (title, tone) = if switched {
+            (t("switched.title"), Tone::Warning)
+        } else {
+            (t("moved.title"), Tone::Info)
+        };
+        alert(ui, tone, &title, |ui| {
+            if switched {
+                ui.label(tf("switched.message", &[("old", from.as_str())]));
+            } else {
+                ui.label(tf(
+                    "moved.message",
+                    &[("appId", app_id.as_str()), ("old", from.as_str())],
+                ));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 if primary_button(ui, &t("moved.ok")).clicked() {
                     self.act(ctx, "/v1/exposure/notice-seen", json!({}), "");
@@ -178,7 +211,6 @@ impl LinkApp {
         &mut self,
         ui: &mut egui::Ui,
         shared: Option<&Value>,
-        account: Option<&Value>,
         exposure: Option<&Value>,
     ) {
         let Some(answer) = shared else { return };
@@ -189,8 +221,7 @@ impl LinkApp {
             return;
         };
         let reach = Reach::of(exposure, answer.get("origin") == Some(&Value::Bool(true)));
-        let theirs = account.map(|a| text(a, "offer")).unwrap_or_default();
-        let ours = account.map(|a| text(a, "email")).unwrap_or_default();
+        let waiting = answer.get("waiting").and_then(Value::as_u64).unwrap_or(0);
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(semibold(t("shared.title")).size(15.0));
@@ -199,21 +230,6 @@ impl LinkApp {
             });
             caption(ui, t("shared.explain"));
             match &reach {
-                Reach::OtherAccount => {
-                    alert(ui, Tone::Warning, &t("shared.otherAccountTitle"), |ui| {
-                        ui.label(tf(
-                            "shared.otherAccount",
-                            &[("realtimex", theirs.as_str()), ("link", ours.as_str())],
-                        ));
-                        if !theirs.is_empty()
-                            && ui
-                                .button(tf("shared.useAccount", &[("name", theirs.as_str())]))
-                                .clicked()
-                        {
-                            self.confirm = Some(Confirm::UseAccount(theirs.clone()));
-                        }
-                    });
-                }
                 Reach::SignedOut => {
                     alert(ui, Tone::Warning, &t("shared.signedOutTitle"), |ui| {
                         ui.label(t("shared.signedOut"));
@@ -234,7 +250,7 @@ impl LinkApp {
                 }
                 Reach::Online | Reach::Connecting => {}
             }
-            for row in card_rows(items, &reach) {
+            for row in card_rows(items, &reach, waiting) {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(semibold(&row.name));
@@ -260,14 +276,12 @@ enum Reach {
     Connecting,
     SignedOut,
     Error(String),
-    OtherAccount,
 }
 
 impl Reach {
     fn of(exposure: Option<&Value>, origin: bool) -> Self {
         let state = exposure.map(|e| text(e, "state"));
         match state.as_deref() {
-            Some("other-account") => Reach::OtherAccount,
             Some("signed-out") => Reach::SignedOut,
             Some("error") => Reach::Error(
                 exposure
@@ -288,18 +302,18 @@ impl Reach {
             Reach::Online => (t("shared.online"), Tone::Success),
             Reach::Closed => (t("shared.realtimexClosed"), Tone::Info),
             Reach::Connecting => (t("shared.connecting"), Tone::Info),
-            Reach::SignedOut | Reach::OtherAccount => (t("shared.notShared"), Tone::Warning),
+            Reach::SignedOut => (t("shared.notShared"), Tone::Warning),
             Reach::Error(_) => (t("shared.notReachable"), Tone::Danger),
         }
     }
 }
 
-/// The rows as `reach` shows them: hidden when nothing of RealTimeX's can go through (signed out,
-/// another account); "Connecting" or "Offline" while Link doesn't serve.
-fn card_rows(items: &Value, reach: &Reach) -> Vec<Row> {
-    let mut rows = rows(items, *reach == Reach::Online);
+/// The rows as `reach` shows them: hidden when nothing of RealTimeX's can go through (signed
+/// out); "Connecting" or "Offline" while Link doesn't serve.
+fn card_rows(items: &Value, reach: &Reach, waiting: u64) -> Vec<Row> {
+    let mut rows = rows(items, *reach == Reach::Online, waiting);
     let badge = match reach {
-        Reach::SignedOut | Reach::OtherAccount => return Vec::new(),
+        Reach::SignedOut => return Vec::new(),
         Reach::Connecting => (t("shared.connecting"), Tone::Neutral),
         Reach::Error(_) => (t("shared.offline"), Tone::Neutral),
         Reach::Online | Reach::Closed => return rows,
@@ -323,21 +337,31 @@ mod tests {
             { "kind": "messaging", "count": 2, "names": ["Office Mac", "Studio PC"] },
             { "kind": "later", "count": 1 },
         ]);
-        let open = rows(&items, true);
+        let open = rows(&items, true, 4);
         assert_eq!(open.len(), 4);
         assert!(open.iter().all(|row| row.badge.1 == Tone::Success));
         assert!(open[2].detail.contains("support.example.com"));
         assert_eq!(open[3].detail, "Office Mac, Studio PC");
-        let closed = rows(&items, false);
-        assert!(closed.iter().all(|row| row.badge.1 == Tone::Neutral));
-        assert!(rows(&json!([]), true).is_empty());
+        // RealTimeX closed: artifacts stay up (Link serves them), webhooks wait for it, the
+        // widget's chat and desktop messaging are offline.
+        let closed = rows(&items, false, 4);
+        assert_eq!(closed[0].badge.1, Tone::Success);
+        assert_eq!(closed[1].badge, ("4 waiting".to_string(), Tone::Info));
+        assert!(
+            closed[1].detail.contains("4 deliveries"),
+            "{}",
+            closed[1].detail
+        );
+        assert!(closed[2..].iter().all(|row| row.badge.1 == Tone::Neutral));
+        assert_eq!(rows(&items, false, 0)[1].badge.1, Tone::Success);
+        assert!(rows(&json!([]), true, 0).is_empty());
     }
 
     #[test]
     fn whether_link_serves_comes_before_whether_realtimex_runs() {
         let items = json!([
-            { "kind": "artifacts", "count": 3, "names": [] },
             { "kind": "mobile", "count": 2, "names": [] },
+            { "kind": "messaging", "count": 1, "names": ["Office Mac"] },
         ]);
         let exposure = |state: &str| json!({ "state": state, "error": { "code": "recovery-capped", "message": "taken back" } });
         let cases = [
@@ -347,7 +371,6 @@ mod tests {
             ("connecting", false, Reach::Connecting, Some(Tone::Neutral)),
             ("signed-out", true, Reach::SignedOut, None),
             ("signed-out", false, Reach::SignedOut, None),
-            ("other-account", true, Reach::OtherAccount, None),
             (
                 "error",
                 true,
@@ -358,7 +381,7 @@ mod tests {
         for (state, origin, reach, row_tone) in cases {
             let got = Reach::of(Some(&exposure(state)), origin);
             assert_eq!(got, reach, "{state} {origin}");
-            let shown = card_rows(&items, &got);
+            let shown = card_rows(&items, &got, 0);
             match row_tone {
                 None => assert!(shown.is_empty(), "{state}"),
                 Some(tone) => {

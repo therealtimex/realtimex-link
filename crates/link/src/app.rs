@@ -332,8 +332,7 @@ enum Confirm {
     TurnOff,
     /// "Keep RealTimeX Link running" off: everything it carries stops.
     TurnOffLink,
-    /// Sign Link in to RealTimeX's account instead of its own (one App ID needs one account).
-    UseAccount(String),
+
     NewPassword,
     StopSession(String),
     Remove {
@@ -845,7 +844,6 @@ impl eframe::App for LinkApp {
                                 self.shared_ui(
                                     ui,
                                     shared.as_ref(),
-                                    account.as_ref(),
                                     status.as_ref().and_then(|s| s.get("exposure")),
                                 );
                             } else {
@@ -853,7 +851,6 @@ impl eframe::App for LinkApp {
                                 self.shared_ui(
                                     ui,
                                     shared.as_ref(),
-                                    account.as_ref(),
                                     status.as_ref().and_then(|s| s.get("exposure")),
                                 );
                                 self.account_ui(ui, ctx, account.as_ref());
@@ -943,6 +940,8 @@ impl LinkApp {
         let Some(account) = account else { return };
         let signed_in = account.get("signedIn") == Some(&Value::Bool(true));
         let signing_in = account.get("signingIn") == Some(&Value::Bool(true));
+        // RealTimeX owns this Link (realtimex-ai-app#2836 §6.2): its account, read-only here.
+        let managed = account.get("managedByRealtimex") == Some(&Value::Bool(true));
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(semibold(t("account.title")).size(15.0));
@@ -957,14 +956,26 @@ impl LinkApp {
                 ui.horizontal(|ui| {
                     let email = text(account, "email");
                     ui.label(&email);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(t("account.signOut")).clicked() {
-                            self.confirm = Some(Confirm::SignOut);
-                        }
-                    });
+                    if !managed {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(t("account.signOut")).clicked() {
+                                self.confirm = Some(Confirm::SignOut);
+                            }
+                        });
+                    }
                 });
-                if text(account, "via") == "realtimex" {
+                if managed {
+                    caption(ui, t("account.managedByRealtimex"));
+                } else if text(account, "via") == "realtimex" {
                     caption(ui, t("account.viaRealtimex"));
+                }
+                return;
+            }
+            if managed {
+                // RealTimeX signed out: signing in happens there.
+                caption(ui, t("account.signInInRealtimex"));
+                if primary_button(ui, &t("footer.openRealtimex")).clicked() {
+                    desktop::open_realtimex();
                 }
                 return;
             }
@@ -1634,7 +1645,7 @@ impl LinkApp {
         let (which, name) = match confirm {
             Confirm::TurnOff => ("turnOff", ""),
             Confirm::TurnOffLink => ("turnOffLink", ""),
-            Confirm::UseAccount(name) => ("useAccount", name.as_str()),
+
             Confirm::NewPassword => ("newPassword", ""),
             Confirm::StopSession(name) => ("stop", name.as_str()),
             Confirm::Remove { name, .. } => ("remove", name.as_str()),
@@ -1686,12 +1697,7 @@ impl LinkApp {
                     json!({ "on": false }),
                     &t("link.turnedOff"),
                 ),
-                Some(Confirm::UseAccount(name)) => self.act(
-                    ctx,
-                    "/v1/account/use-realtimex",
-                    json!({}),
-                    &tf("shared.usingAccount", &[("name", name.as_str())]),
-                ),
+
                 Some(Confirm::NewPassword) => self.act(
                     ctx,
                     "/v1/host/password/regenerate",
