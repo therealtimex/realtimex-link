@@ -381,7 +381,7 @@ pub fn card_frame(ui: &egui::Ui) -> egui::Frame {
         .corner_radius(CornerRadius::same(CARD_RADIUS))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Success,
     Warning,

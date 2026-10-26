@@ -1,0 +1,607 @@
+//! RealTimeX behind Link (realtimex-ai-app#2836): while RealTimeX runs it registers its servers
+//! here (POST /v1/origin), and the relay's requests for published artifacts, the embed widget,
+//! webhooks, the mobile app and desktop messaging are passed to them over loopback, with the
+//! headers RealTimeX's own connector set (relayConnector.cjs): where the request came from, on
+//! which surface, and that it came from the public relay. Each also carries the origin's token, so
+//! RealTimeX can tell Link's relayed requests from any other local caller.
+//!
+//! Nothing registered, or nothing listening there any more: "desktop offline" (503).
+//!
+//! The origin is kept in memory only: RealTimeX registers again at each start, and a port nobody
+//! answers on is forgotten, so a later process on that port is never handed public requests.
+
+use std::convert::Infallible;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use http_body_util::{BodyExt, StreamBody};
+use hyper_util::rt::TokioIo;
+use serde_json::{json, Value};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::Message;
+
+use super::{frame, response_headers, RelayRequest, Sender, TEXT_FLAG};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a public client waits before trying an offline computer again.
+const RETRY_AFTER: u64 = 30;
+/// RealTimeX's marker for requests from the public relay (desktopLoopbackSession.js there).
+const RELAY_SOURCE_HEADER: &str = "x-realtimex-relay-source";
+const PUBLIC_RELAY_SOURCE: &str = "public-relay";
+const RELAY_SURFACE_HEADER: &str = "x-realtimex-relay-surface";
+/// The origin's token, on every request Link passes to it.
+pub const ORIGIN_TOKEN_HEADER: &str = "x-realtimex-link-origin";
+const MIN_TOKEN: usize = 32;
+const MAX_TOKEN: usize = 256;
+
+/// RealTimeX's servers: its backend, and the embed widget's proxy when it has its own port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub port: u16,
+    pub embed_port: Option<u16>,
+    pub token: String,
+}
+
+impl Origin {
+    /// POST /v1/origin's body: { port, embedPort?, token }.
+    pub fn from_body(body: &Value) -> Result<Self, String> {
+        let port = |name: &str| -> Result<Option<u16>, String> {
+            match body.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port > 0)
+                    .map(Some)
+                    .ok_or_else(|| format!("{name} must be a port number")),
+            }
+        };
+        let token = body.get("token").and_then(Value::as_str).unwrap_or("");
+        if !(MIN_TOKEN..=MAX_TOKEN).contains(&token.len())
+            || !token.chars().all(|c| c.is_ascii_graphic())
+        {
+            return Err(format!(
+                "token must be {MIN_TOKEN} to {MAX_TOKEN} visible ASCII characters"
+            ));
+        }
+        Ok(Self {
+            port: port("port")?.ok_or("port is required")?,
+            embed_port: port("embedPort")?,
+            token: token.to_string(),
+        })
+    }
+}
+
+/// Where one stream goes: the port for its surface, and the token.
+pub(super) struct Target {
+    port: u16,
+    token: String,
+}
+
+/// The registered origin, shared with the streams that use it.
+#[derive(Clone, Default)]
+pub struct Registry(Arc<Mutex<Option<Origin>>>);
+
+impl Registry {
+    fn current(&self) -> std::sync::MutexGuard<'_, Option<Origin>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn set(&self, origin: Origin) {
+        *self.current() = Some(origin);
+    }
+
+    pub fn clear(&self) {
+        *self.current() = None;
+    }
+
+    pub fn get(&self) -> Option<Origin> {
+        self.current().clone()
+    }
+
+    pub fn registered(&self) -> bool {
+        self.current().is_some()
+    }
+
+    pub(super) fn clone_handle(&self) -> Registry {
+        self.clone()
+    }
+
+    /// The embed widget goes to its proxy; every other surface to the backend.
+    pub(super) fn target(&self, surface: &str) -> Option<Target> {
+        let origin = self.get()?;
+        let port = match (surface, origin.embed_port) {
+            ("e", Some(port)) => port,
+            _ => origin.port,
+        };
+        Some(Target {
+            port,
+            token: origin.token,
+        })
+    }
+
+    /// Nothing answered on the origin's port: RealTimeX is gone (unless it registered again).
+    fn forget(&self, token: &str) {
+        let mut current = self.current();
+        if current.as_ref().is_some_and(|origin| origin.token == token) {
+            *current = None;
+        }
+    }
+}
+
+/// The headers RealTimeX's own connector set on a relayed request.
+fn forwarded(request: &RelayRequest, token: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("x-forwarded-host", request.public_host.clone()),
+        ("x-forwarded-prefix", request.public_prefix.clone()),
+        ("x-forwarded-proto", "https".into()),
+        ("x-forwarded-for", request.client.to_string()),
+        (RELAY_SURFACE_HEADER, request.surface.clone()),
+        (RELAY_SOURCE_HEADER, PUBLIC_RELAY_SOURCE.into()),
+        (ORIGIN_TOKEN_HEADER, token.to_string()),
+    ]
+}
+
+async fn connect(target: &Target, registry: &Registry) -> Option<TcpStream> {
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((Ipv4Addr::LOCALHOST, target.port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => Some(stream),
+        _ => {
+            registry.forget(&target.token);
+            None
+        }
+    }
+}
+
+/// Pass one HTTP request to the origin and stream its answer back.
+pub(super) async fn http(
+    id: u32,
+    request: RelayRequest,
+    body: mpsc::Receiver<bytes::Bytes>,
+    target: Option<Target>,
+    registry: Registry,
+    send: Sender,
+) {
+    let Some(target) = target else {
+        return offline(id, &request, &send).await;
+    };
+    let Some(stream) = connect(&target, &registry).await else {
+        return offline(id, &request, &send).await;
+    };
+    let (mut sender, connection) =
+        match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
+            Ok(handshake) => handshake,
+            Err(error) => return reset(id, &send, &error.to_string()).await,
+        };
+    let connection = tokio::spawn(connection);
+    let body = StreamBody::new(
+        tokio_stream::wrappers::ReceiverStream::new(body)
+            .map(|chunk| Ok::<_, Infallible>(hyper::body::Frame::data(chunk))),
+    );
+    let mut builder = hyper::Request::builder()
+        .method(request.method.as_str())
+        .uri(&request.path)
+        .header("host", format!("127.0.0.1:{}", target.port));
+    for (name, value) in &request.headers {
+        builder = builder.header(name, value);
+    }
+    for (name, value) in forwarded(&request, &target.token) {
+        builder = builder.header(name, value);
+    }
+    let Ok(outgoing) = builder.body(body) else {
+        return reset(id, &send, "bad request").await;
+    };
+    let response = match sender.send_request(outgoing).await {
+        Ok(response) => response,
+        Err(error) => {
+            connection.abort();
+            return reset(id, &send, &error.to_string()).await;
+        }
+    };
+    let (parts, mut answer) = response.into_parts();
+    if !send
+        .meta(
+            frame::HEADERS,
+            id,
+            &json!({ "status": parts.status.as_u16(), "headers": response_headers(&parts.headers) }),
+        )
+        .await
+    {
+        connection.abort();
+        return;
+    }
+    while let Some(next) = answer.frame().await {
+        match next {
+            Ok(part) => {
+                let part = match part.into_data() {
+                    Ok(chunk) => {
+                        if !send.data(frame::DATA, id, &chunk, 0).await {
+                            connection.abort();
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(part) => part,
+                };
+                if let Ok(trailers) = part.into_trailers() {
+                    send.meta(
+                        frame::TRAILERS,
+                        id,
+                        &Value::Object(response_headers(&trailers)),
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                connection.abort();
+                return reset(id, &send, &error.to_string()).await;
+            }
+        }
+    }
+    send.raw(frame::END, id, &[], 0).await;
+}
+
+/// Pass one WebSocket to the origin: accepted once the origin accepts, then messages both ways
+/// (a message keeps its boundary and text flag across frames) until either side closes.
+pub(super) async fn websocket(
+    id: u32,
+    request: RelayRequest,
+    mut input: mpsc::Receiver<Message>,
+    target: Option<Target>,
+    registry: Registry,
+    send: Sender,
+) {
+    let Some(target) = target else {
+        return reset(id, &send, "desktop offline").await;
+    };
+    let Some(stream) = connect(&target, &registry).await else {
+        return reset(id, &send, "desktop offline").await;
+    };
+    let url = format!("ws://127.0.0.1:{}{}", target.port, request.path);
+    let mut outgoing = match url.into_client_request() {
+        Ok(outgoing) => outgoing,
+        Err(error) => return reset(id, &send, &error.to_string()).await,
+    };
+    let headers = request
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .chain(
+            forwarded(&request, &target.token)
+                .into_iter()
+                .map(|(name, value)| (name, value)),
+        )
+        .collect::<Vec<_>>();
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            outgoing.headers_mut().append(name, value);
+        }
+    }
+    if !request.protocols.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&request.protocols.join(", ")) {
+            outgoing
+                .headers_mut()
+                .insert("sec-websocket-protocol", value);
+        }
+    }
+    let (socket, response) = match tokio_tungstenite::client_async(outgoing, stream).await {
+        Ok(accepted) => accepted,
+        Err(error) => return reset(id, &send, &error.to_string()).await,
+    };
+    let protocol = response
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| json!({ "sec-websocket-protocol": value }))
+        .unwrap_or_else(|| json!({}));
+    if !send
+        .meta(
+            frame::WS_ACCEPT,
+            id,
+            &json!({ "status": 101, "headers": protocol }),
+        )
+        .await
+    {
+        return;
+    }
+    let (mut sink, mut source) = socket.split();
+    let mut reading = true;
+    loop {
+        tokio::select! {
+            message = source.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    if !send.data(frame::WS_DATA, id, text.as_str().as_bytes(), TEXT_FLAG).await {
+                        return;
+                    }
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    if !send.data(frame::WS_DATA, id, &bytes, 0).await {
+                        return;
+                    }
+                }
+                Some(Ok(Message::Close(close))) => {
+                    let (code, reason) = close
+                        .map(|c| (u16::from(c.code), c.reason.as_str().chars().take(123).collect::<String>()))
+                        .unwrap_or((1005, String::new()));
+                    send.meta(frame::WS_CLOSE, id, &json!({ "code": code, "reason": reason }))
+                        .await;
+                    return;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return reset(id, &send, &error.to_string()).await,
+                None => {
+                    send.meta(frame::WS_CLOSE, id, &json!({ "code": 1006, "reason": "" }))
+                        .await;
+                    return;
+                }
+            },
+            message = input.recv(), if reading => match message {
+                Some(message) => {
+                    if sink.send(message).await.is_err() {
+                        return reset(id, &send, "the origin closed the WebSocket").await;
+                    }
+                }
+                // The relay's side is done: close, and the origin's close answers.
+                None => {
+                    reading = false;
+                    let _ = sink.send(Message::Close(None)).await;
+                }
+            },
+        }
+    }
+}
+
+async fn reset(id: u32, send: &Sender, reason: &str) {
+    send.meta(frame::RESET, id, &json!({ "error": reason }))
+        .await;
+}
+
+/// "Desktop offline": RealTimeX isn't running here. A page for a browser, JSON otherwise.
+async fn offline(id: u32, request: &RelayRequest, send: &Sender) {
+    let browser = request
+        .headers
+        .iter()
+        .any(|(name, value)| name == "accept" && value.contains("text/html"));
+    let (content_type, body) = if browser {
+        ("text/html; charset=utf-8", OFFLINE_PAGE.to_string())
+    } else {
+        (
+            "application/json",
+            json!({ "error": "desktop offline", "code": "DESKTOP_OFFLINE" }).to_string(),
+        )
+    };
+    respond(
+        id,
+        send,
+        503,
+        json!({
+            "content-type": content_type,
+            "retry-after": RETRY_AFTER.to_string(),
+            "cache-control": "no-store",
+        }),
+        body,
+    )
+    .await;
+}
+
+/// A whole answer from Link itself.
+pub(super) async fn answer(id: u32, send: &Sender, status: u16, content_type: &str, body: String) {
+    respond(
+        id,
+        send,
+        status,
+        json!({ "content-type": content_type, "cache-control": "no-store" }),
+        body,
+    )
+    .await;
+}
+
+async fn respond(id: u32, send: &Sender, status: u16, headers: Value, body: String) {
+    if send
+        .meta(
+            frame::HEADERS,
+            id,
+            &json!({ "status": status, "headers": headers }),
+        )
+        .await
+        && send.data(frame::DATA, id, body.as_bytes(), 0).await
+    {
+        send.raw(frame::END, id, &[], 0).await;
+    }
+}
+
+const OFFLINE_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>This computer is offline</title>
+<style>
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 16px/1.5 system-ui, sans-serif; background: #f7f7f8; color: #1f2328; }
+main { max-width: 28rem; padding: 2rem; text-align: center; }
+h1 { font-size: 1.25rem; margin: 0 0 .5rem; }
+p { margin: 0; color: #59636e; }
+@media (prefers-color-scheme: dark) { body { background: #16181d; color: #e6e8eb; } p { color: #9aa3ad; } }
+</style>
+</head>
+<body>
+<main>
+<h1>This computer is offline</h1>
+<p>RealTimeX isn't open on the computer that shares this. Try again in a little while.</p>
+</main>
+</body>
+</html>
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> RelayRequest {
+        RelayRequest {
+            surface: "e".into(),
+            method: "GET".into(),
+            path: "/embed/x".into(),
+            headers: vec![("accept".into(), "text/html,*/*".into())],
+            client: "203.0.113.7".parse().unwrap(),
+            public_host: "c.realtimex.ai".into(),
+            public_prefix: "/e/ID".into(),
+            length: None,
+            websocket: false,
+            protocols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_origin_needs_a_port_and_a_long_token() {
+        let token = "t".repeat(32);
+        let origin =
+            Origin::from_body(&json!({ "port": 3001, "embedPort": 3456, "token": token })).unwrap();
+        assert_eq!(
+            origin,
+            Origin {
+                port: 3001,
+                embed_port: Some(3456),
+                token: token.clone()
+            }
+        );
+        for body in [
+            json!({ "token": token }),
+            json!({ "port": 0, "token": token }),
+            json!({ "port": 70000, "token": token }),
+            json!({ "port": "3001", "token": token }),
+            json!({ "port": 3001, "token": "short" }),
+            json!({ "port": 3001, "token": format!("{} ", "t".repeat(32)) }),
+        ] {
+            assert!(Origin::from_body(&body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn the_widget_goes_to_its_proxy_and_a_dead_origin_is_forgotten() {
+        let registry = Registry::default();
+        assert!(registry.target("a").is_none());
+        registry.set(Origin {
+            port: 3001,
+            embed_port: Some(3456),
+            token: "one".into(),
+        });
+        assert_eq!(registry.target("e").unwrap().port, 3456);
+        assert_eq!(registry.target("h").unwrap().port, 3001);
+        // An answer about an origin registered before doesn't forget the current one.
+        registry.forget("other");
+        assert!(registry.registered());
+        registry.forget("one");
+        assert!(!registry.registered());
+    }
+
+    #[test]
+    fn relayed_requests_carry_realtimexs_forwarding_headers() {
+        let headers = forwarded(&request(), "secret");
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("x-forwarded-host"), Some("c.realtimex.ai"));
+        assert_eq!(get("x-forwarded-prefix"), Some("/e/ID"));
+        assert_eq!(get("x-forwarded-proto"), Some("https"));
+        assert_eq!(get("x-forwarded-for"), Some("203.0.113.7"));
+        assert_eq!(get("x-realtimex-relay-surface"), Some("e"));
+        assert_eq!(get("x-realtimex-relay-source"), Some("public-relay"));
+        assert_eq!(get(ORIGIN_TOKEN_HEADER), Some("secret"));
+    }
+
+    #[tokio::test]
+    async fn without_an_origin_a_browser_gets_the_offline_page() {
+        let (data, mut sent) = mpsc::channel(8);
+        let (control, _) = mpsc::unbounded_channel();
+        let send = Sender { data, control };
+        http(
+            5,
+            request(),
+            mpsc::channel(1).1,
+            None,
+            Registry::default(),
+            send,
+        )
+        .await;
+        let mut decoder = super::super::Decoder::default();
+        let mut frames = Vec::new();
+        while let Ok(Message::Binary(chunk)) = sent.try_recv() {
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        let headers: Value = serde_json::from_slice(&frames[0].payload).unwrap();
+        assert_eq!(headers["status"], 503);
+        assert_eq!(headers["headers"]["retry-after"], "30");
+        assert!(String::from_utf8_lossy(&frames[1].payload).contains("This computer is offline"));
+        assert_eq!(frames[2].kind, frame::END);
+    }
+
+    #[tokio::test]
+    async fn requests_reach_the_origin_with_their_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                seen.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-from: origin\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&seen).to_lowercase()
+        });
+        let registry = Registry::default();
+        registry.set(Origin {
+            port,
+            embed_port: None,
+            token: "t".repeat(32),
+        });
+        let (data, mut sent) = mpsc::channel(8);
+        let (control, _) = mpsc::unbounded_channel();
+        let send = Sender { data, control };
+        let (body, rx) = mpsc::channel(1);
+        drop(body);
+        let mut request = request();
+        request.surface = "a".into();
+        request.path = "/ar/x/index.html".into();
+        http(9, request, rx, registry.target("a"), registry, send).await;
+        let seen = server.await.unwrap();
+        assert!(seen.starts_with("get /ar/x/index.html http/1.1"));
+        assert!(seen.contains(&format!("host: 127.0.0.1:{port}")));
+        assert!(seen.contains("x-realtimex-relay-source: public-relay"));
+        assert!(seen.contains("x-realtimex-relay-surface: a"));
+        let mut decoder = super::super::Decoder::default();
+        let mut frames = Vec::new();
+        while let Ok(Message::Binary(chunk)) = sent.try_recv() {
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        let headers: Value = serde_json::from_slice(&frames[0].payload).unwrap();
+        assert_eq!(headers["status"], 200);
+        assert_eq!(headers["headers"]["x-from"], "origin");
+        assert!(headers["headers"].get("content-length").is_none());
+        assert_eq!(&frames[1].payload[..], b"ok");
+        assert_eq!(frames.last().unwrap().kind, frame::END);
+    }
+}

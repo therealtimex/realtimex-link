@@ -1,18 +1,25 @@
-//! RealTimeX Link's own Public Exposure (#2753): other computers reach this one through
-//! RealTimeX's relay (https://x.realtimex.ai/d/<exposureId>) without Tailscale, while RealTimeX is
-//! closed too. Link enrolls its own exposure (its own install ID, only Remote Control's surface
-//! `d`), so it never contends with RealTimeX's for the one connector an exposure may have.
+//! This computer's Public Exposure (#2753, realtimex-link#6): the internet reaches it through
+//! RealTimeX's relay (https://x.realtimex.ai/<surface>/<exposureId>) without Tailscale, while
+//! RealTimeX is closed too. Link is the computer's only connector (realtimex-ai-app#2836): it
+//! carries every surface, Remote Control's `d` in-process and RealTimeX's `a e h m p` to the
+//! origin RealTimeX registers (origin.rs), and it adopts RealTimeX's exposure when both are signed
+//! in to the same account, so there is one App ID.
 //!
 //! Enrolling (and recovering a lost credential) needs the signed-in account's access token: Link's
 //! own sign-in (signin.rs), else the one RealTimeX hands over (POST /v1/account/token); the tunnel
-//! itself needs only the connector
-//! credential enrollment returns, kept sealed in the store. The wire protocol is rtx-relay/1, as
-//! RealTimeX's own connector speaks it (server/utils/publicExposure/relayConnector.cjs there):
-//! binary frames over one WebSocket, HTTP streams forwarded into the public Remote Control routes
-//! in-process (router::PublicRoutes).
+//! itself needs only the connector credential enrollment returns, kept sealed in the store. The
+//! wire protocol is rtx-relay/1, as RealTimeX's own connector spoke it
+//! (server/utils/publicExposure/relayConnector.cjs there): binary frames over one WebSocket.
+//!
+//! Flow control: frames to the relay wait in a bounded queue (a slow relay holds the streams
+//! back, not memory), each request body and WebSocket waits in a bounded one too, and each
+//! surface has a request body limit.
 
-use std::collections::HashMap;
+mod origin;
+
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -32,17 +39,32 @@ use tower::ServiceExt;
 use crate::host::Host;
 use crate::router::PublicRoutes;
 
+pub use origin::Origin;
+
 pub mod keys {
-    /// This Link's own relay install ID (a UUID, made once).
+    /// This Link's relay install ID (a UUID made once, or RealTimeX's after adopting its exposure).
     pub const INSTALL_ID: &str = "relay-install-id";
     /// The enrolled exposure: { exposureId, connector: { url, protocol, websocketSubprotocol },
-    /// routes: [{ hostname, pathPrefix, publicBaseUrl }], allowedPrefixes }.
+    /// routes: [{ surface, hostname, pathPrefix, publicBaseUrl, contentBaseUrl }],
+    /// allowedPrefixes: { <surface>: [prefix] } }.
     pub const EXPOSURE: &str = "relay-exposure";
     /// The connector credential, sealed.
     pub const CREDENTIAL: &str = "relay-credential";
+    /// Exposure IDs this computer had before (its own, before adopting RealTimeX's): controllers
+    /// that saved one find this computer by it and move to the current one.
+    pub const FORMER_IDS: &str = "relay-former-ids";
+    /// { exposureId, from, at, seen }: the exposure adopted from RealTimeX, for the window's
+    /// one-time "This computer now has one App ID".
+    pub const ADOPTED: &str = "relay-adopted";
 }
 
-const SURFACE: &str = "d";
+/// Every surface Link carries: published artifacts, the embed widget, webhooks, the mobile app
+/// and desktop messaging go to RealTimeX (the origin); Remote Control is Link's own.
+pub const SURFACES: [&str; 6] = ["a", "e", "h", "m", "p", "d"];
+const REMOTE_CONTROL: &str = "d";
+const PEER: &str = "p";
+/// Desktop messaging carries only the peer wire: a policy may narrow it, never widen it.
+const PEER_CEILING: &str = "/api/peer/v1";
 const DEFAULT_API_BASE: &str = "https://marketplace-api-next.realtimex.ai";
 /// The Marketplace API hosts RealTimeX may name (over https, default port). The API base is also
 /// the identity tokens' issuer and where their keys come from, so any other host is ignored.
@@ -58,7 +80,16 @@ const PROTOCOL_VERSION: u8 = 1;
 const HEADER_BYTES: usize = 11;
 const MAX_DATA_FRAME: usize = 64 * 1024;
 const MAX_META_FRAME: usize = 32 * 1024;
-const DEFAULT_ALLOWED_PREFIX: &str = "/remote-control";
+const TEXT_FLAG: u8 = 1;
+const MORE_FLAG: u8 = 2;
+/// Frames waiting for the relay's socket. Streams wait for room, so a slow relay slows them.
+const OUT_QUEUE: usize = 256;
+/// Request body (or WebSocket) frames waiting for one stream's reader.
+const STREAM_QUEUE: usize = 16;
+/// A reader that takes nothing for this long has its stream reset (the others go on).
+const STREAM_STALL: Duration = Duration::from_secs(30);
+/// One WebSocket message, across MORE fragments.
+const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The relay pings every 10 s; nothing for this long means the connection is dead.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(35);
@@ -85,13 +116,44 @@ mod frame {
     pub const HEADERS: u8 = 3;
     pub const DATA: u8 = 4;
     pub const END: u8 = 5;
+    pub const WINDOW_UPDATE: u8 = 6;
     pub const CANCEL: u8 = 7;
     pub const RESET: u8 = 8;
     pub const WS_OPEN: u8 = 9;
+    pub const WS_ACCEPT: u8 = 10;
+    pub const WS_DATA: u8 = 11;
     pub const WS_CLOSE: u8 = 12;
     pub const PING: u8 = 13;
     pub const PONG: u8 = 14;
     pub const GOAWAY: u8 = 15;
+    pub const TRAILERS: u8 = 16;
+}
+
+/// The local paths each surface reaches when the enrollment names no policy for it, as
+/// RealTimeX's connector had them (relayConnector.cjs DEFAULT_ALLOWED_PATH_PREFIXES) and the
+/// Marketplace sends them (RELAY_PATH_POLICY). /api/ping answers the reachability probe.
+fn default_prefixes(surface: &str) -> &'static [&'static str] {
+    match surface {
+        "a" => &["/ar", "/api/ping"],
+        "e" => &["/embed", "/api/embed"],
+        "h" => &["/wh", "/api/ping"],
+        "m" => &["/mb"],
+        "p" => &[PEER_CEILING],
+        "d" => &["/remote-control"],
+        _ => &[],
+    }
+}
+
+/// The largest request body each surface takes: artifacts and the widget only post small
+/// forms, the mobile app uploads files.
+fn body_limit(surface: &str) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    match surface {
+        "a" | "e" | "d" => MIB,
+        "h" | "p" => 10 * MIB,
+        "m" => 50 * MIB,
+        _ => 0,
+    }
 }
 
 /// An access token for the account, and the Marketplace API base.
@@ -106,7 +168,8 @@ struct Account {
 struct Status {
     state: &'static str,
     detail: Option<String>,
-    /// Enrollment must be repeated (no exposure yet, or the relay refused the credential).
+    /// Enrollment must be repeated (no exposure yet, the relay refused the credential, or the
+    /// enrolled surfaces aren't the ones Link carries).
     needs_enrollment: bool,
 }
 
@@ -118,6 +181,15 @@ pub struct Relay {
     status: Mutex<Status>,
     /// Woken when something that decides the relay changed (a token, settings, a stop).
     changed: Notify,
+    /// The exposure changed under the open connection (adopted): connect again at once.
+    restart: AtomicBool,
+    /// Surfaces this Marketplace doesn't support yet (422 RELAY_SURFACE_UNSUPPORTED), until the
+    /// daemon restarts.
+    unsupported: Mutex<HashSet<String>>,
+    /// RealTimeX's servers, while it runs (origin.rs).
+    pub origin: origin::Registry,
+    /// One adoption at a time.
+    adopting: tokio::sync::Mutex<()>,
     task: Mutex<Option<JoinHandle<()>>>,
     /// The routes of the open connection, so revoking a client ends its relayed sessions too.
     routes: Mutex<Option<Arc<PublicRoutes>>>,
@@ -138,6 +210,10 @@ impl Relay {
                 ..Default::default()
             }),
             changed: Notify::new(),
+            restart: AtomicBool::new(false),
+            unsupported: Mutex::new(HashSet::new()),
+            origin: origin::Registry::default(),
+            adopting: tokio::sync::Mutex::new(()),
             task: Mutex::new(None),
             routes: Mutex::new(None),
         })
@@ -261,17 +337,78 @@ impl Relay {
             .map(str::to_string)
     }
 
-    /// For the settings page: { state, url, detail }.
+    /// The exposure IDs this computer had before the current one.
+    pub fn former_ids(&self) -> Vec<String> {
+        let Some(host) = self.host.upgrade() else {
+            return Vec::new();
+        };
+        let current = self.exposure_id();
+        strings(host.store.get(keys::FORMER_IDS).as_ref())
+            .into_iter()
+            .filter(|id| Some(id) != current.as_ref())
+            .collect()
+    }
+
+    /// For the settings page: { state, url, detail } (url: Remote Control's).
     pub fn state(&self) -> Value {
         let status = lock(&self.status);
         let url = self.host.upgrade().and_then(|host| {
-            host.store
-                .get(keys::EXPOSURE)?
-                .pointer("/routes/0/publicBaseUrl")?
+            let exposure = host.store.get(keys::EXPOSURE)?;
+            stored_routes(&exposure)
+                .into_iter()
+                .find(|route| route.get("surface").and_then(Value::as_str) == Some(REMOTE_CONTROL))?
+                .get("publicBaseUrl")?
                 .as_str()
                 .map(str::to_string)
         });
         json!({ "state": status.state, "url": url, "detail": status.detail })
+    }
+
+    /// For GET /v1/status: { appId, adopted, surfaces, origin, notice }. notice: the exposure
+    /// adopted from RealTimeX, until the window has shown it once.
+    pub fn exposure(&self) -> Value {
+        let Some(host) = self.host.upgrade() else {
+            return json!({});
+        };
+        let exposure = host.store.get(keys::EXPOSURE);
+        let mut surfaces: Vec<String> = exposure
+            .as_ref()
+            .map(stored_routes)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|route| route.get("surface").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        surfaces.dedup();
+        let adopted = host.store.get(keys::ADOPTED);
+        let current = self.exposure_id();
+        let adopted_now = adopted
+            .as_ref()
+            .and_then(|a| a.get("exposureId"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| Some(id) == current.as_deref());
+        let notice = adopted
+            .filter(|a| adopted_now && a.get("seen") != Some(&Value::Bool(true)))
+            .map(|a| json!({ "appId": a.get("exposureId"), "from": a.get("from") }));
+        json!({
+            "appId": host.app_id(),
+            "adopted": adopted_now,
+            "surfaces": surfaces,
+            "origin": self.origin.registered(),
+            "notice": notice,
+        })
+    }
+
+    /// The window showed "This computer now has one App ID".
+    pub fn notice_seen(&self) -> Result<()> {
+        let Some(host) = self.host.upgrade() else {
+            return Ok(());
+        };
+        if let Some(mut adopted) = host.store.get(keys::ADOPTED) {
+            adopted["seen"] = Value::Bool(true);
+            host.store.set(keys::ADOPTED, &adopted)?;
+        }
+        Ok(())
     }
 
     fn set_status(&self, state: &'static str, detail: Option<String>) {
@@ -280,8 +417,19 @@ impl Relay {
         status.detail = detail;
     }
 
+    /// The relay runs while "Keep RealTimeX Link running" is on; Remote Control's own routes
+    /// refuse while incoming control is off.
     fn wanted(host: &Host) -> bool {
-        host.settings().allow_incoming && host.backend.available()
+        host.settings().keep_running
+    }
+
+    /// The surfaces to enroll: all of them, but the ones this Marketplace refused.
+    fn wanted_surfaces(&self) -> Vec<&'static str> {
+        let unsupported = lock(&self.unsupported);
+        SURFACES
+            .into_iter()
+            .filter(|surface| !unsupported.contains(*surface))
+            .collect()
     }
 
     async fn run(self: Arc<Self>) {
@@ -296,9 +444,17 @@ impl Relay {
                 self.changed.notified().await;
                 continue;
             }
-            let needs = lock(&self.status).needs_enrollment || self.connection(&host).is_none();
-            if needs {
+            let refused = lock(&self.status).needs_enrollment;
+            let enrolled = self.connection(&host);
+            // Enrolled before #6 (only Remote Control), or a surface was added: enrolled again,
+            // and until then the exposure keeps serving what it carries.
+            let stale = enrolled
+                .as_ref()
+                .is_some_and(|connection| !connection.carries(&self.wanted_surfaces()));
+            let usable = enrolled.is_some() && !refused;
+            if refused || enrolled.is_none() || stale {
                 match self.account().await {
+                    None if usable => {}
                     None => {
                         self.set_status(
                             "not-set-up",
@@ -310,6 +466,11 @@ impl Relay {
                     }
                     Some(account) => match self.enroll(&host, &account).await {
                         Ok(()) => lock(&self.status).needs_enrollment = false,
+                        Err(error) if usable => {
+                            (host.log)(&format!(
+                                "[relay] enrolling every surface failed, serving what is enrolled: {error:#}"
+                            ));
+                        }
                         Err(error) => {
                             (host.log)(&format!("[relay] enrollment failed: {error:#}"));
                             self.set_status("error", Some(format!("{error:#}")));
@@ -337,6 +498,8 @@ impl Relay {
             let log = host.log.clone();
             drop(host);
             *lock(&self.routes) = Some(routes.clone());
+            // This connection already uses the current exposure.
+            self.restart.store(false, Ordering::SeqCst);
             let ended = self.serve(&connection, &routes).await;
             *lock(&self.routes) = None;
             routes.shutdown();
@@ -344,6 +507,10 @@ impl Relay {
                 Ended::Stopped => {
                     self.set_status("off", None);
                     self.changed.notified().await;
+                    attempt = 0;
+                    continue;
+                }
+                Ended::Restart => {
                     attempt = 0;
                     continue;
                 }
@@ -378,44 +545,15 @@ impl Relay {
         let _ = tokio::time::timeout(delay, self.changed.notified()).await;
     }
 
-    /// The stored exposure, ready to connect: (exposure, credential).
+    /// The stored exposure, ready to connect.
     fn connection(&self, host: &Host) -> Option<Connection> {
         let exposure = host.store.get(keys::EXPOSURE)?;
         let credential = host.open_secret(&host.store.get(keys::CREDENTIAL)?)?;
-        let routes = exposure
-            .get("routes")?
-            .as_array()?
-            .iter()
-            .filter_map(|route| {
-                Some((
-                    route.get("hostname")?.as_str()?.to_lowercase(),
-                    route.get("pathPrefix")?.as_str()?.to_string(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let allowed = exposure
-            .get("allowedPrefixes")
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(|p| p.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .filter(|list| !list.is_empty())
-            .unwrap_or_else(|| vec![DEFAULT_ALLOWED_PREFIX.to_string()]);
-        Some(Connection {
-            exposure_id: exposure.get("exposureId")?.as_str()?.to_string(),
-            install_id: host.store.get(keys::INSTALL_ID)?.as_str()?.to_string(),
-            url: exposure.pointer("/connector/url")?.as_str()?.to_string(),
-            subprotocol: exposure
-                .pointer("/connector/websocketSubprotocol")
-                .and_then(Value::as_str)
-                .unwrap_or(WEBSOCKET_SUBPROTOCOL)
-                .to_string(),
+        Connection::from_stored(
+            &exposure,
+            host.store.get(keys::INSTALL_ID)?.as_str()?,
             credential,
-            routes,
-            allowed,
-        })
+        )
     }
 
     fn install_id(host: &Host) -> Result<String> {
@@ -431,47 +569,89 @@ impl Relay {
         Ok(id)
     }
 
-    /// Enroll (or refresh) this Link's exposure with only surface d; a lost credential is
-    /// recovered first.
+    /// Enroll (or refresh) this computer's exposure with every surface Link carries; a lost
+    /// credential is recovered first. A surface the Marketplace doesn't support yet is left out.
     async fn enroll(&self, host: &Host, account: &Account) -> Result<()> {
         let install_id = Self::install_id(host)?;
         let credential = host
             .store
             .get(keys::CREDENTIAL)
             .and_then(|sealed| host.open_secret(&sealed));
-        let machine = crate::host::machine_name();
-        let body = json!({
-            "installId": install_id,
-            "connectorCredential": credential,
-            "runtimeChannel": "app",
-            "appName": "RealTimeX Link",
-            "appVersion": env!("CARGO_PKG_VERSION"),
-            "machineName": machine,
-            "osPlatform": os_platform(),
-            "surfaces": [SURFACE],
+        let exposure_id = host.store.get(keys::EXPOSURE).and_then(|e| {
+            e.get("exposureId")
+                .and_then(Value::as_str)
+                .map(String::from)
         });
+        loop {
+            let surfaces = self.wanted_surfaces();
+            match self
+                .register(
+                    host,
+                    account,
+                    &install_id,
+                    credential.clone(),
+                    exposure_id.as_deref(),
+                    &surfaces,
+                )
+                .await
+            {
+                Err(EnrollFailure::Unsupported(surface))
+                    if surfaces.contains(&surface.as_str()) =>
+                {
+                    (host.log)(&format!(
+                        "[relay] the relay service doesn't support surface {surface} yet"
+                    ));
+                    lock(&self.unsupported).insert(surface);
+                }
+                Err(EnrollFailure::Unsupported(surface)) => {
+                    bail!("the relay service refused surface {surface}")
+                }
+                Err(EnrollFailure::Other(error)) => return Err(error),
+                Ok(answer) => {
+                    self.save(host, &answer)?;
+                    (host.log)(&format!(
+                        "[relay] enrolled: {} ({})",
+                        answer
+                            .get("exposureId")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        surfaces.join(" ")
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// POST /v1/relay-exposures; on 409 (the service wants the credential this install lost) the
+    /// exposure is recovered first (its credential rotates).
+    async fn register(
+        &self,
+        host: &Host,
+        account: &Account,
+        install_id: &str,
+        credential: Option<String>,
+        exposure_id: Option<&str>,
+        surfaces: &[&str],
+    ) -> Result<Value, EnrollFailure> {
+        let body = registration(install_id, credential, surfaces);
         let key = format!(
             "relay-{}",
             hex(&Sha256::digest(
-                json!({ "installId": install_id, "routes": ["remoteControl"], "appName": "RealTimeX Link", "appVersion": env!("CARGO_PKG_VERSION") })
+                json!({ "installId": install_id, "surfaces": surfaces, "appName": "RealTimeX Link", "appVersion": env!("CARGO_PKG_VERSION") })
                     .to_string()
                     .as_bytes()
             ))
         );
         let url = format!("{}/v1/relay-exposures", account.api_base);
-        let answer = match api_post(&url, &account.token, &key, &body).await {
-            Ok(answer) => answer,
-            Err(ApiFailure { status: 409, .. }) => {
-                // The service wants the credential this install lost: recover (it rotates).
-                let exposure_id = host
-                    .store
-                    .get(keys::EXPOSURE)
-                    .and_then(|e| {
-                        e.get("exposureId")
-                            .and_then(Value::as_str)
-                            .map(String::from)
-                    })
-                    .ok_or_else(|| anyhow!("the relay knows this install, but not its exposure"))?;
+        match api_post(&url, &account.token, &key, &body).await {
+            Ok(answer) => Ok(answer),
+            Err(failure) if failure.status == 409 => {
+                let exposure_id = exposure_id.ok_or_else(|| {
+                    EnrollFailure::Other(anyhow!(
+                        "the relay knows this install, but not its exposure"
+                    ))
+                })?;
                 let recover_key = format!(
                     "relay-recovery-{}",
                     hex(&Sha256::digest(
@@ -480,98 +660,204 @@ impl Relay {
                             .as_bytes()
                     ))
                 );
-                let recovered = api_post(
-                    &format!(
-                        "{}/v1/relay-exposures/{exposure_id}/recover",
-                        account.api_base
-                    ),
-                    &account.token,
-                    &recover_key,
-                    &json!({ "installId": install_id }),
-                )
-                .await
-                .map_err(|f| anyhow!("{}", f.message))?;
-                self.save(host, &recovered)?;
-                let mut fields = body_fields(&body);
-                fields.insert(
-                    "connectorCredential".into(),
-                    recovered
-                        .pointer("/connector/credential")
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                );
-                let body = Value::Object(fields);
+                let recovered = recover(account, exposure_id, install_id, &recover_key)
+                    .await
+                    .map_err(EnrollFailure::from)?;
+                self.save(host, &recovered).map_err(EnrollFailure::Other)?;
+                let credential = recovered
+                    .pointer("/connector/credential")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let body = registration(install_id, credential, surfaces);
                 api_post(&url, &account.token, &format!("{key}-recovered"), &body)
                     .await
-                    .map_err(|f| anyhow!("{}", f.message))?
+                    .map_err(EnrollFailure::from)
             }
-            Err(failure) => return Err(anyhow!("{}", failure.message)),
+            Err(failure) => Err(failure.into()),
+        }
+    }
+
+    /// POST /v1/exposure/adopt: take over RealTimeX's exposure (realtimex-ai-app#2836), so this
+    /// computer has one App ID and RealTimeX's published, webhook and embed URLs keep working.
+    /// `token` is RealTimeX's access token; its account must be Link's (Link not signed in takes
+    /// it, as a handover). The exposure's credential is recovered with it (it rotates, so
+    /// RealTimeX must have stopped its own connector first), then it is enrolled with every
+    /// surface under RealTimeX's install ID, and Link's previous exposure ID is kept as a former
+    /// one. Answers { appId, formerAppIds }.
+    pub async fn adopt(
+        &self,
+        exposure_id: &str,
+        install_id: &str,
+        token: &str,
+        api_base: Option<&str>,
+    ) -> Result<Value, crate::error::ApiError> {
+        use crate::error::ApiError;
+        let _one = self.adopting.lock().await;
+        let host = self
+            .host
+            .upgrade()
+            .ok_or_else(|| ApiError::new(503, "RealTimeX Link is stopping"))?;
+        let valid = |text: &str, max: usize| {
+            !text.is_empty()
+                && text.len() <= max
+                && text
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         };
-        self.save(host, &answer)?;
+        if !valid(exposure_id, 128) || !valid(install_id, 128) {
+            return Err(ApiError::bad_request(
+                "exposureId and installId must be the exposure's IDs",
+            ));
+        }
+        let theirs = crate::identity::account_of(token)
+            .and_then(|a| a.get("subject").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| ApiError::bad_request("token must be the account's access token"))?;
+        // This computer's account: Link's own sign-in, or RealTimeX's handover it took.
+        let ours = host.store.get(crate::identity::keys::ACCOUNT);
+        let ours_subject = ours
+            .as_ref()
+            .and_then(|a| a.get("subject"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match ours_subject {
+            Some(subject) if subject != theirs => {
+                let email = |a: Option<Value>| a.and_then(|a| a.get("email").cloned());
+                // Kept as an offer, for the window's "Use <RealTimeX's account>".
+                let _ = self.handover(token, api_base);
+                return Err(ApiError::coded(
+                    409,
+                    "ACCOUNT_MISMATCH",
+                    "RealTimeX Link is signed in to another account",
+                )
+                .with_details(json!({
+                    "linkAccount": email(ours),
+                    "realtimexAccount": email(crate::identity::account_of(token)),
+                })));
+            }
+            Some(_) => {}
+            None => {
+                if !self.handover(token, api_base).unwrap_or(false) {
+                    return Err(ApiError::coded(
+                        409,
+                        "NOT_SIGNED_IN",
+                        "RealTimeX Link was signed out here; sign in to RealTimeX's account in Link first",
+                    ));
+                }
+            }
+        }
+        if self.exposure_id().as_deref() == Some(exposure_id) {
+            return Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }));
+        }
+        // The App ID other computers know this one by until now.
+        let previous = host.app_id();
+        let account = Account {
+            token: token.to_string(),
+            api_base: self.api_base(),
+            expires_at: jwt_expiry(token),
+        };
+        let recovered = recover(
+            &account,
+            exposure_id,
+            install_id,
+            &format!("relay-adopt-{}", crate::util::uuid()),
+        )
+        .await
+        .map_err(|failure| {
+            ApiError::coded(
+                if failure.status == 404 { 404 } else { 502 },
+                "ADOPT_FAILED",
+                failure.message,
+            )
+        })?;
+        let credential = recovered
+            .pointer("/connector/credential")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| ApiError::new(502, "the relay service answered without a credential"))?;
+        // Enroll every surface on the adopted exposure before anything is kept, so a failure
+        // leaves Link's own exposure as it was.
+        let mut surfaces = self.wanted_surfaces();
+        let answer = loop {
+            let key = format!("relay-adopt-enroll-{}", crate::util::uuid());
+            let url = format!("{}/v1/relay-exposures", account.api_base);
+            let body = registration(install_id, Some(credential.clone()), &surfaces);
+            match api_post(&url, &account.token, &key, &body).await {
+                Ok(answer) => break answer,
+                Err(failure) => match EnrollFailure::from(failure) {
+                    EnrollFailure::Unsupported(surface) if surfaces.contains(&surface.as_str()) => {
+                        surfaces.retain(|s| *s != surface);
+                        lock(&self.unsupported).insert(surface);
+                    }
+                    EnrollFailure::Unsupported(surface) => {
+                        return Err(ApiError::coded(
+                            502,
+                            "ADOPT_FAILED",
+                            format!("the relay service refused surface {surface}"),
+                        ))
+                    }
+                    EnrollFailure::Other(error) => {
+                        return Err(ApiError::coded(502, "ADOPT_FAILED", format!("{error:#}")))
+                    }
+                },
+            }
+        };
+        if answer.get("exposureId").and_then(Value::as_str) != Some(exposure_id) {
+            return Err(ApiError::coded(
+                502,
+                "ADOPT_FAILED",
+                "the relay service enrolled another exposure",
+            ));
+        }
+        let mut former = strings(host.store.get(keys::FORMER_IDS).as_ref());
+        if !former.contains(&previous) {
+            former.push(previous.clone());
+        }
+        former.retain(|id| id != exposure_id);
+        let (exposure, sealed) = self.stored(&host, &answer).map_err(ApiError::from)?;
+        let mut values = vec![
+            (keys::EXPOSURE, exposure),
+            (keys::INSTALL_ID, json!(install_id)),
+            (keys::FORMER_IDS, json!(former)),
+            (
+                keys::ADOPTED,
+                json!({ "exposureId": exposure_id, "from": previous, "at": crate::util::iso_now() }),
+            ),
+        ];
+        if let Some(sealed) = sealed {
+            values.push((keys::CREDENTIAL, sealed));
+        }
+        host.store
+            .transaction(&values, &[])
+            .map_err(ApiError::from)?;
+        lock(&self.status).needs_enrollment = false;
         (host.log)(&format!(
-            "[relay] enrolled: {}",
-            answer
-                .get("exposureId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
+            "[relay] adopted RealTimeX's exposure {exposure_id} (was {previous})"
         ));
-        Ok(())
+        self.restart.store(true, Ordering::SeqCst);
+        self.wake();
+        Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }))
     }
 
     /// Keep an enrollment answer: the exposure (without the credential) and the sealed credential.
     fn save(&self, host: &Host, answer: &Value) -> Result<()> {
-        let exposure_id = answer
-            .get("exposureId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("the relay answered without an exposure ID"))?;
-        let connector = answer.get("connector").cloned().unwrap_or(json!({}));
-        let url = connector
-            .get("url")
-            .and_then(Value::as_str)
-            .filter(|url| url.starts_with("wss://"))
-            .ok_or_else(|| anyhow!("the relay answered without a wss:// connector"))?;
-        let routes: Vec<Value> = answer
-            .get("surfaces")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|s| s.get("surface").and_then(Value::as_str) == Some(SURFACE))
-            .map(|s| {
-                json!({
-                    "hostname": s.get("hostname"),
-                    "pathPrefix": s.get("pathPrefix"),
-                    "publicBaseUrl": s.get("publicBaseUrl"),
-                })
-            })
-            .collect();
-        if routes.is_empty() {
-            bail!("the relay did not give this computer Remote Control's route");
-        }
-        let allowed: Vec<Value> = answer
-            .get("pathAllowlist")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|p| p.get("surface").and_then(Value::as_str) == Some(SURFACE))
-            .filter_map(|p| p.get("pathPrefix").cloned())
-            .collect();
-        let exposure = json!({
-            "exposureId": exposure_id,
-            "connector": {
-                "url": url,
-                "protocol": connector.get("protocol"),
-                "websocketSubprotocol": connector.get("websocketSubprotocol"),
-            },
-            "routes": routes,
-            "allowedPrefixes": allowed,
-        });
+        let (exposure, sealed) = self.stored(host, answer)?;
         let mut values = vec![(keys::EXPOSURE, exposure)];
-        if let Some(credential) = connector.get("credential").and_then(Value::as_str) {
-            values.push((keys::CREDENTIAL, host.seal_secret(credential)?));
+        if let Some(sealed) = sealed {
+            values.push((keys::CREDENTIAL, sealed));
         }
         host.store.transaction(&values, &[])?;
         Ok(())
+    }
+
+    /// What the store keeps of an enrollment answer: (exposure, sealed credential).
+    fn stored(&self, host: &Host, answer: &Value) -> Result<(Value, Option<Value>)> {
+        let exposure = exposure_of(answer)?;
+        let sealed = answer
+            .pointer("/connector/credential")
+            .and_then(Value::as_str)
+            .map(|credential| host.seal_secret(credential))
+            .transpose()?;
+        Ok((exposure, sealed))
     }
 
     /// One connection, until it ends.
@@ -593,17 +879,26 @@ impl Relay {
             Err(_) => return Ended::lost(false, "the relay did not answer".into()),
         };
         let (mut sink, mut source) = socket.split();
-        let (out, mut outgoing) = mpsc::unbounded_channel::<Message>();
+        let (data, mut outgoing) = mpsc::channel::<Message>(OUT_QUEUE);
+        let (control, mut urgent) = mpsc::unbounded_channel::<Message>();
         let writer = tokio::spawn(async move {
-            while let Some(message) = outgoing.recv().await {
-                if sink.send(message).await.is_err() {
+            loop {
+                // The frame loop's own answers (PONG, a refused stream) go first.
+                let message = tokio::select! {
+                    biased;
+                    Some(message) = urgent.recv() => message,
+                    Some(message) = outgoing.recv() => message,
+                    else => break,
+                };
+                let closing = matches!(message, Message::Close(_));
+                if sink.send(message).await.is_err() || closing {
                     break;
                 }
             }
             let _ = sink.close().await;
         });
-        let send = Sender(out);
-        send.meta(
+        let send = Sender { data, control };
+        send.urgent_meta(
             frame::HELLO,
             0,
             &json!({
@@ -627,6 +922,9 @@ impl Relay {
             let message = tokio::select! {
                 message = tokio::time::timeout(wait, source.next()) => message,
                 () = self.changed.notified() => {
+                    if self.restart.swap(false, Ordering::SeqCst) {
+                        break Ended::Restart;
+                    }
                     if self.host.upgrade().is_some_and(|host| Self::wanted(&host)) {
                         continue;
                     }
@@ -678,6 +976,7 @@ impl Relay {
                 }
             };
             let mut fatal = None;
+            let mut goaway = false;
             for frame in frames {
                 if !ready {
                     if frame.kind == frame::HELLO && frame.stream == 0 {
@@ -697,23 +996,26 @@ impl Relay {
                     }
                     continue;
                 }
-                if let Err(error) = self.handle(frame, connection, routes, &send, &mut streams) {
-                    fatal = Some(error.to_string());
-                    break;
-                }
-                if streams.contains_key(&0) {
-                    // GOAWAY (see handle): stop without reconnecting.
-                    streams.remove(&0);
-                    fatal = Some(String::new());
+                match self
+                    .handle(frame, connection, routes, &send, &mut streams)
+                    .await
+                {
+                    Ok(Handled::Go) => {}
+                    Ok(Handled::GoAway) => goaway = true,
+                    Err(error) => {
+                        fatal = Some(error.to_string());
+                        break;
+                    }
                 }
             }
-            match fatal {
-                Some(reason) if reason.is_empty() => break Ended::Stopped,
-                Some(reason) => {
-                    send.close(1011, "connector protocol error");
-                    break Ended::lost(ready, reason);
-                }
-                None => {}
+            if let Some(reason) = fatal {
+                send.close(1011, "connector protocol error");
+                break Ended::lost(ready, reason);
+            }
+            if goaway {
+                // The relay asked this connector to stop: no reconnecting until something
+                // changes.
+                break Ended::Stopped;
             }
         };
         for (_, stream) in streams.drain() {
@@ -726,90 +1028,93 @@ impl Relay {
     }
 
     /// One frame of a ready connection.
-    fn handle(
+    async fn handle(
         self: &Arc<Self>,
         frame: Frame,
         connection: &Connection,
         routes: &Arc<PublicRoutes>,
         send: &Sender,
         streams: &mut HashMap<u32, Stream>,
-    ) -> Result<()> {
+    ) -> Result<Handled> {
         if frame.stream == 0 {
             match frame.kind {
-                frame::PING => send.raw(frame::PONG, 0, &frame.payload, 0),
-                frame::GOAWAY => {
-                    streams.insert(
-                        0,
-                        Stream {
-                            body: None,
-                            task: tokio::spawn(async {}),
-                        },
-                    );
-                }
+                frame::PING => send.urgent(frame::PONG, 0, &frame.payload, 0),
+                frame::GOAWAY => return Ok(Handled::GoAway),
                 _ => {}
             }
-            return Ok(());
+            return Ok(Handled::Go);
         }
+        // Finished streams answered END themselves; drop their entries now and then.
+        streams.retain(|_, stream| !stream.task.is_finished());
         match frame.kind {
-            frame::OPEN => {
+            frame::OPEN | frame::WS_OPEN => {
+                let websocket = frame.kind == frame::WS_OPEN;
                 let value: Value = serde_json::from_slice(&frame.payload)
                     .context("the relay sent a request that is not JSON")?;
                 if let Some(old) = streams.remove(&frame.stream) {
                     old.task.abort();
                 }
-                match connection.request(&value) {
+                match connection.request(&value, websocket) {
                     Ok(request) => {
                         let stream = self.open(frame.stream, request, routes.clone(), send.clone());
                         streams.insert(frame.stream, stream);
                     }
-                    Err(reason) => {
-                        send.meta(frame::RESET, frame.stream, &json!({ "error": reason }))
-                    }
+                    Err(reason) => send.refuse(frame.stream, &reason),
                 }
             }
-            frame::WS_OPEN => send.meta(
-                frame::RESET,
-                frame.stream,
-                &json!({ "error": "Remote Control has no WebSocket routes" }),
-            ),
-            frame::DATA => match streams.get(&frame.stream) {
-                Some(stream) => {
-                    if let Some(body) = &stream.body {
-                        let _ = body.send(Ok(frame.payload));
+            frame::DATA | frame::WS_DATA => {
+                let Some(stream) = streams.get_mut(&frame.stream) else {
+                    send.refuse(frame.stream, "unknown stream");
+                    return Ok(Handled::Go);
+                };
+                let outcome = if frame.kind == frame::DATA {
+                    stream.body(frame.payload).await
+                } else {
+                    stream.message(frame.payload, frame.flags).await
+                };
+                if let Err(reason) = outcome {
+                    if let Some(stream) = streams.remove(&frame.stream) {
+                        stream.task.abort();
                     }
+                    send.refuse(frame.stream, reason);
                 }
-                None => send.meta(
-                    frame::RESET,
-                    frame.stream,
-                    &json!({ "error": "unknown stream" }),
-                ),
-            },
+            }
             frame::END => match streams.get_mut(&frame.stream) {
-                Some(stream) => stream.body = None,
-                None => send.meta(
-                    frame::RESET,
-                    frame.stream,
-                    &json!({ "error": "unknown stream" }),
-                ),
+                Some(stream) => stream.input = None,
+                None => send.refuse(frame.stream, "unknown stream"),
             },
-            frame::CANCEL | frame::WS_CLOSE => {
+            frame::WS_CLOSE => {
+                // The public client closed: the origin is told, and its close answers.
+                if let Some(stream) = streams.get_mut(&frame.stream) {
+                    let close: Value = serde_json::from_slice(&frame.payload).unwrap_or_default();
+                    let code = close
+                        .get("code")
+                        .and_then(Value::as_u64)
+                        .and_then(|c| u16::try_from(c).ok())
+                        .unwrap_or(1000);
+                    if let Some(Input::Socket(tx)) = stream.input.take() {
+                        let _ = tx.try_send(Message::Close(Some(
+                            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                code: CloseCode::from(code),
+                                reason: String::new().into(),
+                            },
+                        )));
+                    }
+                }
+            }
+            frame::CANCEL | frame::RESET => {
                 if let Some(stream) = streams.remove(&frame.stream) {
                     stream.task.abort();
                 }
             }
-            frame::RESET => {
-                if let Some(stream) = streams.remove(&frame.stream) {
-                    stream.task.abort();
-                }
-            }
+            // The relay's credit for what it has passed on: the bounded queue already paces.
+            frame::WINDOW_UPDATE => {}
             _ => {}
         }
-        // Finished streams answer END themselves; drop their entries now and then.
-        streams.retain(|id, stream| *id == 0 || !stream.task.is_finished());
-        Ok(())
+        Ok(Handled::Go)
     }
 
-    /// Run one request through the public routes and stream the answer back.
+    /// Start one stream: Remote Control's routes in-process, everything else through the origin.
     fn open(
         self: &Arc<Self>,
         id: u32,
@@ -817,64 +1122,282 @@ impl Relay {
         routes: Arc<PublicRoutes>,
         send: Sender,
     ) -> Stream {
-        let (body, chunks) = mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
-        let task = tokio::spawn(async move {
-            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(chunks);
-            let mut builder = axum::http::Request::builder()
-                .method(request.method.as_str())
-                .uri(&request.path);
-            for (name, value) in &request.headers {
-                builder = builder.header(name, value);
-            }
-            let Ok(mut http) = builder.body(Body::from_stream(stream)) else {
-                send.meta(frame::RESET, id, &json!({ "error": "bad request" }));
-                return;
+        let limit = body_limit(&request.surface);
+        if request.websocket {
+            let (tx, rx) = mpsc::channel::<Message>(STREAM_QUEUE);
+            let target = self.origin.target(&request.surface);
+            let registry = self.origin.clone_handle();
+            let task = tokio::spawn(async move {
+                origin::websocket(id, request, rx, target, registry, send).await;
+            });
+            return Stream {
+                input: Some(Input::Socket(tx)),
+                received: 0,
+                limit: MAX_WS_MESSAGE as u64,
+                parts: Vec::new(),
+                text: false,
+                task,
             };
-            http.extensions_mut()
-                .insert(ConnectInfo(SocketAddr::new(request.client, 0)));
-            let response = match routes.router.clone().oneshot(http).await {
-                Ok(response) => response,
-                Err(never) => match never {},
-            };
-            let mut headers = serde_json::Map::new();
-            for (name, value) in response.headers() {
-                let name = name.as_str().to_lowercase();
-                if HOP_BY_HOP.contains(&name.as_str()) || name == "content-length" {
-                    continue;
-                }
-                let Ok(value) = value.to_str() else { continue };
-                let joined = match headers.get(&name).and_then(Value::as_str) {
-                    Some(previous) => format!("{previous}, {value}"),
-                    None => value.to_string(),
-                };
-                headers.insert(name, Value::String(joined));
-            }
-            send.meta(
-                frame::HEADERS,
-                id,
-                &json!({ "status": response.status().as_u16(), "headers": headers }),
-            );
-            let mut data = response.into_body().into_data_stream();
-            while let Some(chunk) = data.next().await {
-                match chunk {
-                    Ok(chunk) => {
-                        for part in chunk.chunks(MAX_DATA_FRAME) {
-                            send.raw(frame::DATA, id, part, 0);
-                        }
-                    }
-                    Err(error) => {
-                        send.meta(frame::RESET, id, &json!({ "error": error.to_string() }));
-                        return;
-                    }
-                }
-            }
-            send.raw(frame::END, id, &[], 0);
-        });
+        }
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(STREAM_QUEUE);
+        let too_large = request.length.is_some_and(|length| length > limit);
+        let task = if too_large {
+            tokio::spawn(async move {
+                origin::answer(
+                    id,
+                    &send,
+                    413,
+                    "application/json",
+                    json!({ "error": "Request body too large" }).to_string(),
+                )
+                .await;
+            })
+        } else if request.surface == REMOTE_CONTROL {
+            tokio::spawn(async move { in_process(id, request, rx, routes, send).await })
+        } else {
+            let target = self.origin.target(&request.surface);
+            let registry = self.origin.clone_handle();
+            tokio::spawn(async move {
+                origin::http(id, request, rx, target, registry, send).await;
+            })
+        };
         Stream {
-            body: Some(body),
+            input: Some(Input::Body(tx)),
+            received: 0,
+            limit,
+            parts: Vec::new(),
+            text: false,
             task,
         }
     }
+}
+
+/// Run one request through Remote Control's public routes and stream the answer back.
+async fn in_process(
+    id: u32,
+    mut request: RelayRequest,
+    body: mpsc::Receiver<bytes::Bytes>,
+    routes: Arc<PublicRoutes>,
+    send: Sender,
+) {
+    let stream = tokio_stream::wrappers::ReceiverStream::new(body).map(Ok::<_, std::io::Error>);
+    request
+        .headers
+        .push(("x-forwarded-for".into(), request.client.to_string()));
+    request
+        .headers
+        .push(("x-forwarded-proto".into(), "https".into()));
+    let mut builder = axum::http::Request::builder()
+        .method(request.method.as_str())
+        .uri(&request.path);
+    for (name, value) in &request.headers {
+        builder = builder.header(name, value);
+    }
+    let Ok(mut http) = builder.body(Body::from_stream(stream)) else {
+        send.meta(frame::RESET, id, &json!({ "error": "bad request" }))
+            .await;
+        return;
+    };
+    http.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(request.client, 0)));
+    let response = match routes.router.clone().oneshot(http).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    };
+    let status = response.status().as_u16();
+    let headers = response_headers(response.headers());
+    if !send
+        .meta(
+            frame::HEADERS,
+            id,
+            &json!({ "status": status, "headers": headers }),
+        )
+        .await
+    {
+        return;
+    }
+    let mut data = response.into_body().into_data_stream();
+    while let Some(chunk) = data.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if !send.data(frame::DATA, id, &chunk, 0).await {
+                    return;
+                }
+            }
+            Err(error) => {
+                send.meta(frame::RESET, id, &json!({ "error": error.to_string() }))
+                    .await;
+                return;
+            }
+        }
+    }
+    send.raw(frame::END, id, &[], 0).await;
+}
+
+/// A response's headers for HEADERS: lowercase names, repeated ones joined, hop-by-hop and
+/// content-length left out.
+fn response_headers(map: &axum::http::HeaderMap) -> serde_json::Map<String, Value> {
+    let mut headers = serde_json::Map::new();
+    for (name, value) in map {
+        let name = name.as_str().to_lowercase();
+        if HOP_BY_HOP.contains(&name.as_str()) || name == "content-length" {
+            continue;
+        }
+        let Ok(value) = value.to_str() else { continue };
+        let joined = match headers.get(&name).and_then(Value::as_str) {
+            Some(previous) => format!("{previous}, {value}"),
+            None => value.to_string(),
+        };
+        headers.insert(name, Value::String(joined));
+    }
+    headers
+}
+
+/// The registration body (POST /v1/relay-exposures).
+fn registration(install_id: &str, credential: Option<String>, surfaces: &[&str]) -> Value {
+    json!({
+        "installId": install_id,
+        "connectorCredential": credential,
+        "runtimeChannel": "app",
+        "appName": "RealTimeX Link",
+        "appVersion": env!("CARGO_PKG_VERSION"),
+        "machineName": crate::host::machine_name(),
+        "osPlatform": os_platform(),
+        "surfaces": surfaces,
+    })
+}
+
+/// POST /v1/relay-exposures/{id}/recover: the exposure bound to `install_id` with a new
+/// credential (only for its owner's account).
+async fn recover(
+    account: &Account,
+    exposure_id: &str,
+    install_id: &str,
+    key: &str,
+) -> Result<Value, ApiFailure> {
+    api_post(
+        &format!(
+            "{}/v1/relay-exposures/{exposure_id}/recover",
+            account.api_base
+        ),
+        &account.token,
+        key,
+        &json!({ "installId": install_id }),
+    )
+    .await
+}
+
+/// What the store keeps of an enrollment answer (without the credential): every surface's
+/// public routes (the content host of artifacts and the widget too) and its path policy.
+fn exposure_of(answer: &Value) -> Result<Value> {
+    let exposure_id = answer
+        .get("exposureId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("the relay answered without an exposure ID"))?;
+    let connector = answer.get("connector").cloned().unwrap_or(json!({}));
+    let url = connector
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("wss://"))
+        .ok_or_else(|| anyhow!("the relay answered without a wss:// connector"))?;
+    let routes: Vec<Value> = answer
+        .get("surfaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| {
+            s.get("surface")
+                .and_then(Value::as_str)
+                .is_some_and(|surface| SURFACES.contains(&surface))
+        })
+        .map(|s| {
+            json!({
+                "surface": s.get("surface"),
+                "hostname": s.get("hostname"),
+                "pathPrefix": s.get("pathPrefix"),
+                "publicBaseUrl": s.get("publicBaseUrl"),
+                "contentBaseUrl": s.get("contentBaseUrl"),
+            })
+        })
+        .collect();
+    if routes.is_empty() {
+        bail!("the relay did not give this computer any route");
+    }
+    // An entry replaces a surface's defaults whole; a surface without one keeps them.
+    let mut allowed = serde_json::Map::new();
+    for entry in answer
+        .get("pathAllowlist")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(surface), Some(prefix)) = (
+            entry.get("surface").and_then(Value::as_str),
+            entry.get("pathPrefix").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !SURFACES.contains(&surface) {
+            continue;
+        }
+        let list = allowed
+            .entry(surface.to_string())
+            .or_insert_with(|| json!([]));
+        if let Some(list) = list.as_array_mut() {
+            list.push(json!(prefix));
+        }
+    }
+    Ok(json!({
+        "exposureId": exposure_id,
+        "connector": {
+            "url": url,
+            "protocol": connector.get("protocol"),
+            "websocketSubprotocol": connector.get("websocketSubprotocol"),
+        },
+        "routes": routes,
+        "allowedPrefixes": allowed,
+    }))
+}
+
+/// The stored routes, each with its surface (an exposure enrolled before #6 had only `d`, and
+/// its routes no surface).
+fn stored_routes(exposure: &Value) -> Vec<Value> {
+    exposure
+        .get("routes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|route| {
+            let mut route = route.clone();
+            if route.get("surface").and_then(Value::as_str).is_none() {
+                route["surface"] = json!(REMOTE_CONTROL);
+            }
+            route
+        })
+        .collect()
+}
+
+fn strings(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// "https://host/<surface>/<id>/" as (host, "/<surface>/<id>"), or None.
+fn public_route(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if host.is_empty() || host.contains(['@', ':', '?', '#']) || path.contains(['?', '#']) {
+        return None;
+    }
+    let path = format!("/{}", path.trim_end_matches('/'));
+    Some((host.to_lowercase(), path))
 }
 
 struct Connection {
@@ -883,29 +1406,119 @@ struct Connection {
     url: String,
     subprotocol: String,
     credential: String,
-    /// (hostname, pathPrefix) of each public route to this computer.
-    routes: Vec<(String, String)>,
-    allowed: Vec<String>,
+    /// (surface, hostname, pathPrefix) of each public route to this computer.
+    routes: Vec<(String, String, String)>,
+    /// The path policy of each surface the enrollment named (others keep `default_prefixes`).
+    allowed: HashMap<String, Vec<String>>,
 }
 
-struct RelayRequest {
+pub(crate) struct RelayRequest {
+    surface: String,
     method: String,
     path: String,
     headers: Vec<(String, String)>,
     client: std::net::IpAddr,
+    public_host: String,
+    public_prefix: String,
+    /// The client's Content-Length, for the body limit before anything is read.
+    length: Option<u64>,
+    websocket: bool,
+    /// The WebSocket subprotocols the client offers.
+    protocols: Vec<String>,
 }
 
 impl Connection {
-    /// The local request for an OPEN, or why the stream is refused (it alone is reset).
-    fn request(&self, value: &Value) -> Result<RelayRequest, String> {
-        let text = |name: &str| value.get(name).and_then(Value::as_str).unwrap_or("");
-        if text("surface") != SURFACE {
-            return Err("unauthorized surface".into());
+    fn from_stored(exposure: &Value, install_id: &str, credential: String) -> Option<Self> {
+        let mut routes = Vec::new();
+        for route in stored_routes(exposure) {
+            let surface = route.get("surface")?.as_str()?.to_string();
+            let prefix = route.get("pathPrefix")?.as_str()?.to_string();
+            if let Some(host) = route.get("hostname").and_then(Value::as_str) {
+                routes.push((surface.clone(), host.to_lowercase(), prefix.clone()));
+            }
+            // Artifacts and the widget are also served on the content host.
+            for key in ["publicBaseUrl", "contentBaseUrl"] {
+                if let Some((host, path)) = route
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(public_route)
+                {
+                    if path == prefix {
+                        let entry = (surface.clone(), host, path);
+                        if !routes.contains(&entry) {
+                            routes.push(entry);
+                        }
+                    }
+                }
+            }
         }
+        let allowed = match exposure.get("allowedPrefixes") {
+            // Before #6: Remote Control's list.
+            Some(Value::Array(list)) => HashMap::from([(
+                REMOTE_CONTROL.to_string(),
+                strings(Some(&Value::Array(list.clone()))),
+            )]),
+            Some(Value::Object(map)) => map
+                .iter()
+                .map(|(surface, list)| (surface.clone(), strings(Some(list))))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        Some(Connection {
+            exposure_id: exposure.get("exposureId")?.as_str()?.to_string(),
+            install_id: install_id.to_string(),
+            url: exposure.pointer("/connector/url")?.as_str()?.to_string(),
+            subprotocol: exposure
+                .pointer("/connector/websocketSubprotocol")
+                .and_then(Value::as_str)
+                .unwrap_or(WEBSOCKET_SUBPROTOCOL)
+                .to_string(),
+            credential,
+            routes,
+            allowed,
+        })
+    }
+
+    /// Whether this exposure is enrolled with exactly these surfaces.
+    fn carries(&self, surfaces: &[&str]) -> bool {
+        let enrolled: HashSet<&str> = self.routes.iter().map(|(s, _, _)| s.as_str()).collect();
+        enrolled == surfaces.iter().copied().collect()
+    }
+
+    /// Whether `pathname` is in `surface`'s policy. An empty list (an invalid policy) reaches
+    /// nothing; desktop messaging never leaves its ceiling.
+    fn allows(&self, surface: &str, pathname: &str) -> bool {
+        let under = |prefix: &str| {
+            let prefix = prefix.trim_end_matches('/');
+            !prefix.is_empty()
+                && (pathname == prefix || pathname.starts_with(&format!("{prefix}/")))
+        };
+        let within_ceiling = |prefix: &str| {
+            surface != PEER
+                || prefix == PEER_CEILING
+                || prefix.starts_with(&format!("{PEER_CEILING}/"))
+        };
+        match self.allowed.get(surface) {
+            Some(list) => list
+                .iter()
+                .any(|prefix| within_ceiling(prefix) && under(prefix)),
+            None => default_prefixes(surface).iter().any(|prefix| under(prefix)),
+        }
+    }
+
+    /// The local request for an OPEN or WS_OPEN, or why the stream is refused (it alone is
+    /// reset).
+    fn request(&self, value: &Value, websocket: bool) -> Result<RelayRequest, String> {
+        let text = |name: &str| value.get(name).and_then(Value::as_str).unwrap_or("");
+        let surface = text("surface");
         let route = (
+            surface.to_string(),
             text("publicHost").trim().to_lowercase(),
             text("publicPrefix").trim().to_string(),
         );
+        if !self.routes.iter().any(|(s, _, _)| s == surface) {
+            return Err("unauthorized surface".into());
+        }
         if !self.routes.contains(&route) {
             return Err("unauthorized public route".into());
         }
@@ -916,28 +1529,26 @@ impl Connection {
             && !pathname.split('/').any(|part| part == ".." || part == ".")
             && !path.contains('\\')
             && !path.chars().any(char::is_control);
-        let allowed = self.allowed.iter().any(|prefix| {
-            pathname == prefix
-                || pathname.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
-        });
-        if !safe || !allowed {
+        if !safe || !self.allows(surface, pathname) {
             return Err("unauthorized request path".into());
         }
         let method = match text("method").to_uppercase() {
             m if m.is_empty() => "GET".to_string(),
             m => m,
         };
+        // Remote Control has no WebSocket routes; desktop messaging is plain GET and POST.
+        if websocket && (surface == REMOTE_CONTROL || surface == PEER) {
+            return Err("unauthorized request method".into());
+        }
+        if surface == PEER && !matches!(method.as_str(), "GET" | "POST") {
+            return Err("unauthorized request method".into());
+        }
         let mut headers = Vec::new();
+        let mut protocols = Vec::new();
+        let mut length = None;
         if let Some(map) = value.get("headers").and_then(Value::as_object) {
             for (name, raw) in map {
-                let name = name.to_lowercase();
-                if HOP_BY_HOP.contains(&name.as_str())
-                    || name == "host"
-                    || name == "content-length"
-                    || name.starts_with("x-forwarded-")
-                {
-                    continue;
-                }
+                let name = name.trim().to_lowercase();
                 let values: Vec<String> = match raw {
                     Value::Array(list) => list
                         .iter()
@@ -946,6 +1557,30 @@ impl Connection {
                     Value::String(v) => vec![v.clone()],
                     _ => continue,
                 };
+                if name == "content-length" {
+                    length = values.first().and_then(|v| v.trim().parse::<u64>().ok());
+                }
+                if websocket && name == "sec-websocket-protocol" {
+                    protocols.extend(
+                        values
+                            .iter()
+                            .flat_map(|v| v.split(','))
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty()),
+                    );
+                }
+                // The forwarding headers, and RealTimeX's relay markers, are Link's to set.
+                if name.is_empty()
+                    || HOP_BY_HOP.contains(&name.as_str())
+                    || name == "host"
+                    || name == "content-length"
+                    || name.starts_with("x-forwarded-")
+                    || name.starts_with("x-realtimex-")
+                    || (websocket && name.starts_with("sec-websocket-"))
+                    || name.contains(['\r', '\n'])
+                {
+                    continue;
+                }
                 for v in values {
                     if !v.contains(['\r', '\n']) {
                         headers.push((name.clone(), v));
@@ -957,28 +1592,101 @@ impl Connection {
         let client = text("remoteAddress")
             .parse::<std::net::IpAddr>()
             .map_err(|_| "the relay named no client address".to_string())?;
-        headers.push(("x-forwarded-for".into(), client.to_string()));
-        headers.push(("x-forwarded-proto".into(), "https".into()));
         Ok(RelayRequest {
+            surface: surface.to_string(),
             method,
             path: path.to_string(),
             headers,
             client,
+            public_host: route.1,
+            public_prefix: route.2,
+            length,
+            websocket,
+            protocols,
         })
     }
 }
 
+/// What a stream reads from the relay: its request body, or its WebSocket's messages.
+enum Input {
+    Body(mpsc::Sender<bytes::Bytes>),
+    Socket(mpsc::Sender<Message>),
+}
+
 struct Stream {
-    /// The request body's remaining chunks (None after END).
-    body: Option<mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>>,
+    /// None after END (or the client's WS_CLOSE).
+    input: Option<Input>,
+    /// Request body bytes so far, against `limit`.
+    received: u64,
+    limit: u64,
+    /// The WebSocket message being put together from MORE fragments.
+    parts: Vec<u8>,
+    text: bool,
     task: JoinHandle<()>,
+}
+
+impl Stream {
+    /// A DATA frame: the next part of the request body.
+    async fn body(&mut self, chunk: bytes::Bytes) -> Result<(), &'static str> {
+        self.received += chunk.len() as u64;
+        if self.received > self.limit {
+            return Err("request body too large");
+        }
+        let Some(Input::Body(tx)) = &self.input else {
+            return Ok(());
+        };
+        match tokio::time::timeout(STREAM_STALL, tx.send(chunk)).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err("the request body was not read"),
+        }
+    }
+
+    /// A WS_DATA frame: a whole message, or a fragment of one (MORE).
+    async fn message(&mut self, chunk: bytes::Bytes, flags: u8) -> Result<(), &'static str> {
+        if self.parts.is_empty() {
+            self.text = flags & TEXT_FLAG != 0;
+        }
+        if self.parts.len() + chunk.len() > MAX_WS_MESSAGE {
+            return Err("WebSocket message too large");
+        }
+        self.parts.extend_from_slice(&chunk);
+        if flags & MORE_FLAG != 0 {
+            return Ok(());
+        }
+        let payload = std::mem::take(&mut self.parts);
+        let message = if self.text {
+            match String::from_utf8(payload) {
+                Ok(text) => Message::Text(text.into()),
+                Err(_) => return Err("WebSocket text is not UTF-8"),
+            }
+        } else {
+            Message::Binary(payload.into())
+        };
+        let Some(Input::Socket(tx)) = &self.input else {
+            return Ok(());
+        };
+        match tokio::time::timeout(STREAM_STALL, tx.send(message)).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err("the WebSocket was not read"),
+        }
+    }
+}
+
+enum Handled {
+    Go,
+    GoAway,
 }
 
 enum Ended {
     Stopped,
+    /// The exposure changed (adopted): connect again with the new one.
+    Restart,
     AuthFailed,
     AlreadyActive,
-    Lost { was_ready: bool, reason: String },
+    Lost {
+        was_ready: bool,
+        reason: String,
+    },
 }
 
 impl Ended {
@@ -987,33 +1695,85 @@ impl Ended {
     }
 }
 
+/// Frames to the relay: a stream's own frames wait in order for room in the bounded queue; the
+/// frame loop's answers (PONG, a refused stream) jump it.
 #[derive(Clone)]
-struct Sender(mpsc::UnboundedSender<Message>);
+pub(crate) struct Sender {
+    data: mpsc::Sender<Message>,
+    control: mpsc::UnboundedSender<Message>,
+}
+
+fn encode(kind: u8, stream: u32, payload: &[u8], flags: u8) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len());
+    bytes.push(PROTOCOL_VERSION);
+    bytes.push(kind);
+    bytes.push(flags);
+    bytes.extend_from_slice(&stream.to_be_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn meta_payload(value: &Value) -> Vec<u8> {
+    let text = value.to_string();
+    if text.len() > MAX_META_FRAME {
+        json!({ "error": "metadata too large" })
+            .to_string()
+            .into_bytes()
+    } else {
+        text.into_bytes()
+    }
+}
 
 impl Sender {
-    fn raw(&self, kind: u8, stream: u32, payload: &[u8], flags: u8) {
-        let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len());
-        bytes.push(PROTOCOL_VERSION);
-        bytes.push(kind);
-        bytes.push(flags);
-        bytes.extend_from_slice(&stream.to_be_bytes());
-        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(payload);
-        let _ = self.0.send(Message::Binary(bytes.into()));
+    /// One frame, in its stream's order. False: the connection is gone.
+    async fn raw(&self, kind: u8, stream: u32, payload: &[u8], flags: u8) -> bool {
+        self.data
+            .send(Message::Binary(encode(kind, stream, payload, flags).into()))
+            .await
+            .is_ok()
     }
 
-    fn meta(&self, kind: u8, stream: u32, value: &Value) {
-        let text = value.to_string();
-        let payload = if text.len() > MAX_META_FRAME {
-            json!({ "error": "metadata too large" }).to_string()
-        } else {
-            text
-        };
-        self.raw(kind, stream, payload.as_bytes(), 0);
+    async fn meta(&self, kind: u8, stream: u32, value: &Value) -> bool {
+        self.raw(kind, stream, &meta_payload(value), 0).await
+    }
+
+    /// DATA or WS_DATA in frames of at most 64 KiB; a WebSocket message keeps its boundary with
+    /// MORE on every frame but its last (and its TEXT flag on each).
+    async fn data(&self, kind: u8, stream: u32, payload: &[u8], flags: u8) -> bool {
+        if payload.is_empty() {
+            return self.raw(kind, stream, payload, flags).await;
+        }
+        let parts = payload.chunks(MAX_DATA_FRAME).count();
+        for (index, part) in payload.chunks(MAX_DATA_FRAME).enumerate() {
+            let more = if kind == frame::WS_DATA && index + 1 < parts {
+                MORE_FLAG
+            } else {
+                0
+            };
+            if !self.raw(kind, stream, part, flags | more).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn urgent(&self, kind: u8, stream: u32, payload: &[u8], flags: u8) {
+        let _ = self
+            .control
+            .send(Message::Binary(encode(kind, stream, payload, flags).into()));
+    }
+
+    fn urgent_meta(&self, kind: u8, stream: u32, value: &Value) {
+        self.urgent(kind, stream, &meta_payload(value), 0);
+    }
+
+    fn refuse(&self, stream: u32, reason: &str) {
+        self.urgent_meta(frame::RESET, stream, &json!({ "error": reason }));
     }
 
     fn close(&self, code: u16, reason: &str) {
-        let _ = self.0.send(Message::Close(Some(
+        let _ = self.control.send(Message::Close(Some(
             tokio_tungstenite::tungstenite::protocol::CloseFrame {
                 code: CloseCode::from(code),
                 reason: reason.to_string().into(),
@@ -1024,6 +1784,7 @@ impl Sender {
 
 struct Frame {
     kind: u8,
+    flags: u8,
     stream: u32,
     payload: bytes::Bytes,
 }
@@ -1046,10 +1807,11 @@ impl Decoder {
                 bail!("unsupported relay protocol version");
             }
             let kind = self.buffer[1];
+            let flags = self.buffer[2];
             let stream = u32::from_be_bytes(self.buffer[3..7].try_into().expect("4 bytes"));
             let length =
                 u32::from_be_bytes(self.buffer[7..11].try_into().expect("4 bytes")) as usize;
-            let limit = if kind == frame::DATA || kind == 11 {
+            let limit = if kind == frame::DATA || kind == frame::WS_DATA {
                 MAX_DATA_FRAME
             } else {
                 MAX_META_FRAME
@@ -1065,6 +1827,7 @@ impl Decoder {
             self.buffer.drain(..HEADER_BYTES + length);
             frames.push(Frame {
                 kind,
+                flags,
                 stream,
                 payload,
             });
@@ -1076,6 +1839,40 @@ impl Decoder {
 struct ApiFailure {
     status: u16,
     message: String,
+    /// The answer's body, for a typed refusal ({ code, surface }).
+    body: Value,
+}
+
+enum EnrollFailure {
+    /// 422 RELAY_SURFACE_UNSUPPORTED: this Marketplace doesn't serve that surface yet.
+    Unsupported(String),
+    Other(anyhow::Error),
+}
+
+impl From<ApiFailure> for EnrollFailure {
+    fn from(failure: ApiFailure) -> Self {
+        if failure.status == 422
+            && failure.body.get("code").and_then(Value::as_str) == Some("RELAY_SURFACE_UNSUPPORTED")
+        {
+            let surface = failure
+                .body
+                .get("surface")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    // "Relay surface p is not supported by this service yet"
+                    failure
+                        .message
+                        .strip_prefix("Relay surface ")
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(str::to_string)
+                });
+            if let Some(surface) = surface.filter(|s| SURFACES.contains(&s.as_str())) {
+                return EnrollFailure::Unsupported(surface);
+            }
+        }
+        EnrollFailure::Other(anyhow!("{}", failure.message))
+    }
 }
 
 /// POST JSON to the Marketplace API with the account's token (blocking, off the runtime).
@@ -1105,6 +1902,7 @@ async fn api_post(
             .map_err(|error| ApiFailure {
                 status: 0,
                 message: format!("{url}: {error}"),
+                body: Value::Null,
             })?;
         let status = response.status().as_u16();
         let answer: Value = response.body_mut().read_json().unwrap_or(Value::Null);
@@ -1113,26 +1911,25 @@ async fn api_post(
         }
         let message = answer
             .get("message")
+            .or_else(|| answer.get("detail"))
             .or_else(|| answer.get("error"))
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("the relay service answered {status}"));
-        Err(ApiFailure { status, message })
+        Err(ApiFailure {
+            status,
+            message,
+            body: answer,
+        })
     })
     .await
     .unwrap_or_else(|error| {
         Err(ApiFailure {
             status: 0,
             message: error.to_string(),
+            body: Value::Null,
         })
     })
-}
-
-/// The registration body's fields other than the credential.
-fn body_fields(body: &Value) -> serde_json::Map<String, Value> {
-    let mut fields = body.as_object().cloned().unwrap_or_default();
-    fields.remove("connectorCredential");
-    fields
 }
 
 /// A JWT's `exp`, unchecked (it only says when to stop using it).
@@ -1198,8 +1995,8 @@ fn allowed_api_base(base: &str) -> Option<String> {
             let (host, port) = authority
                 .rsplit_once(':')
                 .unwrap_or((authority.as_str(), ""));
-            let port_ok = port.is_empty()
-                || (port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit()));
+            let port_ok =
+                port.is_empty() || (port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit()));
             (DEBUG_API_HOSTS.contains(&host) && port_ok).then(|| format!("http://{authority}"))
         }
         _ => None,
@@ -1250,73 +2047,210 @@ mod tests {
         assert_eq!(allowed_api_base("http://10.0.0.1:3001"), None);
     }
 
-    fn connection() -> Connection {
-        Connection {
-            exposure_id: "Hn4cR8tZ1qLs0wXe5uYb7A".into(),
-            install_id: "i".into(),
-            url: "wss://relay.example/connect".into(),
-            subprotocol: WEBSOCKET_SUBPROTOCOL.into(),
-            credential: "c".into(),
-            routes: vec![("x.realtimex.ai".into(), "/d/Hn4cR8tZ1qLs0wXe5uYb7A".into())],
-            allowed: vec![DEFAULT_ALLOWED_PREFIX.into()],
-        }
+    const ID: &str = "Hn4cR8tZ1qLs0wXe5uYb7A";
+
+    /// An enrollment answer as the Marketplace gives it.
+    fn answer() -> Value {
+        json!({
+            "exposureId": ID,
+            "connector": { "url": "wss://relay.example/connect", "credential": "c", "websocketSubprotocol": WEBSOCKET_SUBPROTOCOL },
+            "surfaces": [
+                { "surface": "a", "hostname": "x.realtimex.ai", "pathPrefix": format!("/a/{ID}"), "publicBaseUrl": format!("https://x.realtimex.ai/a/{ID}/"), "contentBaseUrl": format!("https://c.realtimex.ai/a/{ID}/") },
+                { "surface": "h", "hostname": "s.realtimex.ai", "pathPrefix": format!("/h/{ID}"), "publicBaseUrl": format!("https://s.realtimex.ai/h/{ID}/") },
+                { "surface": "p", "hostname": "s.realtimex.ai", "pathPrefix": format!("/p/{ID}"), "publicBaseUrl": format!("https://s.realtimex.ai/p/{ID}/") },
+                { "surface": "d", "hostname": "x.realtimex.ai", "pathPrefix": format!("/d/{ID}"), "publicBaseUrl": format!("https://x.realtimex.ai/d/{ID}/") },
+                { "surface": "w", "hostname": "x.realtimex.ai", "pathPrefix": format!("/w/{ID}"), "publicBaseUrl": format!("https://x.realtimex.ai/w/{ID}/") },
+            ],
+            "pathAllowlist": [
+                { "surface": "h", "pathPrefix": "/wh" },
+                { "surface": "p", "pathPrefix": "/api/peer/v1" },
+                { "surface": "p", "pathPrefix": "/api" },
+                { "surface": "d", "pathPrefix": "/remote-control" },
+            ],
+        })
     }
 
-    fn open(path: &str) -> Value {
+    fn connection() -> Connection {
+        Connection::from_stored(&exposure_of(&answer()).unwrap(), "i", "c".into()).unwrap()
+    }
+
+    fn open(surface: &str, host: &str, path: &str) -> Value {
         json!({
-            "surface": "d",
-            "publicHost": "X.realtimex.ai",
-            "publicPrefix": "/d/Hn4cR8tZ1qLs0wXe5uYb7A",
+            "surface": surface,
+            "publicHost": host,
+            "publicPrefix": format!("/{surface}/{ID}"),
             "path": path,
             "method": "post",
-            "headers": { "Content-Type": "application/json", "X-Forwarded-For": "6.6.6.6", "Host": "evil", "Connection": "close" },
+            "headers": {
+                "Content-Type": "application/json",
+                "Content-Length": "12",
+                "X-Forwarded-For": "6.6.6.6",
+                "X-RealTimeX-Relay-Source": "desktop",
+                "Host": "evil",
+                "Connection": "close",
+                "Sec-WebSocket-Protocol": "chat, json",
+            },
             "remoteAddress": "203.0.113.7",
         })
     }
 
     #[test]
-    fn requests_keep_to_remote_controls_routes() {
+    fn requests_keep_to_each_surfaces_routes() {
         let request = connection()
-            .request(&open("/remote-control/connect"))
+            .request(
+                &open("d", "X.realtimex.ai", "/remote-control/connect"),
+                false,
+            )
             .unwrap();
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/remote-control/connect");
         assert_eq!(request.client.to_string(), "203.0.113.7");
+        assert_eq!(request.length, Some(12));
         assert!(request
             .headers
             .contains(&("content-type".into(), "application/json".into())));
-        assert!(request
-            .headers
-            .contains(&("x-forwarded-for".into(), "203.0.113.7".into())));
-        assert!(!request
-            .headers
-            .iter()
-            .any(|(n, v)| n == "host" || n == "connection" || v == "6.6.6.6"));
+        assert!(!request.headers.iter().any(|(n, v)| n == "host"
+            || n == "connection"
+            || n == "content-length"
+            || n.starts_with("x-realtimex-")
+            || v == "6.6.6.6"));
         for path in [
             "/api/system",
             "/remote-control/../api",
             "//evil/remote-control",
             "/remote-controlx",
         ] {
-            assert!(connection().request(&open(path)).is_err(), "{path}");
+            assert!(
+                connection()
+                    .request(&open("d", "x.realtimex.ai", path), false)
+                    .is_err(),
+                "{path}"
+            );
         }
-        let mut other = open("/remote-control/hello");
+        let mut other = open("d", "x.realtimex.ai", "/remote-control/hello");
         other["publicPrefix"] = json!("/d/someone-else");
-        assert!(connection().request(&other).is_err());
-        other = open("/remote-control/hello");
-        other["surface"] = json!("w");
-        assert!(connection().request(&other).is_err());
-        other = open("/remote-control/hello");
+        assert!(connection().request(&other, false).is_err());
+        other = open("d", "x.realtimex.ai", "/remote-control/hello");
         other["remoteAddress"] = json!("");
-        assert!(connection().request(&other).is_err());
+        assert!(connection().request(&other, false).is_err());
+        // A surface this exposure doesn't carry (workspace share was removed).
+        assert!(connection()
+            .request(&open("w", "x.realtimex.ai", "/sw"), false)
+            .is_err());
+        assert!(connection()
+            .request(&open("e", "x.realtimex.ai", "/embed"), false)
+            .is_err());
     }
 
     #[test]
-    fn frames_round_trip_across_messages() {
-        let (out, mut sent) = mpsc::unbounded_channel();
-        let send = Sender(out);
-        send.meta(frame::HEADERS, 7, &json!({ "status": 200 }));
-        send.raw(frame::DATA, 7, &[1, 2, 3], 0);
+    fn artifacts_are_served_on_the_content_host_too_with_their_default_policy() {
+        let connection = connection();
+        for host in ["x.realtimex.ai", "c.realtimex.ai"] {
+            let request = connection
+                .request(&open("a", host, "/ar/abc/index.html"), false)
+                .unwrap();
+            assert_eq!(request.public_host, host);
+            assert_eq!(request.public_prefix, format!("/a/{ID}"));
+        }
+        assert!(connection
+            .request(&open("a", "s.realtimex.ai", "/ar/abc"), false)
+            .is_err());
+        assert!(connection
+            .request(&open("a", "c.realtimex.ai", "/wh/token"), false)
+            .is_err());
+        // The enrollment's list replaces h's defaults whole: no /api/ping.
+        assert!(connection
+            .request(&open("h", "s.realtimex.ai", "/wh/token"), false)
+            .is_ok());
+        assert!(connection
+            .request(&open("h", "s.realtimex.ai", "/api/ping"), false)
+            .is_err());
+    }
+
+    #[test]
+    fn desktop_messaging_stays_under_its_ceiling_and_methods() {
+        let connection = connection();
+        assert!(connection
+            .request(&open("p", "s.realtimex.ai", "/api/peer/v1/messages"), false)
+            .is_ok());
+        // "/api" in the policy is outside the ceiling and ignored.
+        assert!(connection
+            .request(&open("p", "s.realtimex.ai", "/api/system"), false)
+            .is_err());
+        let mut put = open("p", "s.realtimex.ai", "/api/peer/v1/messages");
+        put["method"] = json!("PUT");
+        assert!(connection.request(&put, false).is_err());
+        assert!(connection
+            .request(&open("p", "s.realtimex.ai", "/api/peer/v1/messages"), true)
+            .is_err());
+        assert!(connection
+            .request(&open("d", "x.realtimex.ai", "/remote-control/x"), true)
+            .is_err());
+    }
+
+    #[test]
+    fn websocket_requests_keep_their_subprotocols_apart() {
+        let request = connection()
+            .request(&open("a", "x.realtimex.ai", "/ar/live"), true)
+            .unwrap();
+        assert!(request.websocket);
+        assert_eq!(request.protocols, vec!["chat", "json"]);
+        assert!(!request
+            .headers
+            .iter()
+            .any(|(n, _)| n.starts_with("sec-websocket-")));
+    }
+
+    #[test]
+    fn an_exposure_from_before_carries_only_remote_control() {
+        let old = json!({
+            "exposureId": ID,
+            "connector": { "url": "wss://relay.example/connect" },
+            "routes": [{ "hostname": "x.realtimex.ai", "pathPrefix": format!("/d/{ID}"), "publicBaseUrl": format!("https://x.realtimex.ai/d/{ID}/") }],
+            "allowedPrefixes": ["/remote-control"],
+        });
+        let connection = Connection::from_stored(&old, "i", "c".into()).unwrap();
+        assert!(connection.carries(&["d"]));
+        assert!(!connection.carries(&SURFACES));
+        assert!(connection
+            .request(&open("d", "x.realtimex.ai", "/remote-control/hello"), false)
+            .is_ok());
+        assert!(connection.carries(&["d"]));
+        let new = super::connection();
+        assert!(new.carries(&["a", "h", "p", "d"]));
+    }
+
+    #[test]
+    fn unsupported_surfaces_are_recognized() {
+        let failure = |body: Value| ApiFailure {
+            status: 422,
+            message: "Relay surface p is not supported by this service yet".into(),
+            body,
+        };
+        assert!(matches!(
+            EnrollFailure::from(failure(json!({ "code": "RELAY_SURFACE_UNSUPPORTED", "surface": "p" }))),
+            EnrollFailure::Unsupported(s) if s == "p"
+        ));
+        assert!(matches!(
+            EnrollFailure::from(failure(json!({ "code": "RELAY_SURFACE_UNSUPPORTED" }))),
+            EnrollFailure::Unsupported(s) if s == "p"
+        ));
+        assert!(matches!(
+            EnrollFailure::from(failure(json!({ "code": "OTHER" }))),
+            EnrollFailure::Other(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn frames_round_trip_across_messages() {
+        let (data, mut sent) = mpsc::channel(8);
+        let (control, _) = mpsc::unbounded_channel();
+        let send = Sender { data, control };
+        assert!(
+            send.meta(frame::HEADERS, 7, &json!({ "status": 200 }))
+                .await
+        );
+        assert!(send.raw(frame::DATA, 7, &[1, 2, 3], 0).await);
         let mut bytes = Vec::new();
         while let Ok(Message::Binary(chunk)) = sent.try_recv() {
             bytes.extend_from_slice(&chunk);
@@ -1333,6 +2267,56 @@ mod tests {
         bad[0] = 1;
         bad[7..11].copy_from_slice(&((MAX_DATA_FRAME as u32) + 1).to_be_bytes());
         assert!(Decoder::default().feed(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_websocket_message_keeps_its_boundary_and_text_flag() {
+        let (data, mut sent) = mpsc::channel(8);
+        let (control, _) = mpsc::unbounded_channel();
+        let send = Sender { data, control };
+        let message = vec![b'x'; MAX_DATA_FRAME + 10];
+        assert!(send.data(frame::WS_DATA, 3, &message, TEXT_FLAG).await);
+        let mut decoder = Decoder::default();
+        let mut frames = Vec::new();
+        while let Ok(Message::Binary(chunk)) = sent.try_recv() {
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].flags, TEXT_FLAG | MORE_FLAG);
+        assert_eq!(frames[1].flags, TEXT_FLAG);
+        // And back: fragments make one text message.
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stream = Stream {
+            input: Some(Input::Socket(tx)),
+            received: 0,
+            limit: MAX_WS_MESSAGE as u64,
+            parts: Vec::new(),
+            text: false,
+            task: tokio::spawn(async {}),
+        };
+        for frame in frames {
+            stream.message(frame.payload, frame.flags).await.unwrap();
+        }
+        match rx.try_recv().unwrap() {
+            Message::Text(text) => assert_eq!(text.len(), MAX_DATA_FRAME + 10),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_over_its_limit_is_refused() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut stream = Stream {
+            input: Some(Input::Body(tx)),
+            received: 0,
+            limit: 4,
+            parts: Vec::new(),
+            text: false,
+            task: tokio::spawn(async {}),
+        };
+        assert!(stream.body(bytes::Bytes::from_static(b"abc")).await.is_ok());
+        assert!(stream.body(bytes::Bytes::from_static(b"de")).await.is_err());
+        assert_eq!(body_limit("m"), 50 * 1024 * 1024);
     }
 
     #[test]

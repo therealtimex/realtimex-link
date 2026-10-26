@@ -12,6 +12,8 @@ pub struct ApiError {
     pub message: String,
     pub code: Option<String>,
     pub retry_after: Option<u64>,
+    /// More fields for the answer's body (a typed refusal's particulars).
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -21,6 +23,7 @@ impl ApiError {
             message: message.into(),
             code: None,
             retry_after: None,
+            details: None,
         }
     }
 
@@ -41,6 +44,12 @@ impl ApiError {
 
     pub fn retry_after(mut self, seconds: u64) -> Self {
         self.retry_after = Some(seconds);
+        self
+    }
+
+    /// Add these fields (an object) to the answer's body.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
         self
     }
 }
@@ -67,10 +76,17 @@ impl IntoResponse for ApiError {
         if self.status >= 500 {
             eprintln!("[remote-control] {}", self.message);
         }
-        let body = match &self.code {
+        let mut body = match &self.code {
             Some(code) => json!({ "error": self.message, "code": code }),
             None => json!({ "error": self.message }),
         };
+        if let (Some(serde_json::Value::Object(details)), Some(fields)) =
+            (&self.details, body.as_object_mut())
+        {
+            for (name, value) in details {
+                fields.entry(name.clone()).or_insert_with(|| value.clone());
+            }
+        }
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response = (status, Json(body)).into_response();
         if let Some(seconds) = self.retry_after {

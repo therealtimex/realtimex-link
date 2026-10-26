@@ -54,6 +54,9 @@ pub struct Settings {
     pub default_permissions: Value,
     pub allow_incoming: bool,
     pub new_computer_policy: String,
+    /// "Keep RealTimeX Link running" (realtimex-ai-app#2836): on by default. Off, nothing reaches
+    /// this computer (no relay, no remote control) and Link doesn't start at login.
+    pub keep_running: bool,
 }
 
 struct State {
@@ -63,6 +66,7 @@ struct State {
     default_permissions: Value,
     allow_incoming: bool,
     new_computer_policy: String,
+    keep_running: bool,
     last_error: Option<String>,
     helper_error: Option<String>,
     tailscale: Option<Tailnet>,
@@ -156,6 +160,7 @@ impl Host {
                     default_permissions: json!({ "view": true, "control": true }),
                     allow_incoming: false,
                     new_computer_policy: DEFAULT_NEW_COMPUTER_POLICY.into(),
+                    keep_running: true,
                     last_error: None,
                     helper_error: None,
                     tailscale: None,
@@ -193,16 +198,19 @@ impl Host {
             .unwrap_or_else(|| self.state().fallback_app_id.clone())
     }
 
-    /// The App ID Link had before its relay exposure (the one it made for itself): controllers
-    /// that saved it find Link by it and move to the current one.
-    fn former_app_ids(&self) -> Vec<String> {
+    /// The App IDs Link had before: the one it made for itself before its relay exposure, and its
+    /// own exposure's before it adopted RealTimeX's. Controllers that saved one find Link by it
+    /// and move to the current one.
+    pub fn former_app_ids(&self) -> Vec<String> {
         let current = self.app_id();
         let fallback = self.state().fallback_app_id.clone();
-        if fallback.is_empty() || fallback == current {
-            Vec::new()
-        } else {
-            vec![fallback]
+        // And the exposure IDs it had before it adopted RealTimeX's (relay.rs).
+        let mut former = self.relay.former_ids();
+        if !fallback.is_empty() && !former.contains(&fallback) {
+            former.push(fallback);
         }
+        former.retain(|id| *id != current);
+        former
     }
 
     pub fn identity(&self) -> Value {
@@ -235,7 +243,14 @@ impl Host {
             default_permissions: state.default_permissions.clone(),
             allow_incoming: state.allow_incoming,
             new_computer_policy: state.new_computer_policy.clone(),
+            keep_running: state.keep_running,
         }
+    }
+
+    /// Whether other computers may connect now: allowed, and Link is kept running.
+    fn incoming(&self) -> bool {
+        let state = self.state();
+        state.allow_incoming && state.keep_running
     }
 
     /// This computer's own Public Exposure (relay.rs): { state, url, detail }.
@@ -252,6 +267,7 @@ impl Host {
                 state.default_permissions = normalize_permissions(permissions);
             }
             state.allow_incoming = settings.get("allowIncoming") == Some(&Value::Bool(true));
+            state.keep_running = settings.get("keepRunning") != Some(&Value::Bool(false));
             state.new_computer_policy = settings
                 .get("newComputerPolicy")
                 .and_then(Value::as_str)
@@ -349,7 +365,7 @@ impl Host {
         via: &str,
         password_blocked: bool,
     ) -> Result<Admitted, ApiError> {
-        if !self.state().allow_incoming {
+        if !self.incoming() {
             return Ok(Admitted::refuse(
                 403,
                 "not-accepting",
@@ -517,9 +533,9 @@ impl Host {
                 Ok(refused)
             }
             // A request is open for this client ID and this caller didn't show its requestId.
-            Err(error) if error.code.as_deref() == Some("request-conflict") => Ok(
-                Admitted::refuse(409, "request-conflict", &error.message),
-            ),
+            Err(error) if error.code.as_deref() == Some("request-conflict") => {
+                Ok(Admitted::refuse(409, "request-conflict", &error.message))
+            }
             Err(error) => Err(error),
         }
     }
@@ -712,6 +728,7 @@ impl Host {
                 "defaultPermissions": settings.default_permissions,
                 "allowIncoming": settings.allow_incoming,
                 "newComputerPolicy": settings.new_computer_policy,
+                "keepRunning": settings.keep_running,
             }),
         )?;
         Ok(())
@@ -737,30 +754,56 @@ impl Host {
     pub async fn set_allow_incoming(&self, allow: bool) -> Result<(), ApiError> {
         self.state().allow_incoming = allow;
         self.save_settings()?;
-        self.follow_hosting_at_login();
         if !allow {
-            // Viewers are cut off first, then capture stops.
-            self.end_streams(|_| true).await;
-            self.close_listener().await;
-            let _ = self.backend.stop().await;
-            self.state().session = None;
+            self.end_hosting().await;
         }
         self.reconcile().await;
-        self.relay.wake();
         Ok(())
     }
 
-    /// Hosting on means this computer should be reachable after a restart too: Link starts at
-    /// login. Hosting off, nothing needs Link at login, so the item goes (autostart.rs). Turned
-    /// off through POST /v1/autostart, it stays off. A copy with its own data folder
-    /// (development, tests) leaves the login item alone.
+    /// "Keep RealTimeX Link running" (realtimex-ai-app#2836). Off: the relay stops (nothing
+    /// shared reaches this computer), remote control stops and Link no longer starts at login; the
+    /// local API still answers, so RealTimeX can say Link is off. On: all of it comes back, at
+    /// login too (an earlier opt-out through POST /v1/autostart is cleared).
+    pub async fn set_keep_running(&self, on: bool) -> Result<(), ApiError> {
+        self.state().keep_running = on;
+        self.save_settings()?;
+        if on {
+            crate::autostart::set_opted_out(&self.store, false)?;
+        }
+        self.follow_hosting_at_login();
+        if !on {
+            self.end_hosting().await;
+        }
+        self.reconcile().await;
+        self.relay.wake();
+        (self.log)(if on {
+            "[link] RealTimeX Link is kept running"
+        } else {
+            "[link] RealTimeX Link is turned off"
+        });
+        Ok(())
+    }
+
+    /// No more incoming control: viewers are cut off first, then capture stops.
+    async fn end_hosting(&self) {
+        self.end_streams(|_| true).await;
+        self.close_listener().await;
+        let _ = self.backend.stop().await;
+        self.state().session = None;
+    }
+
+    /// Link kept running means this computer should be reachable after a restart too: Link
+    /// starts at login. Turned off, nothing needs Link at login, so the item goes (autostart.rs).
+    /// Turned off through POST /v1/autostart, it stays off until the switch is turned on again.
+    /// A copy with its own data folder (development, tests) leaves the login item alone.
     fn sync_login_item(&self) -> anyhow::Result<()> {
         if !crate::paths::is_standard() {
             return Ok(());
         }
-        let hosting = self.state().allow_incoming;
+        let running = self.state().keep_running;
         let opted_out = crate::autostart::opted_out(&self.store);
-        match crate::autostart::follow(hosting, opted_out)? {
+        match crate::autostart::follow(running, opted_out)? {
             crate::autostart::Change::Add => {
                 (self.log)("[remote-control] RealTimeX Link starts at login");
             }
@@ -856,7 +899,7 @@ impl Host {
         let address = {
             let mut state = self.state();
             state.tailscale = tailnet.clone();
-            if state.allow_incoming {
+            if state.allow_incoming && state.keep_running {
                 tailnet.map(|t| t.address)
             } else {
                 None
@@ -1029,7 +1072,7 @@ impl Host {
     fn state_code(&self) -> &'static str {
         let available = self.backend.available();
         let state = self.state();
-        if !state.allow_incoming {
+        if !state.allow_incoming || !state.keep_running {
             "off"
         } else if !available {
             "unsupported"
@@ -1057,6 +1100,7 @@ impl Host {
             "appId": app_id,
             "appIdSource": "plugin",
             "allowIncoming": state.allow_incoming,
+            "keepRunning": state.keep_running,
             "publicExposure": self.public_state(),
             "state": code,
             "stateDetail": match code {
@@ -1086,6 +1130,9 @@ impl Host {
     fn state_label(&self) -> String {
         let detected = self.backend.detected();
         let state = self.state();
+        if !state.keep_running {
+            return "Off: RealTimeX Link is turned off".into();
+        }
         if !state.allow_incoming {
             return "Off: turn on Allow remote control".into();
         }

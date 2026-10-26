@@ -15,6 +15,8 @@ use crate::desktop;
 use crate::i18n::{t, tf};
 use crate::theme::{self, primary_button, semibold, tone_colors, Tone};
 
+mod sharing;
+
 const POLL: Duration = Duration::from_millis(1500);
 /// The window's height follows its content between these; past the maximum the content scrolls.
 const MIN_HEIGHT: f32 = 360.0;
@@ -33,6 +35,10 @@ pub struct Snapshot {
     pub account: Option<Value>,
     /// Link's own updates (GET /v1/update).
     pub update: Option<Value>,
+    /// GET /v1/status: keepRunning, and exposure { appId, adopted, surfaces, origin, notice }.
+    pub status: Option<Value>,
+    /// What RealTimeX shares through Link, and whether it runs (GET /v1/shared).
+    pub shared: Option<Value>,
     pub error: Option<String>,
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
@@ -237,6 +243,7 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
                 }));
                 appearance = Some(preference);
             }
+            lock(&shared).status = status.clone();
             let shown = status.and_then(|status| status["showWindow"].as_u64());
             let seen = std::mem::replace(&mut lock(&shared).show_window, shown);
             if let (Some(seen), Some(shown)) = (seen, shown) {
@@ -246,6 +253,7 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
             }
+            let pushed = api.get("/v1/shared").ok();
             let overview = api.get("/v1/host/overview");
             let requests = api.get("/v1/host/connection-requests");
             let password = api.get("/v1/host/password");
@@ -254,6 +262,7 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             let mut state = lock(&shared);
             state.account = account;
             state.update = update;
+            state.shared = pushed;
             match overview {
                 Ok(overview) => {
                     state.overview = Some(overview);
@@ -321,9 +330,16 @@ enum Focus {
 
 enum Confirm {
     TurnOff,
+    /// "Keep RealTimeX Link running" off: everything it carries stops.
+    TurnOffLink,
+    /// Sign Link in to RealTimeX's account instead of its own (one App ID needs one account).
+    UseAccount(String),
     NewPassword,
     StopSession(String),
-    Remove { id: String, name: String },
+    Remove {
+        id: String,
+        name: String,
+    },
     SignOut,
 }
 
@@ -518,8 +534,8 @@ fn caption(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(RichText::new(text.into()).small().weak());
 }
 
-/// The switch: a pill with a knob (theme.rs paints it).
-fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+/// The switch: a pill with a knob (theme.rs paints it); `label` names it for screen readers.
+fn toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
     let size = egui::vec2(2.2, 1.2) * ui.spacing().interact_size.y;
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
     if response.clicked() {
@@ -527,12 +543,7 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         response.mark_changed();
     }
     response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::Role::CheckBox,
-            ui.is_enabled(),
-            *on,
-            t("host.allowRemoteControl"),
-        )
+        egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *on, label)
     });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
@@ -622,6 +633,10 @@ impl eframe::App for LinkApp {
             self.settings = false;
             self.focus = Some(Focus::Gear);
         }
+        let (status, shared) = {
+            let state = lock(&self.shared);
+            (state.status.clone(), state.shared.clone())
+        };
         let (overview, requests, password, account, update, error, notice, stored) = {
             let mut state = lock(&self.shared);
             if state
@@ -773,6 +788,22 @@ impl eframe::App for LinkApp {
                         }
                         break 'content;
                     };
+                    // Link on or off comes first; off, nothing else is running to show.
+                    if let Some(on) = status
+                        .as_ref()
+                        .and_then(|s| s.get("keepRunning"))
+                        .and_then(Value::as_bool)
+                    {
+                        if !self.settings {
+                            self.power_ui(ui, ctx, on);
+                        }
+                        if !on && !self.settings {
+                            break 'content;
+                        }
+                    }
+                    if let Some(exposure) = status.as_ref().and_then(|s| s.get("exposure")) {
+                        self.moved_ui(ui, ctx, exposure);
+                    }
                     self.update_ui(ui, ctx, update.as_ref());
                     self.requests_ui(ui, ctx, &requests);
                     self.session_ui(ui, overview);
@@ -807,8 +838,10 @@ impl eframe::App for LinkApp {
                             if !signed_in && desktop::realtimex_app().is_none() {
                                 self.account_ui(ui, ctx, account.as_ref());
                                 self.this_computer_ui(ui, ctx, overview, &password);
+                                self.shared_ui(ui, shared.as_ref(), account.as_ref());
                             } else {
                                 self.this_computer_ui(ui, ctx, overview, &password);
+                                self.shared_ui(ui, shared.as_ref(), account.as_ref());
                                 self.account_ui(ui, ctx, account.as_ref());
                             }
                         }
@@ -1104,7 +1137,7 @@ impl LinkApp {
             let mut changed = false;
             let mut switch = |ui: &mut egui::Ui, allow: &mut bool| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    changed |= toggle(ui, allow).changed();
+                    changed |= toggle(ui, allow, &allow_label).changed();
                     ui.label(allow_label.as_str());
                 });
             };
@@ -1586,6 +1619,8 @@ impl LinkApp {
         // confirm.<which>.title, .message and .action; {name} where there is one.
         let (which, name) = match confirm {
             Confirm::TurnOff => ("turnOff", ""),
+            Confirm::TurnOffLink => ("turnOffLink", ""),
+            Confirm::UseAccount(name) => ("useAccount", name.as_str()),
             Confirm::NewPassword => ("newPassword", ""),
             Confirm::StopSession(name) => ("stop", name.as_str()),
             Confirm::Remove { name, .. } => ("remove", name.as_str()),
@@ -1619,6 +1654,18 @@ impl LinkApp {
                     "/v1/host/settings",
                     json!({ "allowIncoming": false }),
                     &t("host.turnedOff"),
+                ),
+                Some(Confirm::TurnOffLink) => self.act(
+                    ctx,
+                    "/v1/keep-running",
+                    json!({ "on": false }),
+                    &t("link.turnedOff"),
+                ),
+                Some(Confirm::UseAccount(name)) => self.act(
+                    ctx,
+                    "/v1/account/use-realtimex",
+                    json!({}),
+                    &tf("shared.usingAccount", &[("name", name.as_str())]),
                 ),
                 Some(Confirm::NewPassword) => self.act(
                     ctx,

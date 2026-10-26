@@ -101,14 +101,27 @@ impl SignIn {
         let Some(host) = self.host.upgrade() else {
             return false;
         };
-        if self.signed_in() {
-            return false;
-        }
-        if host.store.get(keys::HANDOVER_OFF).is_some() {
+        let offer = || {
             let email = crate::identity::account_of(token)
                 .and_then(|account| account.get("email")?.as_str().map(str::to_string))
                 .unwrap_or_default();
             *lock(&self.offered) = Some((token.to_string(), email));
+        };
+        if self.signed_in() {
+            // Another account than Link's own: offered, so the window can offer "Use <it>"
+            // (realtimex-ai-app#2836: one App ID needs one account).
+            let subject = |account: Option<Value>| {
+                account.and_then(|a| a.get("subject").and_then(Value::as_str).map(str::to_string))
+            };
+            if subject(crate::identity::account_of(token))
+                != subject(host.store.get(crate::identity::keys::ACCOUNT))
+            {
+                offer();
+            }
+            return false;
+        }
+        if host.store.get(keys::HANDOVER_OFF).is_some() {
+            offer();
             return false;
         }
         true
@@ -435,12 +448,16 @@ impl SignIn {
         Ok(())
     }
 
-    /// "Continue as …": take RealTimeX's last handover after all.
-    pub fn use_handover(&self) -> Result<()> {
+    /// "Continue as …" / "Use <RealTimeX's account>": take RealTimeX's last handover after all,
+    /// signing Link out of its own account first when it has one.
+    pub async fn use_handover(&self) -> Result<()> {
         let host = self.host()?;
         let (token, _) = lock(&self.offered)
             .take()
             .ok_or_else(|| anyhow!("RealTimeX hasn't offered an account; open RealTimeX"))?;
+        if self.signed_in() {
+            self.sign_out().await?;
+        }
         host.store.remove(keys::HANDOVER_OFF)?;
         host.relay.set_account(&token)
     }
@@ -502,7 +519,8 @@ fn judge(target: &str, state: &str) -> Callback {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     };
-    if !param("state").is_some_and(|given| crate::util::same_bytes(given.as_bytes(), state.as_bytes()))
+    if !param("state")
+        .is_some_and(|given| crate::util::same_bytes(given.as_bytes(), state.as_bytes()))
     {
         Callback::Rejected("The sign-in answer didn't match. Try again.")
     } else if let Some(error) = param("error") {
