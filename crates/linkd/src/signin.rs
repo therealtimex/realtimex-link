@@ -314,7 +314,7 @@ impl SignIn {
         host.store.remove(keys::HANDOVER_OFF)?;
         *lock(&self.offered) = None;
         (host.log)(&format!("[sign-in] signed in as {email}"));
-        host.relay.wake();
+        host.relay.account_arrived();
         Ok(email)
     }
 

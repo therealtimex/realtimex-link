@@ -221,6 +221,10 @@ struct Status {
     /// Enrollment must be repeated (no exposure yet, the relay refused the credential, or the
     /// enrolled surfaces aren't the ones Link carries).
     needs_enrollment: bool,
+    /// The exposure carries fewer surfaces than Link does (one enrolled by 0.1.x carries only
+    /// Remote Control's) and there is no token to enroll the rest: it serves what it carries
+    /// until a sign-in or RealTimeX's handover brings one.
+    awaiting_account: bool,
 }
 
 pub struct Relay {
@@ -321,6 +325,15 @@ impl Relay {
         self.changed.notify_one();
     }
 
+    /// A token arrived (a sign-in, RealTimeX's handover): an exposure waiting for one to enroll
+    /// the rest of its surfaces leaves its connection and enrolls them now.
+    pub fn account_arrived(&self) {
+        if lock(&self.status).awaiting_account {
+            self.restart.store(true, Ordering::SeqCst);
+        }
+        self.wake();
+    }
+
     /// RealTimeX hands over the signed-in account's access token (and its API base). It signs
     /// Link in only when Link has no sign-in of its own (signin.rs); the API base counts only then,
     /// and only when it names an allowed host (`allowed_api_base`).
@@ -377,7 +390,9 @@ impl Relay {
         if let Some(base) = api_base.and_then(allowed_api_base) {
             self.set_api_base(base);
         }
-        host.signin.replace_with_handover(token).await
+        host.signin.replace_with_handover(token).await?;
+        self.account_arrived();
+        Ok(())
     }
 
     /// The fence for work done with `account`'s token from now on.
@@ -604,10 +619,16 @@ impl Relay {
             }
         }
         let ours = host.store.get(crate::identity::keys::ACCOUNT);
-        let (state, detail) = {
+        let (state, mut detail, awaiting) = {
             let status = lock(&self.status);
-            (status.state, status.detail.clone())
+            (status.state, status.detail.clone(), status.awaiting_account)
         };
+        // Serving only part of what Link carries for want of a token: say what it waits for.
+        let waiting = state == "ready" && awaiting && !self.serving_complete();
+        let handed_over = host.signin.status()["via"] == "realtimex";
+        if waiting && handed_over {
+            detail = Some(WAITING_FOR_REALTIMEX.into());
+        }
         let state = if !host.settings().keep_running {
             "off"
         } else if crate::owner::present(&host.store)
@@ -617,6 +638,8 @@ impl Relay {
         } else {
             match state {
                 "ready" if self.serving_complete() => "online",
+                "ready" if waiting && handed_over => "error",
+                "ready" if waiting => "signed-out",
                 "ready" => "connecting",
                 "error" => "error",
                 "not-set-up" => "signed-out",
@@ -734,7 +757,14 @@ impl Relay {
             let usable = enrolled.is_some() && !refused;
             if refused || enrolled.is_none() || stale {
                 match self.account().await {
-                    None if usable => self.converge(),
+                    None if usable => {
+                        if !std::mem::replace(&mut lock(&self.status).awaiting_account, true) {
+                            (host.log)(
+                                "[relay] enrolling every surface needs a sign-in or RealTimeX's handover; serving what is enrolled",
+                            );
+                        }
+                        self.converge();
+                    }
                     // RealTimeX owns Link and its handed-over token ran out (§6.3 A5): the
                     // next handover, at RealTimeX's next start, brings a fresh one.
                     None if crate::owner::present(&host.store) => {
@@ -753,7 +783,11 @@ impl Relay {
                         continue;
                     }
                     Some(account) => match self.enroll(&host, &account).await {
-                        Ok(()) => lock(&self.status).needs_enrollment = false,
+                        Ok(()) => {
+                            let mut status = lock(&self.status);
+                            status.needs_enrollment = false;
+                            status.awaiting_account = false;
+                        }
                         Err(error) if usable => {
                             (host.log)(&format!(
                                 "[relay] enrolling every surface failed, serving what is enrolled: {error:#}"
@@ -3451,6 +3485,32 @@ mod tests {
         // Released (uninstalled): Link is its own again.
         crate::owner::release(&host.store).unwrap();
         assert_eq!(host.signin.status()["managedByRealtimex"], false);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exposure_from_0_1_waits_for_a_token_then_enrolls_every_surface() {
+        let (base, _seen) = marketplace(|_, _, _, _, _| (404, json!({}))).await;
+        let dir = tempfile::tempdir().unwrap();
+        // Enrolled by 0.1.x: only Remote Control.
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let connection = relay.connection(&host).unwrap();
+        assert!(!connection.carries(&relay.wanted_surfaces()));
+        // A token without the rest doesn't restart the connection.
+        relay.account_arrived();
+        assert!(!relay.restart.load(Ordering::SeqCst));
+        // No token to enroll the rest (RealTimeX's handover ran out): Remote Control is served,
+        // and the exposure says what it waits for instead of connecting for ever.
+        lock(&relay.status).awaiting_account = true;
+        relay.set_status("ready", None);
+        relay.mark_serving(&connection);
+        let exposure = relay.exposure();
+        assert_eq!(exposure["state"], "error");
+        assert_eq!(exposure["error"]["code"], "waiting-for-realtimex");
+        assert!(exposure["surfaces"]["d"].is_string());
+        // RealTimeX's next handover leaves the connection to enroll every surface.
+        relay.take_handover(&token("u1"), None).await.unwrap();
+        assert!(relay.restart.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread")]
