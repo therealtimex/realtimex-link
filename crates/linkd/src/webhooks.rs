@@ -289,6 +289,7 @@ pub fn receive(
             }
             let delivery = Delivery {
                 id: crate::util::uuid(),
+                account: account(store),
                 endpoint: endpoint.tokens[0].clone(),
                 received_at: now,
                 method: "POST".into(),
@@ -405,6 +406,7 @@ fn handshake(
     };
     let delivery = Delivery {
         id: crate::util::uuid(),
+        account: account(store),
         endpoint: endpoint.tokens[0].clone(),
         received_at: now,
         method: "GET".into(),
@@ -449,11 +451,18 @@ fn decode_query(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// GET /v1/inbox's answer: { items: [{ id, endpoint, receivedAt, method, path, headers, body
-/// (base64) }], total }.
+/// The account deliveries are kept for, and read by: the one that owns the current exposure.
+/// After RealTimeX switched accounts the previous account's stay, unreadable, until it comes
+/// back or they expire.
+fn account(store: &Store) -> String {
+    crate::relay::exposure_subject(store).unwrap_or_default()
+}
+
+/// GET /v1/inbox's answer, the current account's deliveries: { items: [{ id, endpoint,
+/// receivedAt, method, path, headers, body (base64) }], total }.
 pub fn inbox_page(store: &Store, after: Option<&str>, limit: usize) -> Result<Value, ApiError> {
     use base64::Engine;
-    let (items, total) = store.inbox_list(after, limit.clamp(1, 100))?;
+    let (items, total) = store.inbox_list(&account(store), after, limit.clamp(1, 100))?;
     let items: Vec<Value> = items
         .into_iter()
         .map(|d| {
@@ -472,10 +481,15 @@ pub fn inbox_page(store: &Store, after: Option<&str>, limit: usize) -> Result<Va
     Ok(json!({ "items": items, "total": total }))
 }
 
-/// How many deliveries wait, per endpoint's first token, for the window's Shared card.
+/// POST /v1/inbox/ack: only the current account's deliveries go.
+pub fn ack(store: &Store, ids: &[String]) -> Result<usize, ApiError> {
+    Ok(store.inbox_ack(&account(store), ids)?)
+}
+
+/// How many of the current account's deliveries wait, for the window's Shared card.
 pub fn waiting(store: &Store) -> u64 {
     store
-        .inbox_counts()
+        .inbox_counts(&account(store))
         .map(|counts| counts.values().sum())
         .unwrap_or(0)
 }
@@ -487,6 +501,9 @@ mod tests {
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
+        store
+            .set(crate::relay::keys::SUBJECT, &json!({ "subject": "u1" }))
+            .unwrap();
         let verify = crate::util::sha256_hex(b"meta-secret");
         let kept = parse(&json!({
             "exposureId": "x",
@@ -592,7 +609,7 @@ mod tests {
             405
         );
         assert_eq!(post(&store, &rates, "/wh/", b"{}").status, 404);
-        assert_eq!(store.inbox_list(None, 10).unwrap().1, 2);
+        assert_eq!(store.inbox_list("u1", None, 10).unwrap().1, 2);
     }
 
     #[test]

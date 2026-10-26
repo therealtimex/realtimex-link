@@ -483,7 +483,7 @@ async fn inbox_ack(State(state): State<Shared>, Body64(body): Body64) -> Answer 
         .filter_map(|id| id.as_str().map(str::to_string))
         .take(1000)
         .collect();
-    let acked = state.host.store.inbox_ack(&ids)?;
+    let acked = crate::webhooks::ack(&state.host.store, &ids)?;
     Ok(Json(json!({ "acked": acked })))
 }
 

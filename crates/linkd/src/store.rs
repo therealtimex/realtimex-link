@@ -69,6 +69,7 @@ impl Store {
             db.execute_batch(
                 "CREATE TABLE IF NOT EXISTS inbox (
                     id TEXT PRIMARY KEY,
+                    account TEXT NOT NULL,
                     endpoint TEXT NOT NULL,
                     received_at INTEGER NOT NULL,
                     method TEXT NOT NULL,
@@ -77,7 +78,7 @@ impl Store {
                     body BLOB NOT NULL,
                     size INTEGER NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS inbox_endpoint ON inbox (endpoint, received_at);
+                 CREATE INDEX IF NOT EXISTS inbox_endpoint ON inbox (account, endpoint, received_at);
                  CREATE INDEX IF NOT EXISTS inbox_received ON inbox (received_at);",
             )?;
         }
@@ -151,6 +152,9 @@ impl Store {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delivery {
     pub id: String,
+    /// The account whose RealTimeX it is for (its Keycloak subject): only that account reads or
+    /// acknowledges it (realtimex-ai-app#2836, an account switch must not hand it over).
+    pub account: String,
     /// The endpoint's URL token.
     pub endpoint: String,
     /// Milliseconds since the epoch.
@@ -181,8 +185,8 @@ impl Store {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (count, bytes): (i64, i64) = tx.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM inbox WHERE endpoint = ?1",
-            [&delivery.endpoint],
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM inbox WHERE account = ?1 AND endpoint = ?2",
+            [&delivery.account, &delivery.endpoint],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let size = delivery.body.len() as u64;
@@ -193,10 +197,11 @@ impl Store {
             }));
         }
         tx.execute(
-            "INSERT INTO inbox (id, endpoint, received_at, method, path, headers, body, size) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO inbox (id, account, endpoint, received_at, method, path, headers, body, size) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 delivery.id,
+                delivery.account,
                 delivery.endpoint,
                 delivery.received_at,
                 delivery.method,
@@ -210,15 +215,20 @@ impl Store {
         Ok(Ok(()))
     }
 
-    /// Up to `limit` deliveries, oldest first, after `after` (a delivery's id, from an earlier
-    /// page), and how many are kept in all.
-    pub fn inbox_list(&self, after: Option<&str>, limit: usize) -> Result<(Vec<Delivery>, u64)> {
+    /// Up to `limit` of `account`'s deliveries, oldest first, after `after` (a delivery's id,
+    /// from an earlier page), and how many it has kept in all.
+    pub fn inbox_list(
+        &self,
+        account: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Delivery>, u64)> {
         let db = self.db();
         let start: Option<(i64, String)> = match after {
             Some(id) => db
                 .query_row(
-                    "SELECT received_at, id FROM inbox WHERE id = ?1",
-                    [id],
+                    "SELECT received_at, id FROM inbox WHERE id = ?1 AND account = ?2",
+                    [id, account],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?,
@@ -227,13 +237,14 @@ impl Store {
         let (at, id) = start.unwrap_or((i64::MIN, String::new()));
         let mut statement = db.prepare(
             "SELECT id, endpoint, received_at, method, path, headers, body FROM inbox \
-             WHERE received_at > ?1 OR (received_at = ?1 AND id > ?2) \
+             WHERE account = ?4 AND (received_at > ?1 OR (received_at = ?1 AND id > ?2)) \
              ORDER BY received_at, id LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![at, id, limit as i64], |row| {
+        let rows = statement.query_map(params![at, id, limit as i64, account], |row| {
             let headers: String = row.get(5)?;
             Ok(Delivery {
                 id: row.get(0)?,
+                account: account.to_string(),
                 endpoint: row.get(1)?,
                 received_at: row.get(2)?,
                 method: row.get(3)?,
@@ -243,27 +254,35 @@ impl Store {
             })
         })?;
         let deliveries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let total: i64 = db.query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))?;
+        let total: i64 = db.query_row(
+            "SELECT COUNT(*) FROM inbox WHERE account = ?1",
+            [account],
+            |row| row.get(0),
+        )?;
         Ok((deliveries, total as u64))
     }
 
-    /// How many deliveries each endpoint holds: { token: count }.
-    pub fn inbox_counts(&self) -> Result<std::collections::HashMap<String, u64>> {
+    /// How many deliveries each of `account`'s endpoints holds: { token: count }.
+    pub fn inbox_counts(&self, account: &str) -> Result<std::collections::HashMap<String, u64>> {
         let db = self.db();
-        let mut statement = db.prepare("SELECT endpoint, COUNT(*) FROM inbox GROUP BY endpoint")?;
-        let rows = statement.query_map([], |row| {
+        let mut statement = db
+            .prepare("SELECT endpoint, COUNT(*) FROM inbox WHERE account = ?1 GROUP BY endpoint")?;
+        let rows = statement.query_map([account], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// RealTimeX has these: they go. Answers how many went.
-    pub fn inbox_ack(&self, ids: &[String]) -> Result<usize> {
+    /// `account`'s RealTimeX has these: they go (only its own). Answers how many went.
+    pub fn inbox_ack(&self, account: &str, ids: &[String]) -> Result<usize> {
         let mut db = self.db();
         let tx = db.transaction()?;
         let mut removed = 0;
         for id in ids {
-            removed += tx.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
+            removed += tx.execute(
+                "DELETE FROM inbox WHERE id = ?1 AND account = ?2",
+                [id, account],
+            )?;
         }
         tx.commit()?;
         Ok(removed)
@@ -339,6 +358,7 @@ mod tests {
     fn delivery(id: &str, endpoint: &str, at: i64, body: &[u8]) -> Delivery {
         Delivery {
             id: id.into(),
+            account: "a1".into(),
             endpoint: endpoint.into(),
             received_at: at,
             method: "POST".into(),
@@ -365,7 +385,7 @@ mod tests {
             store.get("settings"),
             Some(json!({ "allowIncoming": true }))
         );
-        assert_eq!(store.inbox_list(None, 10).unwrap().1, 0);
+        assert_eq!(store.inbox_list("a1", None, 10).unwrap().1, 0);
     }
 
     #[test]
@@ -385,14 +405,14 @@ mod tests {
             .unwrap()
             .unwrap();
         // Oldest first, a page at a time.
-        let (page, total) = store.inbox_list(None, 2).unwrap();
+        let (page, total) = store.inbox_list("a1", None, 2).unwrap();
         assert_eq!(total, 4);
         assert_eq!(
             page.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
             ["d1", "d2"]
         );
         assert_eq!(page[0], delivery("d1", "tok", 100, b"{}"));
-        let (page, _) = store.inbox_list(Some("d2"), 10).unwrap();
+        let (page, _) = store.inbox_list("a1", Some("d2"), 10).unwrap();
         assert_eq!(
             page.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
             ["e1", "d3"]
@@ -410,10 +430,18 @@ mod tests {
                 .unwrap(),
             Err(InboxRefusal::Full { bytes: 6, .. })
         ));
-        assert_eq!(store.inbox_counts().unwrap()["tok"], 3);
-        assert_eq!(store.inbox_ack(&["d1".into(), "nope".into()]).unwrap(), 1);
+        assert_eq!(store.inbox_counts("a1").unwrap()["tok"], 3);
+        // Another account sees and acknowledges none of them.
+        assert_eq!(store.inbox_list("a2", None, 10).unwrap().1, 0);
+        assert_eq!(store.inbox_ack("a2", &["d1".into()]).unwrap(), 0);
+        assert_eq!(
+            store
+                .inbox_ack("a1", &["d1".into(), "nope".into()])
+                .unwrap(),
+            1
+        );
         assert_eq!(store.inbox_prune(150).unwrap(), 1);
-        let (left, total) = store.inbox_list(None, 10).unwrap();
+        let (left, total) = store.inbox_list("a1", None, 10).unwrap();
         assert_eq!(total, 2);
         assert_eq!(
             left.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),

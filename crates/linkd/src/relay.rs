@@ -59,6 +59,26 @@ pub mod keys {
     /// { from, at, seen }: RealTimeX switched accounts and the previous account's exposure was
     /// dropped, for the window's one-time "links of the previous account are offline".
     pub const SWITCHED: &str = "relay-switched";
+    /// { subject }: the account the current exposure belongs to (enrolled or adopted with its
+    /// token). A handover of another account never reuses it, signed in or not in between.
+    pub const SUBJECT: &str = "relay-account";
+}
+
+/// The account the current exposure belongs to (its Keycloak subject).
+pub fn exposure_subject(store: &crate::store::Store) -> Option<String> {
+    store
+        .get(keys::SUBJECT)?
+        .get("subject")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn account_subject(store: &crate::store::Store) -> Option<String> {
+    store
+        .get(crate::identity::keys::ACCOUNT)?
+        .get("subject")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Every surface Link carries: published artifacts, the embed widget, webhooks, the mobile app
@@ -306,15 +326,13 @@ impl Relay {
             .host
             .upgrade()
             .ok_or_else(|| anyhow!("RealTimeX Link is stopping"))?;
-        let subject = |account: Option<Value>| {
-            account.and_then(|a| a.get("subject").and_then(Value::as_str).map(str::to_string))
-        };
-        let before = subject(host.store.get(crate::identity::keys::ACCOUNT));
-        let after = subject(crate::identity::account_of(token));
-        if after.is_none() {
-            bail!("token must be the account's access token");
-        }
-        if before.is_some() && before != after {
+        let after = crate::identity::account_of(token)
+            .and_then(|a| a.get("subject").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| anyhow!("token must be the account's access token"))?;
+        // The exposure's own account decides, not whoever is signed in now: RealTimeX may have
+        // signed out in between (and Link restarted), and a missing sign-in says nothing.
+        if self.exposure_id().is_some() && self.owner_of_exposure(&host).as_deref() != Some(&after)
+        {
             self.drop_exposure(&host)?;
         }
         if let Some(base) = api_base.and_then(allowed_api_base) {
@@ -323,10 +341,34 @@ impl Relay {
         host.signin.replace_with_handover(token).await
     }
 
+    /// The account the stored exposure belongs to. One enrolled before this was recorded is the
+    /// signed-in account's, if there is one (it was enrolled with it); otherwise unknown.
+    fn owner_of_exposure(&self, host: &Host) -> Option<String> {
+        exposure_subject(&host.store).or_else(|| account_subject(&host.store))
+    }
+
+    /// Everything kept for the current account's RealTimeX: what it shares (artifacts, webhook
+    /// endpoints, the Shared list) and where it runs (the origin). Its queued webhook deliveries
+    /// stay, readable by that account only (store.rs `inbox`).
+    fn forget_shared_state(&self, host: &Host) -> Result<()> {
+        for key in [
+            crate::artifacts::KEY,
+            crate::webhooks::KEY,
+            crate::shared::KEY,
+        ] {
+            host.store.remove(key)?;
+        }
+        self.origin.clear();
+        Ok(())
+    }
+
     /// Forget the current exposure (another account's now): its credential, its install ID and
-    /// the adoption; nothing is retired, since that needs its own account's token.
+    /// the adoption, and what was shared on it; nothing is retired, since that needs its own
+    /// account's token.
     fn drop_exposure(&self, host: &Host) -> Result<()> {
+        self.forget_shared_state(host)?;
         let Some(previous) = self.exposure_id() else {
+            host.store.remove(keys::SUBJECT)?;
             return Ok(());
         };
         let mut former = strings(host.store.get(keys::FORMER_IDS).as_ref());
@@ -348,6 +390,7 @@ impl Relay {
             keys::CREDENTIAL,
             keys::ADOPTED,
             keys::INSTALL_ID,
+            keys::SUBJECT,
         ] {
             host.store.remove(key)?;
         }
@@ -591,6 +634,19 @@ impl Relay {
                 drop(host);
                 self.changed.notified().await;
                 continue;
+            }
+            // Never connect another account's exposure (one recorded before #6 is the signed-in
+            // account's).
+            if let (Some(owner), Some(signed_in)) =
+                (self.owner_of_exposure(&host), account_subject(&host.store))
+            {
+                if owner != signed_in && self.exposure_id().is_some() {
+                    if let Err(error) = self.drop_exposure(&host) {
+                        (host.log)(&format!(
+                            "[relay] dropping another account's exposure: {error:#}"
+                        ));
+                    }
+                }
             }
             let refused = lock(&self.status).needs_enrollment;
             let enrolled = self.connection(&host);
@@ -1021,6 +1077,12 @@ impl Relay {
                 ))
             }
         };
+        // An exposure of another account (RealTimeX signed out and in as someone else) is never
+        // reused: it and what was shared on it go first.
+        if self.exposure_id().is_some() && self.owner_of_exposure(&host).as_deref() != Some(account)
+        {
+            self.drop_exposure(&host).map_err(ApiError::from)?;
+        }
         // Adopting again is the same answer (pending until every surface is enrolled).
         if let Some(adopted) = self.adopted_id() {
             if exposure_id.is_none_or(|id| id == adopted) {
@@ -1065,6 +1127,14 @@ impl Relay {
             .to_string();
         let exposure_id = resolved.as_str();
         let own_exposure = self.exposure_id().filter(|id| id != exposure_id);
+        // Another exposure replaces the adopted one (RealTimeX's own account-switch path): what
+        // RealTimeX shared on the previous one is pushed again for the new one.
+        if self
+            .adopted_id()
+            .is_some_and(|adopted| adopted != exposure_id)
+        {
+            self.forget_shared_state(&host).map_err(ApiError::from)?;
+        }
         let credential = recovered
             .pointer("/connector/credential")
             .and_then(Value::as_str)
@@ -1087,6 +1157,7 @@ impl Relay {
             (keys::EXPOSURE, exposure),
             (keys::INSTALL_ID, json!(install_id)),
             (keys::FORMER_IDS, json!(former)),
+            (keys::SUBJECT, json!({ "subject": account })),
             (
                 keys::ADOPTED,
                 json!({
@@ -1212,6 +1283,10 @@ impl Relay {
     fn save(&self, host: &Host, answer: &Value) -> Result<()> {
         let (exposure, sealed) = self.stored(host, answer)?;
         let mut values = vec![(keys::EXPOSURE, exposure)];
+        // Enrolled with the signed-in account's token: the exposure is that account's.
+        if let Some(subject) = account_subject(&host.store) {
+            values.push((keys::SUBJECT, json!({ "subject": subject })));
+        }
         if let Some(sealed) = sealed {
             values.push((keys::CREDENTIAL, sealed));
         }
@@ -3305,6 +3380,148 @@ mod tests {
         assert_eq!(other.code.as_deref(), Some("adopted-other"));
         let stranger = relay.adopt(None, "rtx-install", "u9").await.unwrap_err();
         assert_eq!(stranger.code.as_deref(), Some("signed-out"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_switch_keeps_the_previous_accounts_data_from_the_new_one() {
+        let (base, _seen) = marketplace(|_, _, _, _, _| (404, json!({}))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let store = &host.store;
+        // Account u1's RealTimeX shared an artifact, a webhook and its origin; a delivery with
+        // its secrets waits.
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(site.path().join("index.html"), "u1 private page").unwrap();
+        let artifacts = crate::artifacts::parse(&json!({ "items": [{
+            "id": "u1-artifact", "dir": site.path().to_str(), "entry": "index.html", "status": "published",
+        }] }))
+        .unwrap();
+        crate::artifacts::set(store, &artifacts).unwrap();
+        crate::webhooks::set(
+            store,
+            &crate::webhooks::parse(&json!({ "items": [{ "tokens": ["u1-hook"] }] })).unwrap(),
+        )
+        .unwrap();
+        relay.origin.set(Origin {
+            targets: std::collections::BTreeMap::from([("h".into(), 3001)]),
+            token: None,
+        });
+        let rates = crate::webhooks::Rates::default();
+        let secret = vec![("authorization".to_string(), "Bearer u1-secret".to_string())];
+        let kept =
+            crate::webhooks::receive(store, &rates, "POST", "/wh/u1-hook", &secret, b"u1 body");
+        assert_eq!(kept.status, 202);
+        let page =
+            |store: &crate::store::Store| crate::webhooks::inbox_page(store, None, 10).unwrap();
+        let first_id = page(store)["items"][0]["id"].as_str().unwrap().to_string();
+        let serve = || crate::artifacts::artifact(store, "GET", "/ar/u1-artifact", &[]).status;
+        // The same account again (a RealTimeX restart): all of it stays.
+        relay.take_handover(&token("u1"), None).await.unwrap();
+        assert_eq!(serve(), 200);
+        assert!(relay.origin.registered());
+        assert_eq!(page(store)["total"], 1);
+        // Account u2: none of u1's state reaches it.
+        relay.take_handover(&token("u2"), None).await.unwrap();
+        assert_eq!(serve(), 404);
+        assert!(!relay.origin.registered());
+        assert_eq!(
+            crate::webhooks::receive(store, &rates, "POST", "/wh/u1-hook", &[], b"x").status,
+            404
+        );
+        assert!(store.get(crate::shared::KEY).is_none());
+        assert_eq!(page(store)["total"], 0);
+        assert_eq!(crate::webhooks::ack(store, &[first_id.clone()]).unwrap(), 0);
+        // u1's delivery is still kept, for u1 only.
+        let (for_u1, total) = store.inbox_list("u1", None, 10).unwrap();
+        assert_eq!((total, for_u1[0].id.as_str()), (1, first_id.as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_switch_across_a_sign_out_never_reuses_the_exposure() {
+        let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = creates.clone();
+        let (base, _seen) = marketplace(move |method, path, _, body, _| {
+            match (method, path, body["connectorCredential"].as_str()) {
+                ("POST", "/v1/relay-exposures", None) => {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let id = ["exposureOfU1", "exposureOfU2", "exposureOfU3"][n.min(2)];
+                    (200, view(id, &SURFACES, &format!("credential-{id}")))
+                }
+                ("POST", "/v1/relay-exposures", Some(credential)) => {
+                    let id = credential.trim_start_matches("credential-").to_string();
+                    (200, view(&id, &SURFACES, credential))
+                }
+                _ => (404, json!({ "message": "unexpected" })),
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        assert_eq!(
+            relay.adopt(None, "rtx-install", "u1").await.unwrap()["appId"],
+            "exposureOfU1"
+        );
+        // RealTimeX signs out, then in as u2: u1's exposure isn't reused.
+        host.signin.sign_out_for_realtimex().await.unwrap();
+        relay.take_handover(&token("u2"), None).await.unwrap();
+        assert_eq!(relay.exposure_id(), None);
+        assert!(host.store.get(keys::CREDENTIAL).is_none());
+        assert_eq!(
+            relay.adopt(None, "rtx-install", "u2").await.unwrap()["appId"],
+            "exposureOfU2"
+        );
+        assert_eq!(exposure_subject(&host.store).as_deref(), Some("u2"));
+        // Even adopt itself never reuses another account's exposure.
+        host.signin.sign_out_for_realtimex().await.unwrap();
+        host.store
+            .set(crate::identity::keys::ACCOUNT, &json!({ "subject": "u3" }))
+            .unwrap();
+        relay.set_account(&token("u3")).unwrap();
+        let _ = relay.adopt(None, "rtx-install", "u3").await;
+        assert_ne!(relay.exposure_id().as_deref(), Some("exposureOfU2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_same_account_after_a_sign_out_and_a_restart_resumes_its_exposure() {
+        let (base, _seen) = marketplace(|method, path, _, body, _| match (method, path) {
+            ("POST", "/v1/relay-exposures") if body["connectorCredential"].is_null() => {
+                (200, view("exposureOfU1", &SURFACES, "credential-u1"))
+            }
+            ("POST", "/v1/relay-exposures") => {
+                (200, view("exposureOfU1", &SURFACES, "credential-u1"))
+            }
+            _ => (404, json!({ "message": "unexpected" })),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let host = signed_in_host(dir.path(), &base);
+            host.relay.adopt(None, "rtx-install", "u1").await.unwrap();
+            host.signin.sign_out_for_realtimex().await.unwrap();
+        }
+        // Link restarts while signed out, then u1's RealTimeX hands over again.
+        let host = Host::new(
+            Arc::new(crate::store::Store::open(dir.path()).unwrap()),
+            crate::secret_box::SecretBox::new(dir.path()),
+            crate::backend::Backend::with_detected(crate::backend::Detected {
+                binary: None,
+                reason: Some("test".into()),
+                code: None,
+            }),
+            0,
+            Arc::new(|_: &str| {}),
+        );
+        host.load_identity().unwrap();
+        *lock(&host.relay.api_base) = Some(base.clone());
+        host.relay.take_handover(&token("u1"), None).await.unwrap();
+        assert_eq!(host.relay.exposure_id().as_deref(), Some("exposureOfU1"));
+        assert!(host.store.get(keys::CREDENTIAL).is_some());
+        assert_eq!(
+            host.relay.adopt(None, "rtx-install", "u1").await.unwrap()["appId"],
+            "exposureOfU1"
+        );
     }
 
     #[test]
