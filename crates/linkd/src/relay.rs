@@ -2405,7 +2405,7 @@ mod tests {
             .request(&open("d", "x.realtimex.ai", "/remote-control/hello"), false)
             .is_ok());
         assert!(connection.carries(&["d"]));
-        let new = super::connection();
+        let new = connection();
         assert!(new.carries(&["a", "h", "p", "d"]));
     }
 
