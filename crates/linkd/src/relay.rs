@@ -1289,6 +1289,7 @@ impl Relay {
     }
 
     /// Every surface on the adopted exposure, with its app ID (an update without it clears it).
+    #[allow(clippy::too_many_arguments)]
     async fn enroll_adopted(
         &self,
         host: &Host,
