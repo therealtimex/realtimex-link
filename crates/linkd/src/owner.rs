@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::error::ApiError;
 use crate::store::Store;
@@ -139,14 +139,6 @@ pub fn realtimex_installed() -> bool {
         vec!["/opt/RealTimeX.AI/RealTimeX.AI".into()]
     };
     candidates.iter().any(|path| path.exists())
-}
-
-/// For GET /v1/account: { managedByRealtimex, ownerInstallId }.
-pub fn view(store: &Store) -> Value {
-    match get(store) {
-        Some(owner) => json!({ "managedByRealtimex": true, "ownerInstallId": owner.install_id }),
-        None => json!({ "managedByRealtimex": false }),
-    }
 }
 
 #[cfg(test)]

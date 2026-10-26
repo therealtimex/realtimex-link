@@ -510,18 +510,6 @@ impl SignIn {
         Ok(())
     }
 
-    /// The account RealTimeX handed over without signing Link in: { subject, email }.
-    pub fn offered_account(&self) -> Option<Value> {
-        let token = lock(&self.offered)
-            .as_ref()
-            .map(|(token, _)| token.clone())?;
-        crate::identity::account_of(&token)
-    }
-
-    pub fn offered_email(&self) -> Option<String> {
-        lock(&self.offered).as_ref().map(|(_, email)| email.clone())
-    }
-
     /// "Continue as …" / "Use <RealTimeX's account>": take RealTimeX's last handover after all,
     /// signing Link out of its own account first when it has one.
     pub async fn use_handover(&self) -> Result<()> {
