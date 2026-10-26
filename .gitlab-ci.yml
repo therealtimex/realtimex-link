@@ -15,8 +15,12 @@
 #   runner (Azure Trusted Signing; the signed archive and the installer, ci/sign-win.ps1).
 # - publish (vX.Y.Z tags): once every other file on the draft is checked against what the build run
 #   recorded, the signed files replace or join the draft's assets, SHA256SUMS is rewritten and the
-#   draft is published, as Link's latest only if no newer release is out (ci/release.py). A
-#   published release is never changed.
+#   draft is published as a pre-release, never as Link's latest (ci/release.py): installed Links
+#   update from releases/latest, which skips pre-releases, so RealTimeX can pin and test it first.
+#   A published release's files are never changed.
+# - promote (the Human's go): the vX.Y.Z tag pipeline's manual promote job makes the pre-release a
+#   release, Link's latest only if no newer release is out. For a version whose tag pipeline had
+#   no promote job (v0.2.0), Run pipeline on main with LINK_PROMOTE_VERSION=X.Y.Z.
 # - Sign again without building (a signing fix): Run pipeline on main with LINK_SIGN_VERSION=X.Y.Z
 #   signs and publishes that existing draft release with this commit's ci/ scripts; the .dmg and
 #   installer scripts still come from the tag's tree. The same checks hold, against GitLab's own
@@ -51,8 +55,12 @@ workflow:
     - if: '$LINK_SIGN_VERSION =~ /^v?[0-9]+\.[0-9]+\.[0-9]+$/ && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
       variables:
         RELEASE_VERSION: $LINK_SIGN_VERSION
-    # A version tag that isn't protected, or LINK_SIGN_VERSION anywhere else: only release-refused.
-    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ || $LINK_SIGN_VERSION'
+    - if: '$LINK_PROMOTE_VERSION =~ /^v?[0-9]+\.[0-9]+\.[0-9]+$/ && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      variables:
+        PROMOTE_VERSION: $LINK_PROMOTE_VERSION
+    # A version tag that isn't protected, or LINK_SIGN_VERSION / LINK_PROMOTE_VERSION anywhere
+    # else: only release-refused.
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ || $LINK_SIGN_VERSION || $LINK_PROMOTE_VERSION'
       variables:
         LINK_RELEASE_REFUSED: "true"
     - if: '$CI_COMMIT_BRANCH'
@@ -64,14 +72,14 @@ release-refused:
   tags:
     - $LINK_CI_RUNNER_TAG
   script:
-    - echo "Releases are signed from protected refs only. A vX.Y.Z tag needs v* tags protected (Settings → Repository → Protected tags), then delete and push the tag again; LINK_SIGN_VERSION runs on the protected default branch only. This pipeline (${CI_COMMIT_REF_NAME}, protected=${CI_COMMIT_REF_PROTECTED}) signs nothing."
+    - echo "Releases are signed from protected refs only. A vX.Y.Z tag needs v* tags protected (Settings → Repository → Protected tags), then delete and push the tag again; LINK_SIGN_VERSION and LINK_PROMOTE_VERSION run on the protected default branch only. This pipeline (${CI_COMMIT_REF_NAME}, protected=${CI_COMMIT_REF_PROTECTED}) signs nothing."
     - exit 1
 
 build:
   stage: build
   rules:
-    # Signing an existing draft again builds nothing; a refused release builds nothing either.
-    - if: '$LINK_SIGN_VERSION || $LINK_RELEASE_REFUSED == "true"'
+    # Signing an existing draft again or promoting builds nothing; a refused release neither.
+    - if: '$LINK_SIGN_VERSION || $PROMOTE_VERSION || $LINK_RELEASE_REFUSED == "true"'
       when: never
     - when: on_success
   # A newer push to the same branch cancels this one (Settings → CI/CD → Auto-cancel redundant
@@ -164,3 +172,21 @@ publish:
     - $LINK_CI_RUNNER_TAG
   script:
     - python3 -u ci/release.py publish "$RELEASE_VERSION" link-signed
+
+# The Human's go: the published pre-release becomes a release (ci/release.py promote). Manual on a
+# vX.Y.Z tag pipeline, after publish; on main with LINK_PROMOTE_VERSION for an earlier version.
+promote:
+  stage: publish
+  rules:
+    - if: '$PROMOTE_VERSION'
+      variables:
+        RELEASE_VERSION: $PROMOTE_VERSION
+    - if: '$CI_COMMIT_TAG && $RELEASE_VERSION'
+      when: manual
+  needs:
+    - job: publish
+      optional: true
+  tags:
+    - $LINK_CI_RUNNER_TAG
+  script:
+    - python3 -u ci/release.py promote "$RELEASE_VERSION"

@@ -123,5 +123,39 @@ class DraftAssets(unittest.TestCase):
         self.assertEqual([a["name"] for a in unchecked], ["linux.deb"])
 
 
+def released(tag, draft=False, prerelease=False, sums=True):
+    assets = [{"name": "SHA256SUMS"}] if sums else []
+    return {"tag_name": tag, "draft": draft, "prerelease": prerelease, "assets": assets, "id": tag}
+
+
+class PreRelease(unittest.TestCase):
+    def test_publish_is_always_a_pre_release_never_latest(self):
+        payload = release.publish_payload("0.2.1")
+        self.assertIs(payload["prerelease"], True)
+        self.assertEqual(payload["make_latest"], "false")
+        self.assertIs(payload["draft"], False)
+
+    def test_promote_makes_the_newest_latest(self):
+        releases = [released("v0.1.11"), released("v0.2.0", prerelease=True), released("v0.2.1", prerelease=True)]
+        item, payload = release.promote_payload("0.2.1", releases)
+        self.assertEqual(item["tag_name"], "v0.2.1")
+        self.assertEqual(payload, {"prerelease": False, "make_latest": "true"})
+
+    def test_promoting_an_older_version_never_moves_latest_back(self):
+        releases = [released("v0.1.11"), released("v0.2.0", prerelease=True), released("v0.2.1")]
+        _, payload = release.promote_payload("0.2.0", releases)
+        self.assertEqual(payload, {"prerelease": False, "make_latest": "false"})
+
+    def test_promote_refuses_a_draft_a_missing_release_or_no_sums(self):
+        for releases in (
+            [released("v0.2.1", draft=True)],
+            [released("v0.2.0")],
+            [released("v0.2.1", prerelease=True, sums=False)],
+            [released("v0.2.1", prerelease=True), released("v0.2.1", prerelease=True)],
+        ):
+            with self.assertRaises(SystemExit):
+                release.promote_payload("0.2.1", releases)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,8 +8,8 @@
 # script comes from there, not from this checkout, which is main's when signing again).
 # Environment (CI variables, the ones RealTimeX's electron-builder signs with): CSC_NAME (the
 # Developer ID Application identity in the runner's keychain), KEYCHAIN and KEYCHAIN_PASSWORD
-# (optional: unlocked when set, and locked again at the end), APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD,
-# APPLE_TEAM_ID (every signature must carry this Team ID).
+# (optional: unlocked when set, and locked again at the end; a failed unlock is only a warning),
+# APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID (every signature must carry this Team ID).
 set -euo pipefail
 VERSION="$1"
 ARCH="$2"
@@ -44,11 +44,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A failed unlock is not fatal: the runner's Aqua session may have the keychain unlocked already
+# (KEYCHAIN_PASSWORD fits one runner, not every one), so codesign decides. UNLOCKED is set only
+# when this script's unlock worked, so cleanup never locks a keychain the session had unlocked.
 KEYCHAIN_ARGS=()
-if [ -n "${KEYCHAIN:-}" ] && security show-keychain-info "$KEYCHAIN" >/dev/null 2>&1; then
-  security unlock-keychain -p "${KEYCHAIN_PASSWORD:-}" "$KEYCHAIN"
-  UNLOCKED="$KEYCHAIN"
-  KEYCHAIN_ARGS=(--keychain "$KEYCHAIN")
+if [ -n "${KEYCHAIN:-}" ]; then
+  if info="$(security show-keychain-info "$KEYCHAIN" 2>&1)"; then
+    echo "Keychain $KEYCHAIN: $info"
+    KEYCHAIN_ARGS=(--keychain "$KEYCHAIN")
+    if security unlock-keychain -p "${KEYCHAIN_PASSWORD:-}" "$KEYCHAIN"; then
+      UNLOCKED="$KEYCHAIN"
+    else
+      echo "WARNING: couldn't unlock $KEYCHAIN; going on, codesign decides" >&2
+    fi
+  else
+    echo "Keychain $KEYCHAIN not usable: $info" >&2
+  fi
 fi
 echo "Developer ID identities on this runner: $(security find-identity -v -p codesigning | grep -c 'Developer ID Application' || true)"
 mkdir -p "$OUT"
