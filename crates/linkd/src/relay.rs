@@ -328,7 +328,11 @@ impl Relay {
     /// A token arrived (a sign-in, RealTimeX's handover): an exposure waiting for one to enroll
     /// the rest of its surfaces leaves its connection and enrolls them now.
     pub fn account_arrived(&self) {
-        if lock(&self.status).awaiting_account {
+        let incomplete = self.host.upgrade().is_some_and(|host| {
+            self.connection(&host)
+                .is_some_and(|connection| !connection.carries(&self.wanted_surfaces()))
+        });
+        if incomplete && lock(&self.status).awaiting_account {
             self.restart.store(true, Ordering::SeqCst);
         }
         self.wake();
@@ -485,7 +489,11 @@ impl Relay {
         ] {
             host.store.remove(key)?;
         }
-        lock(&self.status).needs_enrollment = false;
+        {
+            let mut status = lock(&self.status);
+            status.needs_enrollment = false;
+            status.awaiting_account = false;
+        }
         (host.log)(&format!(
             "[relay] RealTimeX switched accounts: dropped exposure {previous}"
         ));
@@ -1102,7 +1110,10 @@ impl Relay {
         };
         match self.enroll(&host, &account).await {
             Ok(()) => {
-                lock(&self.status).needs_enrollment = false;
+                let mut status = lock(&self.status);
+                status.needs_enrollment = false;
+                status.awaiting_account = false;
+                drop(status);
                 Some(self.complete())
             }
             Err(error) => {
@@ -1294,7 +1305,11 @@ impl Relay {
             host.store.transaction(&values, &[])
         })
         .map_err(|error| ApiError::coded(409, "signed-out", format!("{error:#}")))?;
-        lock(&self.status).needs_enrollment = false;
+        {
+            let mut status = lock(&self.status);
+            status.needs_enrollment = false;
+            status.awaiting_account = false;
+        }
         self.set_status("connecting", None);
         (host.log)(&format!(
             "[relay] adopted RealTimeX's exposure {exposure_id} (was {previous})"
