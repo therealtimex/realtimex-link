@@ -1638,7 +1638,7 @@ impl Relay {
             return Ok(Handled::Go);
         }
         // Finished streams answered END themselves; drop their entries now and then.
-        streams.retain(|_, stream| !stream.task.is_finished());
+        streams.retain(|_, stream| !stream.task.is_finished() || stream.discarding);
         match frame.kind {
             frame::OPEN | frame::WS_OPEN => {
                 let websocket = frame.kind == frame::WS_OPEN;
@@ -1665,14 +1665,24 @@ impl Relay {
                 } else {
                     stream.message(frame.payload, frame.flags).await
                 };
-                if let Err(reason) = outcome {
-                    if let Some(stream) = streams.remove(&frame.stream) {
-                        stream.task.abort();
+                match outcome {
+                    // A body without a length that runs over: 413, as when the length says so.
+                    Err(TOO_LARGE) if frame.kind == frame::DATA => {
+                        stream.refuse_as_too_large(frame.stream, &send)
                     }
-                    send.refuse(frame.stream, reason);
+                    Err(reason) => {
+                        if let Some(stream) = streams.remove(&frame.stream) {
+                            stream.task.abort();
+                        }
+                        send.refuse(frame.stream, reason);
+                    }
+                    Ok(()) => {}
                 }
             }
             frame::END => match streams.get_mut(&frame.stream) {
+                Some(stream) if stream.discarding => {
+                    streams.remove(&frame.stream);
+                }
                 Some(stream) => stream.input = None,
                 None => send.refuse(frame.stream, "unknown stream"),
             },
@@ -1730,21 +1740,13 @@ impl Relay {
                 parts: Vec::new(),
                 text: false,
                 task,
+                discarding: false,
             };
         }
         let (tx, rx) = mpsc::channel::<bytes::Bytes>(STREAM_QUEUE);
-        let too_large = request.length.is_some_and(|length| length > limit);
-        let task = if too_large {
-            tokio::spawn(async move {
-                origin::answer(
-                    id,
-                    &send,
-                    413,
-                    "application/json",
-                    json!({ "error": "Request body too large" }).to_string(),
-                )
-                .await;
-            })
+        let over = request.length.is_some_and(|length| length > limit);
+        let task = if over {
+            tokio::spawn(async move { too_large(id, &send).await })
         } else if request.surface == REMOTE_CONTROL {
             tokio::spawn(async move { in_process(id, request, rx, routes, send).await })
         } else if let Some(store) = self.served_here(&request) {
@@ -1762,12 +1764,13 @@ impl Relay {
             })
         };
         Stream {
-            input: Some(Input::Body(tx)),
+            input: (!over).then_some(Input::Body(tx)),
             received: 0,
             limit,
             parts: Vec::new(),
             text: false,
             task,
+            discarding: over,
         }
     }
 }
@@ -1780,6 +1783,20 @@ impl Relay {
         crate::artifacts::serves(&host.store, &request.surface, pathname)
             .then(|| host.store.clone())
     }
+}
+
+const TOO_LARGE: &str = "request body too large";
+
+/// A request body over its surface's limit (README: 413 beyond).
+async fn too_large(id: u32, send: &Sender) {
+    origin::answer(
+        id,
+        send,
+        413,
+        "application/json",
+        json!({ "error": "Request body too large" }).to_string(),
+    )
+    .await;
 }
 
 /// A published artifact (surface a) or one of the widget's assets (surface e), from disk.
@@ -2300,14 +2317,29 @@ struct Stream {
     parts: Vec<u8>,
     text: bool,
     task: JoinHandle<()>,
+    /// Answered 413: the rest of the body is read and dropped until the relay's END, so the
+    /// answer isn't turned into a reset (and the relay's 502).
+    discarding: bool,
 }
 
 impl Stream {
+    /// Over its limit: answer 413 instead of whatever was handling it, and drop the rest.
+    fn refuse_as_too_large(&mut self, id: u32, send: &Sender) {
+        self.task.abort();
+        self.input = None;
+        self.discarding = true;
+        let send = send.clone();
+        self.task = tokio::spawn(async move { too_large(id, &send).await });
+    }
+
     /// A DATA frame: the next part of the request body.
     async fn body(&mut self, chunk: bytes::Bytes) -> Result<(), &'static str> {
+        if self.discarding {
+            return Ok(());
+        }
         self.received += chunk.len() as u64;
         if self.received > self.limit {
-            return Err("request body too large");
+            return Err(TOO_LARGE);
         }
         let Some(Input::Body(tx)) = &self.input else {
             return Ok(());
@@ -2987,6 +3019,7 @@ mod tests {
             parts: Vec::new(),
             text: false,
             task: tokio::spawn(async {}),
+            discarding: false,
         };
         for frame in frames {
             stream.message(frame.payload, frame.flags).await.unwrap();
@@ -3007,10 +3040,37 @@ mod tests {
             parts: Vec::new(),
             text: false,
             task: tokio::spawn(async {}),
+            discarding: false,
         };
         assert!(stream.body(bytes::Bytes::from_static(b"abc")).await.is_ok());
-        assert!(stream.body(bytes::Bytes::from_static(b"de")).await.is_err());
+        assert_eq!(
+            stream.body(bytes::Bytes::from_static(b"de")).await,
+            Err(TOO_LARGE)
+        );
         assert_eq!(body_limit("m"), 50 * 1024 * 1024);
+        // It answers 413, then the rest of the body is dropped, not refused (a reset would
+        // reach the client as the relay's 502).
+        let (data, mut sent) = mpsc::channel(8);
+        let (control, mut urgent) = mpsc::unbounded_channel();
+        let send = Sender { data, control };
+        stream.refuse_as_too_large(7, &send);
+        assert!(stream.discarding && stream.input.is_none());
+        for _ in 0..3 {
+            assert!(stream.body(bytes::Bytes::from(vec![0u8; 64])).await.is_ok());
+        }
+        (&mut stream.task).await.unwrap();
+        let mut decoder = Decoder::default();
+        let mut frames = Vec::new();
+        while let Ok(Message::Binary(chunk)) = sent.try_recv() {
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        assert_eq!(frames[0].kind, frame::HEADERS);
+        assert_eq!(frames[0].stream, 7);
+        let head: Value = serde_json::from_slice(&frames[0].payload).unwrap();
+        assert_eq!(head["status"], 413);
+        assert_eq!(frames.last().unwrap().kind, frame::END);
+        assert!(frames.iter().all(|f| f.kind != frame::RESET));
+        assert!(urgent.try_recv().is_err());
     }
 
     #[test]
