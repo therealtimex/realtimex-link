@@ -160,7 +160,7 @@ kebab-case.
   there (no origin, or one that refuses), `/wh/<token>` deliveries are checked for token, enabled,
   size and rate, kept byte-exact for 7 days (per endpoint at most 1000 or 100 MiB) and answered
   with `ackStatus`; Meta's hub challenge and Pancake's handshake are answered and kept too.
-  `GET /v1/inbox?after=&limit=` → `{ items: [{ id, endpoint, receivedAt, method, path, headers,
+  `GET /v1/inbox?after=&limit=` (arrival order) → `{ items: [{ id, endpoint, receivedAt, method, path, headers,
   body (base64) }], total }`; `POST /v1/inbox/ack { exposureId, ids }` → `{ acked }`. Only the
   current account's deliveries are listed or acknowledged.
 - `PUT /v1/origin`, `/v1/shared`, `/v1/artifacts`, `/v1/webhooks` and `POST /v1/inbox/ack` name the

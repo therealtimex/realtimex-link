@@ -68,7 +68,8 @@ impl Store {
         if version < 2 {
             db.execute_batch(
                 "CREATE TABLE IF NOT EXISTS inbox (
-                    id TEXT PRIMARY KEY,
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
                     account TEXT NOT NULL,
                     endpoint TEXT NOT NULL,
                     received_at INTEGER NOT NULL,
@@ -224,35 +225,36 @@ impl Store {
         limit: usize,
     ) -> Result<(Vec<Delivery>, u64)> {
         let db = self.db();
-        let start: Option<(i64, String)> = match after {
+        // Arrival order (seq), not received_at: deliveries in the same millisecond keep the
+        // order they came in, and a page after one of them starts right behind it.
+        let start: Option<i64> = match after {
             Some(id) => db
                 .query_row(
-                    "SELECT received_at, id FROM inbox WHERE id = ?1 AND account = ?2",
+                    "SELECT seq FROM inbox WHERE id = ?1 AND account = ?2",
                     [id, account],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| row.get(0),
                 )
                 .optional()?,
             None => None,
         };
-        let (at, id) = start.unwrap_or((i64::MIN, String::new()));
         let mut statement = db.prepare(
             "SELECT id, endpoint, received_at, method, path, headers, body FROM inbox \
-             WHERE account = ?4 AND (received_at > ?1 OR (received_at = ?1 AND id > ?2)) \
-             ORDER BY received_at, id LIMIT ?3",
+             WHERE account = ?3 AND seq > ?1 ORDER BY seq LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![at, id, limit as i64, account], |row| {
-            let headers: String = row.get(5)?;
-            Ok(Delivery {
-                id: row.get(0)?,
-                account: account.to_string(),
-                endpoint: row.get(1)?,
-                received_at: row.get(2)?,
-                method: row.get(3)?,
-                path: row.get(4)?,
-                headers: serde_json::from_str(&headers).unwrap_or(Value::Array(Vec::new())),
-                body: row.get(6)?,
-            })
-        })?;
+        let rows =
+            statement.query_map(params![start.unwrap_or(0), limit as i64, account], |row| {
+                let headers: String = row.get(5)?;
+                Ok(Delivery {
+                    id: row.get(0)?,
+                    account: account.to_string(),
+                    endpoint: row.get(1)?,
+                    received_at: row.get(2)?,
+                    method: row.get(3)?,
+                    path: row.get(4)?,
+                    headers: serde_json::from_str(&headers).unwrap_or(Value::Array(Vec::new())),
+                    body: row.get(6)?,
+                })
+            })?;
         let deliveries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         let total: i64 = db.query_row(
             "SELECT COUNT(*) FROM inbox WHERE account = ?1",
@@ -404,7 +406,7 @@ mod tests {
             .inbox_add(&delivery("e1", "other", 150, b"x"), 10, 1000)
             .unwrap()
             .unwrap();
-        // Oldest first, a page at a time.
+        // In arrival order, a page at a time.
         let (page, total) = store.inbox_list("a1", None, 2).unwrap();
         assert_eq!(total, 4);
         assert_eq!(
@@ -415,7 +417,7 @@ mod tests {
         let (page, _) = store.inbox_list("a1", Some("d2"), 10).unwrap();
         assert_eq!(
             page.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
-            ["e1", "d3"]
+            ["d3", "e1"]
         );
         // The quota is per endpoint, by count and by bytes.
         assert!(matches!(
@@ -445,7 +447,38 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(
             left.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
-            ["e1", "d3"]
+            ["d3", "e1"]
+        );
+    }
+
+    #[test]
+    fn deliveries_in_the_same_millisecond_keep_their_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // Ids sort the other way round from arrival, as random ids may.
+        for id in ["z", "m", "a"] {
+            store
+                .inbox_add(&delivery(id, "tok", 100, b"{}"), 10, 1000)
+                .unwrap()
+                .unwrap();
+        }
+        let ids = |page: Vec<Delivery>| page.into_iter().map(|d| d.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store.inbox_list("a1", None, 10).unwrap().0),
+            ["z", "m", "a"]
+        );
+        assert_eq!(ids(store.inbox_list("a1", None, 1).unwrap().0), ["z"]);
+        assert_eq!(ids(store.inbox_list("a1", Some("z"), 1).unwrap().0), ["m"]);
+        assert_eq!(ids(store.inbox_list("a1", Some("m"), 10).unwrap().0), ["a"]);
+        // A later one still comes after them, even with an acknowledged one in between.
+        store.inbox_ack("a1", &["m".into()]).unwrap();
+        store
+            .inbox_add(&delivery("b", "tok", 100, b"{}"), 10, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ids(store.inbox_list("a1", Some("z"), 10).unwrap().0),
+            ["a", "b"]
         );
     }
 
