@@ -2,10 +2,13 @@
 m4-anydesk:
   tags: [usa-macmini-m4]
   script:
-    - whoami; sw_vers -productVersion; uptime
-    - echo "console user: $(stat -f %Su /dev/console)"
-    - ls /Library/LaunchDaemons /Library/LaunchAgents 2>/dev/null | grep -i anydesk || echo "no anydesk launchd plists"
-    - pgrep -lf -i anydesk || echo "anydesk not running"
-    - (sudo -n true 2>/dev/null && echo "sudo yes") || echo "sudo no"
-    - for s in $(ls /Library/LaunchDaemons 2>/dev/null | grep -i anydesk | sed 's/\.plist$//'); do echo "kickstart $s"; sudo -n launchctl kickstart -k "system/$s" && echo started || echo "kickstart failed"; done
-    - sleep 5; pgrep -lf -i anydesk || echo "anydesk still not running"
+    - |
+      whoami; sw_vers -productVersion; uptime
+      echo "console user = $(stat -f %Su /dev/console)"
+      ls /Library/LaunchDaemons /Library/LaunchAgents 2>/dev/null | grep -i anydesk || echo "no anydesk launchd plists"
+      pgrep -lf -i anydesk || echo "anydesk not running"
+      (sudo -n true 2>/dev/null && echo "sudo yes") || echo "sudo no"
+      for s in $(ls /Library/LaunchDaemons 2>/dev/null | grep -i anydesk | sed 's/\.plist$//'); do
+        echo "kickstart $s"; sudo -n launchctl kickstart -k "system/$s" && echo started || echo "kickstart failed"
+      done
+      sleep 5; pgrep -lf -i anydesk || echo "anydesk still not running"
