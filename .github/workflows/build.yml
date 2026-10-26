@@ -103,6 +103,8 @@ jobs:
       # theme) and the screen capture crate (its one-request-at-a-time gate, image helpers).
       - name: Test rtx-linkd, rtx-link and rtx-screens (Linux)
         if: matrix.name == 'linux-x86_64'
+        # A hung test fails the step in minutes instead of holding the runner.
+        timeout-minutes: 15
         run: cargo test --locked -p rtx-linkd -p rtx-link -p rtx-screens
       # Lints, once (Linux): warnings show in the log; errors fail the build.
       - name: Clippy (Linux)
@@ -112,6 +114,7 @@ jobs:
       # on macOS (its CJK font candidates are on the runner), once (Apple silicon).
       - name: Test macOS key mapping and fonts
         if: matrix.name == 'macos-arm64'
+        timeout-minutes: 15
         run: |
           cargo test --locked -p rtx-control -- platform::macos
           cargo test --locked -p rtx-link

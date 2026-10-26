@@ -3037,7 +3037,16 @@ mod tests {
                             log.push((method.clone(), path.clone(), key.clone(), body.clone()));
                             before
                         };
-                        let (status, reply) = answer(&method, &path, &key, &body, before);
+                        // On the blocking pool: an answer a test holds (Gate) must never stall a
+                        // runtime worker, or the other connections wait behind it.
+                        let (status, reply) = {
+                            let answer = answer.clone();
+                            tokio::task::spawn_blocking(move || {
+                                answer(&method, &path, &key, &body, before)
+                            })
+                            .await
+                            .unwrap()
+                        };
                         let reply = reply.to_string();
                         let head = format!(
                             "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
@@ -3661,9 +3670,31 @@ mod tests {
         }
     }
 
+    /// Releases the gate however the test ends, so a failing assertion reports instead of
+    /// leaving a held answer (and the test) waiting forever.
+    struct Released(Arc<Gate>);
+
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// A gated test fails in a minute rather than hanging CI.
+    async fn within_a_minute<F: std::future::Future>(test: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(60), test)
+            .await
+            .expect("the test took over a minute")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_delayed_enrollment_never_lands_after_an_account_switch() {
+        within_a_minute(delayed_enrollment()).await
+    }
+
+    async fn delayed_enrollment() {
         let gate = Arc::new(Gate::default());
+        let _released = Released(gate.clone());
         let held = gate.clone();
         let (base, _seen) = marketplace(move |method, path, _, body, _| {
             match (method, path, body["connectorCredential"].as_str()) {
@@ -3707,7 +3738,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_delayed_adoption_never_lands_after_an_account_switch() {
+        within_a_minute(delayed_adoption()).await
+    }
+
+    async fn delayed_adoption() {
         let gate = Arc::new(Gate::default());
+        let _released = Released(gate.clone());
         let held = gate.clone();
         let (base, _seen) = marketplace(move |method, path, _, body, _| {
             match (method, path, body["connectorCredential"].as_str()) {
