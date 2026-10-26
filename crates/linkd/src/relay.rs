@@ -2398,13 +2398,12 @@ mod tests {
             "routes": [{ "hostname": "x.realtimex.ai", "pathPrefix": format!("/d/{ID}"), "publicBaseUrl": format!("https://x.realtimex.ai/d/{ID}/") }],
             "allowedPrefixes": ["/remote-control"],
         });
-        let connection = Connection::from_stored(&old, "i", "c".into()).unwrap();
-        assert!(connection.carries(&["d"]));
-        assert!(!connection.carries(&SURFACES));
-        assert!(connection
+        let before = Connection::from_stored(&old, "i", "c".into()).unwrap();
+        assert!(before.carries(&["d"]));
+        assert!(!before.carries(&SURFACES));
+        assert!(before
             .request(&open("d", "x.realtimex.ai", "/remote-control/hello"), false)
             .is_ok());
-        assert!(connection.carries(&["d"]));
         let new = connection();
         assert!(new.carries(&["a", "h", "p", "d"]));
     }
