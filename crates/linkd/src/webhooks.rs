@@ -254,6 +254,9 @@ pub fn receive(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Answer {
+    // The account first, the endpoint after: a delivery that crosses an account switch finds no
+    // endpoint (404) rather than being kept as the next account's.
+    let account = account(store);
     let pathname = path.split(['?', '#']).next().unwrap_or("");
     let Some(token) = token_of(pathname) else {
         return refused(404, "WEBHOOK_PUBLIC_ROUTE_NOT_FOUND", "Not found.");
@@ -270,7 +273,7 @@ pub fn receive(
     }
     let now = crate::util::now_ms();
     match method {
-        "GET" | "HEAD" => handshake(store, &endpoint, path, headers, now),
+        "GET" | "HEAD" => handshake(store, &account, &endpoint, path, headers, now),
         "POST" => {
             if body.len() as u64 > endpoint.max_body {
                 return refused(
@@ -289,7 +292,7 @@ pub fn receive(
             }
             let delivery = Delivery {
                 id: crate::util::uuid(),
-                account: account(store),
+                account: account.clone(),
                 endpoint: endpoint.tokens[0].clone(),
                 received_at: now,
                 method: "POST".into(),
@@ -338,6 +341,7 @@ pub fn receive(
 /// or rejected) is kept as a GET entry, for RealTimeX to record when it pulls.
 fn handshake(
     store: &Store,
+    account: &str,
     endpoint: &Endpoint,
     path: &str,
     headers: &[(String, String)],
@@ -406,7 +410,7 @@ fn handshake(
     };
     let delivery = Delivery {
         id: crate::util::uuid(),
-        account: account(store),
+        account: account.to_string(),
         endpoint: endpoint.tokens[0].clone(),
         received_at: now,
         method: "GET".into(),

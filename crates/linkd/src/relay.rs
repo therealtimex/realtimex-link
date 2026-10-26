@@ -193,6 +193,27 @@ struct Account {
     expires_at: Option<i64>,
 }
 
+impl Account {
+    /// The account the token is for (its Keycloak subject).
+    fn subject(&self) -> Option<String> {
+        crate::identity::account_of(&self.token)
+            .and_then(|a| a.get("subject").and_then(Value::as_str).map(str::to_string))
+    }
+}
+
+/// What an enrollment, recovery, adoption or retirement started under: its account and the
+/// account transition it saw. Its result is kept only while both still hold, checked in the same
+/// lock that account transitions take, so work that was in flight across a switch (a delayed
+/// Marketplace answer) can never write one account's exposure as another's.
+#[derive(Clone, Debug)]
+struct Fence {
+    subject: Option<String>,
+    epoch: u64,
+}
+
+/// A result that crossed an account transition: dropped.
+const STALE: &str = "the account changed while this was in flight; its result was dropped";
+
 #[derive(Default)]
 struct Status {
     state: &'static str,
@@ -223,6 +244,12 @@ pub struct Relay {
     adopting: tokio::sync::Mutex<()>,
     /// A task is enrolling the surfaces the exposure still lacks (`converge`).
     converging: AtomicBool,
+    /// Account transitions so far (`Fence`).
+    epoch: std::sync::atomic::AtomicU64,
+    /// The account the last transition switched to: results for any other are stale.
+    switched_to: Mutex<Option<String>>,
+    /// Held while a transition happens and while a fenced result is checked and written.
+    writes: Mutex<()>,
     /// The current enrollment operation, part of its Idempotency-Key: a retry of the same request
     /// replays it; after the relay refused the credential, or the service called the replay
     /// superseded (another connector took the exposure), a new one starts.
@@ -260,6 +287,9 @@ impl Relay {
             adopting: tokio::sync::Mutex::new(()),
             recoveries: Mutex::new(Vec::new()),
             converging: AtomicBool::new(false),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            switched_to: Mutex::new(None),
+            writes: Mutex::new(()),
             operation: Mutex::new(crate::util::uuid()),
             serving: Mutex::new(None),
             task: Mutex::new(None),
@@ -331,14 +361,54 @@ impl Relay {
             .ok_or_else(|| anyhow!("token must be the account's access token"))?;
         // The exposure's own account decides, not whoever is signed in now: RealTimeX may have
         // signed out in between (and Link restarted), and a missing sign-in says nothing.
-        if self.exposure_id().is_some() && self.owner_of_exposure(&host).as_deref() != Some(&after)
-        {
-            self.drop_exposure(&host)?;
+        let switching = account_subject(&host.store).as_deref() != Some(after.as_str())
+            || (self.exposure_id().is_some()
+                && self.owner_of_exposure(&host).as_deref() != Some(after.as_str()));
+        if switching {
+            self.transition(Some(&after), || -> Result<()> {
+                if self.exposure_id().is_some()
+                    && self.owner_of_exposure(&host).as_deref() != Some(after.as_str())
+                {
+                    self.drop_unfenced(&host)?;
+                }
+                Ok(())
+            })?;
         }
         if let Some(base) = api_base.and_then(allowed_api_base) {
             self.set_api_base(base);
         }
         host.signin.replace_with_handover(token).await
+    }
+
+    /// The fence for work done with `account`'s token from now on.
+    fn fence(&self, subject: Option<String>) -> Fence {
+        Fence {
+            subject,
+            epoch: self.epoch.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Write `fence`'s result, unless an account transition happened since it started or it is
+    /// for another account than the last transition switched to.
+    fn fenced<R>(&self, fence: &Fence, write: impl FnOnce() -> Result<R>) -> Result<R> {
+        let _writes = lock(&self.writes);
+        let current = lock(&self.switched_to).clone();
+        if self.epoch.load(Ordering::SeqCst) != fence.epoch
+            || current.is_some_and(|to| fence.subject.as_deref() != Some(to.as_str()))
+        {
+            bail!(STALE);
+        }
+        write()
+    }
+
+    /// An account transition: everything started before it is stale from here on.
+    fn transition<R>(&self, to: Option<&str>, change: impl FnOnce() -> R) -> R {
+        let _writes = lock(&self.writes);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        if let Some(to) = to {
+            *lock(&self.switched_to) = Some(to.to_string());
+        }
+        change()
     }
 
     /// The account the stored exposure belongs to. One enrolled before this was recorded is the
@@ -366,6 +436,12 @@ impl Relay {
     /// the adoption, and what was shared on it; nothing is retired, since that needs its own
     /// account's token.
     fn drop_exposure(&self, host: &Host) -> Result<()> {
+        let owner = account_subject(&host.store);
+        self.transition(owner.as_deref(), || self.drop_unfenced(host))
+    }
+
+    /// `drop_exposure`'s work, inside a transition.
+    fn drop_unfenced(&self, host: &Host) -> Result<()> {
         self.forget_shared_state(host)?;
         let Some(previous) = self.exposure_id() else {
             host.store.remove(keys::SUBJECT)?;
@@ -789,6 +865,9 @@ impl Relay {
     /// Enroll (or refresh) this computer's exposure with every surface Link carries; a lost
     /// credential is recovered first. A surface the Marketplace doesn't support yet is left out.
     async fn enroll(&self, host: &Host, account: &Account) -> Result<()> {
+        // Taken before anything is asked: a transition while the Marketplace answers makes the
+        // answer stale.
+        let fence = self.fence(account.subject());
         let install_id = Self::install_id(host)?;
         let credential = host
             .store
@@ -809,6 +888,7 @@ impl Relay {
                 .register(
                     host,
                     account,
+                    &fence,
                     &install_id,
                     credential.clone(),
                     exposure_id.as_deref(),
@@ -830,7 +910,7 @@ impl Relay {
                 }
                 Err(EnrollFailure::Other(error)) => return Err(error),
                 Ok(answer) => {
-                    self.save(host, &answer)?;
+                    self.save(host, &answer, &fence)?;
                     (host.log)(&format!(
                         "[relay] enrolled: {} ({})",
                         answer
@@ -852,6 +932,7 @@ impl Relay {
         &self,
         host: &Host,
         account: &Account,
+        fence: &Fence,
         install_id: &str,
         credential: Option<String>,
         exposure_id: Option<&str>,
@@ -889,7 +970,8 @@ impl Relay {
                 let recovered = recover(account, exposure_id, install_id, &recover_key)
                     .await
                     .map_err(EnrollFailure::from)?;
-                self.save(host, &recovered).map_err(EnrollFailure::Other)?;
+                self.save(host, &recovered, fence)
+                    .map_err(EnrollFailure::Other)?;
                 let credential = recovered
                     .pointer("/connector/credential")
                     .and_then(Value::as_str)
@@ -1083,6 +1165,8 @@ impl Relay {
         {
             self.drop_exposure(&host).map_err(ApiError::from)?;
         }
+        // Everything kept from here is this account's, and only while no transition happens.
+        let fence = self.fence(Some(account.to_string()));
         // Adopting again is the same answer (pending until every surface is enrolled).
         if let Some(adopted) = self.adopted_id() {
             if exposure_id.is_none_or(|id| id == adopted) {
@@ -1129,12 +1213,9 @@ impl Relay {
         let own_exposure = self.exposure_id().filter(|id| id != exposure_id);
         // Another exposure replaces the adopted one (RealTimeX's own account-switch path): what
         // RealTimeX shared on the previous one is pushed again for the new one.
-        if self
+        let replacing = self
             .adopted_id()
-            .is_some_and(|adopted| adopted != exposure_id)
-        {
-            self.forget_shared_state(&host).map_err(ApiError::from)?;
-        }
+            .is_some_and(|adopted| adopted != exposure_id);
         let credential = recovered
             .pointer("/connector/credential")
             .and_then(Value::as_str)
@@ -1172,9 +1253,13 @@ impl Relay {
         if let Some(sealed) = sealed {
             values.push((keys::CREDENTIAL, sealed));
         }
-        host.store
-            .transaction(&values, &[])
-            .map_err(ApiError::from)?;
+        self.fenced(&fence, || {
+            if replacing {
+                self.forget_shared_state(&host)?;
+            }
+            host.store.transaction(&values, &[])
+        })
+        .map_err(|error| ApiError::coded(409, "signed-out", format!("{error:#}")))?;
         lock(&self.status).needs_enrollment = false;
         self.set_status("connecting", None);
         (host.log)(&format!(
@@ -1184,6 +1269,7 @@ impl Relay {
             .enroll_adopted(
                 &host,
                 &token,
+                &fence,
                 exposure_id,
                 install_id,
                 &credential,
@@ -1207,6 +1293,7 @@ impl Relay {
         &self,
         host: &Host,
         token: &Account,
+        fence: &Fence,
         exposure_id: &str,
         install_id: &str,
         credential: &str,
@@ -1234,7 +1321,7 @@ impl Relay {
         if answer.get("exposureId").and_then(Value::as_str) != Some(exposure_id) {
             return Err("the relay service enrolled another exposure".into());
         }
-        self.save(host, &answer)
+        self.save(host, &answer, fence)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -1255,10 +1342,17 @@ impl Relay {
             return;
         };
         let relay = self.clone();
+        let fence = self.fence(exposure_subject(&host.store));
         tokio::spawn(async move {
             let Some(account) = relay.account().await else {
                 return;
             };
+            // Only with the account it belongs to, and before any transition.
+            if account.subject() != fence.subject
+                || relay.epoch.load(Ordering::SeqCst) != fence.epoch
+            {
+                return;
+            }
             let url = format!("{}/v1/relay-exposures/{id}", account.api_base);
             let done = api_delete(&url, &account.token).await;
             let Some(host) = relay.host.upgrade() else {
@@ -1266,10 +1360,13 @@ impl Relay {
             };
             match done {
                 Ok(()) => {
-                    if let Some(mut adopted) = host.store.get(keys::ADOPTED) {
-                        adopted["retire"] = Value::Null;
-                        let _ = host.store.set(keys::ADOPTED, &adopted);
-                    }
+                    let _ = relay.fenced(&fence, || {
+                        if let Some(mut adopted) = host.store.get(keys::ADOPTED) {
+                            adopted["retire"] = Value::Null;
+                            host.store.set(keys::ADOPTED, &adopted)?;
+                        }
+                        Ok(())
+                    });
                     (host.log)(&format!("[relay] retired Link's own exposure {id}"));
                 }
                 Err(error) => (host.log)(&format!(
@@ -1280,18 +1377,17 @@ impl Relay {
     }
 
     /// Keep an enrollment answer: the exposure (without the credential) and the sealed credential.
-    fn save(&self, host: &Host, answer: &Value) -> Result<()> {
+    fn save(&self, host: &Host, answer: &Value, fence: &Fence) -> Result<()> {
         let (exposure, sealed) = self.stored(host, answer)?;
         let mut values = vec![(keys::EXPOSURE, exposure)];
-        // Enrolled with the signed-in account's token: the exposure is that account's.
-        if let Some(subject) = account_subject(&host.store) {
+        // The account whose token enrolled it, never whoever is signed in when it lands.
+        if let Some(subject) = &fence.subject {
             values.push((keys::SUBJECT, json!({ "subject": subject })));
         }
         if let Some(sealed) = sealed {
             values.push((keys::CREDENTIAL, sealed));
         }
-        host.store.transaction(&values, &[])?;
-        Ok(())
+        self.fenced(fence, || host.store.transaction(&values, &[]))
     }
 
     /// What the store keeps of an enrollment answer: (exposure, sealed credential).
@@ -2995,7 +3091,11 @@ mod tests {
         // RealTimeX's install rtx-install owns this Link (§6.3 A1).
         crate::owner::claim(&host.store, "rtx-install", crate::util::now_ms()).unwrap();
         host.relay
-            .save(&host, &view("linkOwn", &["d"], "own-credential"))
+            .save(
+                &host,
+                &view("linkOwn", &["d"], "own-credential"),
+                &host.relay.fence(Some("u1".into())),
+            )
             .unwrap();
         host.store
             .set(keys::INSTALL_ID, &json!("link-install"))
@@ -3522,6 +3622,122 @@ mod tests {
             host.relay.adopt(None, "rtx-install", "u1").await.unwrap()["appId"],
             "exposureOfU1"
         );
+    }
+
+    /// Holds one fake Marketplace answer until the test releases it, so a test can order a
+    /// delayed answer against an account switch exactly.
+    #[derive(Default)]
+    struct Gate {
+        /// (a held request arrived, released)
+        state: Mutex<(bool, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn hold(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        async fn arrived(self: &Arc<Self>) {
+            let gate = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut state = gate.state.lock().unwrap();
+                while !state.0 {
+                    state = gate.changed.wait(state).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delayed_enrollment_never_lands_after_an_account_switch() {
+        let gate = Arc::new(Gate::default());
+        let held = gate.clone();
+        let (base, _seen) = marketplace(move |method, path, _, body, _| {
+            match (method, path, body["connectorCredential"].as_str()) {
+                // u1's refresh of its own exposure: its answer comes after the switch.
+                ("POST", "/v1/relay-exposures", Some("own-credential")) => {
+                    held.hold();
+                    (200, view("linkOwn", &SURFACES, "own-credential"))
+                }
+                ("POST", "/v1/relay-exposures", None | Some("credential-u2")) => {
+                    (200, view("exposureOfU2", &SURFACES, "credential-u2"))
+                }
+                _ => (404, json!({ "message": "unexpected" })),
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let as_u1 = relay.account().await.unwrap();
+        let pending = {
+            let (relay, host) = (relay.clone(), host.clone());
+            tokio::spawn(async move { relay.enroll(&host, &as_u1).await })
+        };
+        gate.arrived().await;
+        // While u1's answer is on its way: RealTimeX switches to u2, which adopts its own.
+        relay.take_handover(&token("u2"), None).await.unwrap();
+        assert_eq!(
+            relay.adopt(None, "rtx-install", "u2").await.unwrap()["appId"],
+            "exposureOfU2"
+        );
+        gate.release();
+        let late = pending.await.unwrap().unwrap_err();
+        assert!(format!("{late:#}").contains(STALE), "{late:#}");
+        // u2's exposure, credential and account are untouched by u1's answer.
+        assert_eq!(relay.exposure_id().as_deref(), Some("exposureOfU2"));
+        assert_eq!(exposure_subject(&host.store).as_deref(), Some("u2"));
+        let connection = relay.connection(&host).unwrap();
+        assert_eq!(connection.credential, "credential-u2");
+        assert_eq!(connection.exposure_id, "exposureOfU2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delayed_adoption_never_lands_after_an_account_switch() {
+        let gate = Arc::new(Gate::default());
+        let held = gate.clone();
+        let (base, _seen) = marketplace(move |method, path, _, body, _| {
+            match (method, path, body["connectorCredential"].as_str()) {
+                ("POST", "/v1/relay-exposures", None) => {
+                    held.hold();
+                    (200, view("exposureOfU1", &SURFACES, "credential-u1"))
+                }
+                ("POST", "/v1/relay-exposures", Some(credential)) => {
+                    (200, view("exposureOfU1", &SURFACES, credential))
+                }
+                _ => (404, json!({ "message": "unexpected" })),
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let pending = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.adopt(None, "rtx-install", "u1").await })
+        };
+        gate.arrived().await;
+        relay.take_handover(&token("u2"), None).await.unwrap();
+        gate.release();
+        let late = pending.await.unwrap().unwrap_err();
+        assert_eq!(late.code.as_deref(), Some("signed-out"), "{}", late.message);
+        // Nothing of u1's adoption was kept under u2.
+        assert_ne!(relay.exposure_id().as_deref(), Some("exposureOfU1"));
+        assert_ne!(exposure_subject(&host.store).as_deref(), Some("u1"));
+        assert!(relay.adopted_id().is_none());
     }
 
     #[test]
