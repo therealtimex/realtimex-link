@@ -94,8 +94,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The relay pings every 10 s; nothing for this long means the connection is dead.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 const RECONNECT_DELAYS: [u64; 6] = [1, 2, 5, 10, 30, 60];
-/// After 4409 (another connection still holds the lease, up to 30 s).
-const ALREADY_ACTIVE_FLOOR: Duration = Duration::from_secs(30);
 const CLOSE_AUTH_FAILED: u16 = 4401;
 const CLOSE_ALREADY_ACTIVE: u16 = 4409;
 const API_TIMEOUT: Duration = Duration::from_secs(60);
@@ -150,7 +148,8 @@ fn body_limit(surface: &str) -> u64 {
     const MIB: u64 = 1024 * 1024;
     match surface {
         "a" | "e" | "d" => MIB,
-        "h" | "p" => 10 * MIB,
+        "h" => 15 * MIB,
+        "p" => 10 * MIB,
         "m" => 50 * MIB,
         _ => 0,
     }
@@ -364,39 +363,79 @@ impl Relay {
         json!({ "state": status.state, "url": url, "detail": status.detail })
     }
 
-    /// For GET /v1/status: { appId, adopted, surfaces, origin, notice }. notice: the exposure
-    /// adopted from RealTimeX, until the window has shown it once.
+    /// GET /v1/exposure (realtimex-ai-app#2836 §6): { state, appId, installId, account, surfaces:
+    /// { <surface>: publicBaseUrl }, formerAppIds, error? }, and for the window: adopted, origin
+    /// (RealTimeX registered) and notice (the adopted exposure, until the window showed it once).
+    /// state: off (Link turned off), other-account (RealTimeX handed over another account),
+    /// signed-out, connecting, online or error.
     pub fn exposure(&self) -> Value {
         let Some(host) = self.host.upgrade() else {
-            return json!({});
+            return json!({ "state": "off" });
         };
         let exposure = host.store.get(keys::EXPOSURE);
-        let mut surfaces: Vec<String> = exposure
-            .as_ref()
-            .map(stored_routes)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|route| route.get("surface").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect();
-        surfaces.dedup();
+        let mut surfaces = serde_json::Map::new();
+        for route in exposure.as_ref().map(stored_routes).unwrap_or_default() {
+            let Some(surface) = route.get("surface").and_then(Value::as_str) else {
+                continue;
+            };
+            // Artifacts and the widget are linked on their content host, as RealTimeX did.
+            let url = route
+                .get("contentBaseUrl")
+                .and_then(Value::as_str)
+                .filter(|_| matches!(surface, "a" | "e"))
+                .or_else(|| route.get("publicBaseUrl").and_then(Value::as_str));
+            if let Some(url) = url {
+                surfaces.insert(surface.to_string(), json!(url));
+            }
+        }
+        let ours = host.store.get(crate::identity::keys::ACCOUNT);
+        let subject = |account: Option<&Value>| {
+            account
+                .and_then(|a| a.get("subject"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let offered = host.signin.offered_account();
+        let other_account = offered.is_some()
+            && subject(ours.as_ref()).is_some()
+            && subject(offered.as_ref()) != subject(ours.as_ref());
+        let (state, detail) = {
+            let status = lock(&self.status);
+            (status.state, status.detail.clone())
+        };
+        let state = if !host.settings().keep_running {
+            "off"
+        } else if other_account {
+            "other-account"
+        } else {
+            match state {
+                "ready" => "online",
+                "error" => "error",
+                "not-set-up" => "signed-out",
+                "off" => "off",
+                _ => "connecting",
+            }
+        };
         let adopted = host.store.get(keys::ADOPTED);
-        let current = self.exposure_id();
-        let adopted_now = adopted
-            .as_ref()
-            .and_then(|a| a.get("exposureId"))
-            .and_then(Value::as_str)
-            .is_some_and(|id| Some(id) == current.as_deref());
+        let adopted_now = self.adopted_id().is_some();
         let notice = adopted
             .filter(|a| adopted_now && a.get("seen") != Some(&Value::Bool(true)))
             .map(|a| json!({ "appId": a.get("exposureId"), "from": a.get("from") }));
-        json!({
+        let mut answer = json!({
+            "state": state,
             "appId": host.app_id(),
-            "adopted": adopted_now,
+            "installId": host.store.get(keys::INSTALL_ID),
+            "account": ours.as_ref().and_then(|a| a.get("email")),
             "surfaces": surfaces,
+            "formerAppIds": host.former_app_ids(),
+            "adopted": adopted_now,
             "origin": self.origin.registered(),
             "notice": notice,
-        })
+        });
+        if state == "error" {
+            answer["error"] = json!(detail);
+        }
+        answer
     }
 
     /// The window showed "This computer now has one App ID".
@@ -524,7 +563,9 @@ impl Relay {
                         "connecting",
                         Some("Another connection is still active".into()),
                     );
-                    ALREADY_ACTIVE_FLOOR + jitter(ALREADY_ACTIVE_FLOOR / 5)
+                    // A takeover (adopt) replaces the lease at once; otherwise the old lease
+                    // runs out within its TTL. Short, growing waits either way.
+                    Duration::from_secs(backoff(attempt))
                 }
                 Ended::Lost { was_ready, reason } => {
                     if was_ready {
@@ -577,11 +618,15 @@ impl Relay {
             .store
             .get(keys::CREDENTIAL)
             .and_then(|sealed| host.open_secret(&sealed));
-        let exposure_id = host.store.get(keys::EXPOSURE).and_then(|e| {
-            e.get("exposureId")
+        let stored = host.store.get(keys::EXPOSURE);
+        let text = |name: &str| {
+            stored
+                .as_ref()
+                .and_then(|e| e.get(name))
                 .and_then(Value::as_str)
                 .map(String::from)
-        });
+        };
+        let (exposure_id, app_id) = (text("exposureId"), text("appId"));
         loop {
             let surfaces = self.wanted_surfaces();
             match self
@@ -592,6 +637,7 @@ impl Relay {
                     credential.clone(),
                     exposure_id.as_deref(),
                     &surfaces,
+                    app_id.as_deref(),
                 )
                 .await
             {
@@ -633,8 +679,9 @@ impl Relay {
         credential: Option<String>,
         exposure_id: Option<&str>,
         surfaces: &[&str],
+        app_id: Option<&str>,
     ) -> Result<Value, EnrollFailure> {
-        let body = registration(install_id, credential, surfaces);
+        let body = registration(install_id, credential.clone(), surfaces, app_id);
         let key = format!(
             "relay-{}",
             hex(&Sha256::digest(
@@ -668,7 +715,7 @@ impl Relay {
                     .pointer("/connector/credential")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let body = registration(install_id, credential, surfaces);
+                let body = registration(install_id, credential, surfaces, app_id);
                 api_post(&url, &account.token, &format!("{key}-recovered"), &body)
                     .await
                     .map_err(EnrollFailure::from)
@@ -677,19 +724,30 @@ impl Relay {
         }
     }
 
-    /// POST /v1/exposure/adopt: take over RealTimeX's exposure (realtimex-ai-app#2836), so this
-    /// computer has one App ID and RealTimeX's published, webhook and embed URLs keep working.
-    /// `token` is RealTimeX's access token; its account must be Link's (Link not signed in takes
-    /// it, as a handover). The exposure's credential is recovered with it (it rotates, so
-    /// RealTimeX must have stopped its own connector first), then it is enrolled with every
-    /// surface under RealTimeX's install ID, and Link's previous exposure ID is kept as a former
-    /// one. Answers { appId, formerAppIds }.
+    /// The exposure adopted from RealTimeX, while it is the current one.
+    pub fn adopted_id(&self) -> Option<String> {
+        let host = self.host.upgrade()?;
+        let adopted = host
+            .store
+            .get(keys::ADOPTED)?
+            .get("exposureId")?
+            .as_str()?
+            .to_string();
+        (self.exposure_id().as_deref() == Some(adopted.as_str())).then_some(adopted)
+    }
+
+    /// POST /v1/exposure/adopt (realtimex-ai-app#2836 §6): take over RealTimeX's exposure, so
+    /// this computer has one App ID and RealTimeX's published, webhook and embed URLs keep working.
+    /// `account` is RealTimeX's account (its Keycloak subject) and must be Link's. Link recovers
+    /// the exposure's credential with its own token for that account (it rotates: RealTimeX
+    /// stopped re-registering first), enrolls it with every surface under RealTimeX's install ID
+    /// and app ID, keeps it and connects. Its previous App ID becomes a former one; its own
+    /// exposure is retired once the adopted one has been online. Answers { appId, formerAppIds }.
     pub async fn adopt(
         &self,
         exposure_id: &str,
         install_id: &str,
-        token: &str,
-        api_base: Option<&str>,
+        account: &str,
     ) -> Result<Value, crate::error::ApiError> {
         use crate::error::ApiError;
         let _one = self.adopting.lock().await;
@@ -704,14 +762,11 @@ impl Relay {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         };
-        if !valid(exposure_id, 128) || !valid(install_id, 128) {
+        if !valid(exposure_id, 128) || !valid(install_id, 128) || !valid(account, 128) {
             return Err(ApiError::bad_request(
-                "exposureId and installId must be the exposure's IDs",
+                "exposureId, installId and account (the Keycloak subject) are required",
             ));
         }
-        let theirs = crate::identity::account_of(token)
-            .and_then(|a| a.get("subject").and_then(Value::as_str).map(str::to_string))
-            .ok_or_else(|| ApiError::bad_request("token must be the account's access token"))?;
         // This computer's account: Link's own sign-in, or RealTimeX's handover it took.
         let ours = host.store.get(crate::identity::keys::ACCOUNT);
         let ours_subject = ours
@@ -719,69 +774,79 @@ impl Relay {
             .and_then(|a| a.get("subject"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        match ours_subject {
-            Some(subject) if subject != theirs => {
-                let email = |a: Option<Value>| a.and_then(|a| a.get("email").cloned());
-                // Kept as an offer, for the window's "Use <RealTimeX's account>".
-                let _ = self.handover(token, api_base);
+        let token = match (ours_subject, self.account().await) {
+            (Some(subject), Some(token)) if subject == account => token,
+            (Some(subject), _) if subject != account => {
+                let realtimex = host.signin.offered_email();
                 return Err(ApiError::coded(
                     409,
-                    "ACCOUNT_MISMATCH",
+                    "other-account",
                     "RealTimeX Link is signed in to another account",
                 )
                 .with_details(json!({
-                    "linkAccount": email(ours),
-                    "realtimexAccount": email(crate::identity::account_of(token)),
+                    "linkAccount": ours.as_ref().and_then(|a| a.get("email")),
+                    "realtimexAccount": realtimex,
                 })));
             }
-            Some(_) => {}
-            None => {
-                if !self.handover(token, api_base).unwrap_or(false) {
-                    return Err(ApiError::coded(
-                        409,
-                        "NOT_SIGNED_IN",
-                        "RealTimeX Link was signed out here; sign in to RealTimeX's account in Link first",
-                    ));
-                }
+            _ => {
+                return Err(ApiError::coded(
+                    409,
+                    "signed-out",
+                    "RealTimeX Link isn't signed in; hand over RealTimeX's account first",
+                ))
             }
-        }
-        if self.exposure_id().as_deref() == Some(exposure_id) {
-            return Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }));
-        }
-        // The App ID other computers know this one by until now.
-        let previous = host.app_id();
-        let account = Account {
-            token: token.to_string(),
-            api_base: self.api_base(),
-            expires_at: jwt_expiry(token),
         };
+        // One RealTimeX per Link: adopting again is the same answer, another exposure is refused.
+        if let Some(adopted) = self.adopted_id() {
+            if adopted == exposure_id {
+                return Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }));
+            }
+            return Err(ApiError::coded(
+                409,
+                "adopted-other",
+                "RealTimeX Link already carries another RealTimeX's exposure",
+            )
+            .with_details(json!({ "appId": adopted })));
+        }
+        let failed = |message: String| ApiError::coded(502, "adopt-failed", message);
+        // The App ID other computers know this one by until now, and Link's own exposure.
+        let previous = host.app_id();
+        let own_exposure = self.exposure_id().filter(|id| id != exposure_id);
         let recovered = recover(
-            &account,
+            &token,
             exposure_id,
             install_id,
             &format!("relay-adopt-{}", crate::util::uuid()),
         )
         .await
         .map_err(|failure| {
-            ApiError::coded(
-                if failure.status == 404 { 404 } else { 502 },
-                "ADOPT_FAILED",
-                failure.message,
-            )
+            if failure.status == 404 {
+                ApiError::coded(404, "exposure-not-found", failure.message)
+            } else {
+                failed(failure.message)
+            }
         })?;
         let credential = recovered
             .pointer("/connector/credential")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| ApiError::new(502, "the relay service answered without a credential"))?;
-        // Enroll every surface on the adopted exposure before anything is kept, so a failure
-        // leaves Link's own exposure as it was.
+            .ok_or_else(|| failed("the relay service answered without a credential".into()))?;
+        let app_id = recovered
+            .get("appId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // Every surface on the adopted exposure, with its app ID, before anything is kept.
         let mut surfaces = self.wanted_surfaces();
         let answer = loop {
             let key = format!("relay-adopt-enroll-{}", crate::util::uuid());
-            let url = format!("{}/v1/relay-exposures", account.api_base);
-            let body = registration(install_id, Some(credential.clone()), &surfaces);
-            match api_post(&url, &account.token, &key, &body).await {
+            let url = format!("{}/v1/relay-exposures", token.api_base);
+            let body = registration(
+                install_id,
+                Some(credential.clone()),
+                &surfaces,
+                app_id.as_deref(),
+            );
+            match api_post(&url, &token.token, &key, &body).await {
                 Ok(answer) => break answer,
                 Err(failure) => match EnrollFailure::from(failure) {
                     EnrollFailure::Unsupported(surface) if surfaces.contains(&surface.as_str()) => {
@@ -789,24 +854,16 @@ impl Relay {
                         lock(&self.unsupported).insert(surface);
                     }
                     EnrollFailure::Unsupported(surface) => {
-                        return Err(ApiError::coded(
-                            502,
-                            "ADOPT_FAILED",
-                            format!("the relay service refused surface {surface}"),
-                        ))
+                        return Err(failed(format!(
+                            "the relay service refused surface {surface}"
+                        )))
                     }
-                    EnrollFailure::Other(error) => {
-                        return Err(ApiError::coded(502, "ADOPT_FAILED", format!("{error:#}")))
-                    }
+                    EnrollFailure::Other(error) => return Err(failed(format!("{error:#}"))),
                 },
             }
         };
         if answer.get("exposureId").and_then(Value::as_str) != Some(exposure_id) {
-            return Err(ApiError::coded(
-                502,
-                "ADOPT_FAILED",
-                "the relay service enrolled another exposure",
-            ));
+            return Err(failed("the relay service enrolled another exposure".into()));
         }
         let mut former = strings(host.store.get(keys::FORMER_IDS).as_ref());
         if !former.contains(&previous) {
@@ -820,7 +877,13 @@ impl Relay {
             (keys::FORMER_IDS, json!(former)),
             (
                 keys::ADOPTED,
-                json!({ "exposureId": exposure_id, "from": previous, "at": crate::util::iso_now() }),
+                json!({
+                    "exposureId": exposure_id,
+                    "from": previous,
+                    "at": crate::util::iso_now(),
+                    // Link's own exposure, retired once this one has been online.
+                    "retire": own_exposure,
+                }),
             ),
         ];
         if let Some(sealed) = sealed {
@@ -830,12 +893,50 @@ impl Relay {
             .transaction(&values, &[])
             .map_err(ApiError::from)?;
         lock(&self.status).needs_enrollment = false;
+        self.set_status("connecting", None);
         (host.log)(&format!(
             "[relay] adopted RealTimeX's exposure {exposure_id} (was {previous})"
         ));
         self.restart.store(true, Ordering::SeqCst);
         self.wake();
         Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }))
+    }
+
+    /// The adopted exposure is online: Link's own one goes (tombstoned), once.
+    fn retire_own(self: &Arc<Self>) {
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let Some(id) = host
+            .store
+            .get(keys::ADOPTED)
+            .and_then(|a| a.get("retire").and_then(Value::as_str).map(str::to_string))
+        else {
+            return;
+        };
+        let relay = self.clone();
+        tokio::spawn(async move {
+            let Some(account) = relay.account().await else {
+                return;
+            };
+            let url = format!("{}/v1/relay-exposures/{id}", account.api_base);
+            let done = api_delete(&url, &account.token).await;
+            let Some(host) = relay.host.upgrade() else {
+                return;
+            };
+            match done {
+                Ok(()) => {
+                    if let Some(mut adopted) = host.store.get(keys::ADOPTED) {
+                        adopted["retire"] = Value::Null;
+                        let _ = host.store.set(keys::ADOPTED, &adopted);
+                    }
+                    (host.log)(&format!("[relay] retired Link's own exposure {id}"));
+                }
+                Err(error) => (host.log)(&format!(
+                    "[relay] couldn't retire Link's own exposure {id} yet: {error}"
+                )),
+            }
+        });
     }
 
     /// Keep an enrollment answer: the exposure (without the credential) and the sealed credential.
@@ -989,6 +1090,7 @@ impl Relay {
                         } else {
                             ready = true;
                             self.set_status("ready", None);
+                            self.retire_own();
                             if let Some(host) = self.host.upgrade() {
                                 (host.log)(&format!("[relay] ready: {}", connection.exposure_id));
                             }
@@ -1254,9 +1356,16 @@ fn response_headers(map: &axum::http::HeaderMap) -> serde_json::Map<String, Valu
 }
 
 /// The registration body (POST /v1/relay-exposures).
-fn registration(install_id: &str, credential: Option<String>, surfaces: &[&str]) -> Value {
+fn registration(
+    install_id: &str,
+    credential: Option<String>,
+    surfaces: &[&str],
+    app_id: Option<&str>,
+) -> Value {
     json!({
         "installId": install_id,
+        // The exposure's app ID as it is: an update without it would clear it.
+        "appId": app_id,
         "connectorCredential": credential,
         "runtimeChannel": "app",
         "appName": "RealTimeX Link",
@@ -1350,6 +1459,7 @@ fn exposure_of(answer: &Value) -> Result<Value> {
     }
     Ok(json!({
         "exposureId": exposure_id,
+        "appId": answer.get("appId"),
         "connector": {
             "url": url,
             "protocol": connector.get("protocol"),
@@ -1932,6 +2042,29 @@ async fn api_post(
     })
 }
 
+/// DELETE on the Marketplace API with the account's token: Ok once it is gone (404 too).
+async fn api_delete(url: &str, token: &str) -> Result<(), String> {
+    let (url, token) = (url.to_string(), token.to_string());
+    tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(API_TIMEOUT))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let response = agent
+            .delete(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|error| format!("{url}: {error}"))?;
+        match response.status().as_u16() {
+            200..=299 | 404 => Ok(()),
+            status => Err(format!("the relay service answered {status}")),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.to_string()))
+}
+
 /// A JWT's `exp`, unchecked (it only says when to stop using it).
 fn jwt_expiry(token: &str) -> Option<i64> {
     use base64::Engine;
@@ -1967,11 +2100,6 @@ fn backoff(attempt: usize) -> u64 {
         0
     };
     (base as i64 + offset).max(1) as u64
-}
-
-fn jitter(max: Duration) -> Duration {
-    let millis = max.as_millis().max(1) as u64;
-    Duration::from_millis(u64::from_le_bytes(crate::util::random_bytes::<8>()) % millis)
 }
 
 /// The Marketplace API base as `https://<allowed host>`, or None. Parsed, not prefix-matched:

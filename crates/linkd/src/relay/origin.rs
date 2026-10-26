@@ -1,15 +1,16 @@
 //! RealTimeX behind Link (realtimex-ai-app#2836): while RealTimeX runs it registers its servers
-//! here (POST /v1/origin), and the relay's requests for published artifacts, the embed widget,
-//! webhooks, the mobile app and desktop messaging are passed to them over loopback, with the
-//! headers RealTimeX's own connector set (relayConnector.cjs): where the request came from, on
-//! which surface, and that it came from the public relay. Each also carries the origin's token, so
-//! RealTimeX can tell Link's relayed requests from any other local caller.
+//! here (PUT /v1/origin, one target per surface), and the relay's requests for published
+//! artifacts, the embed widget, webhooks, the mobile app and desktop messaging are passed to them
+//! over loopback, with the headers RealTimeX's own connector set (relayConnector.cjs): where the
+//! request came from, on which surface, and that it came from the public relay. With a token, each
+//! also carries it, so RealTimeX can tell Link's relayed requests from any other local caller.
 //!
 //! Nothing registered, or nothing listening there any more: "desktop offline" (503).
 //!
-//! The origin is kept in memory only: RealTimeX registers again at each start, and a port nobody
+//! The origin is kept in memory only: RealTimeX registers again at each start, and a target nobody
 //! answers on is forgotten, so a later process on that port is never handed public requests.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -38,113 +39,164 @@ const RELAY_SURFACE_HEADER: &str = "x-realtimex-relay-surface";
 pub const ORIGIN_TOKEN_HEADER: &str = "x-realtimex-link-origin";
 const MIN_TOKEN: usize = 32;
 const MAX_TOKEN: usize = 256;
+/// The surfaces RealTimeX serves (Remote Control's `d` is Link's own).
+const ORIGIN_SURFACES: [&str; 5] = ["a", "e", "h", "m", "p"];
 
-/// RealTimeX's servers: its backend, and the embed widget's proxy when it has its own port.
+/// RealTimeX's servers: the loopback port of each surface it serves, and its optional token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Origin {
-    pub port: u16,
-    pub embed_port: Option<u16>,
-    pub token: String,
+    pub targets: BTreeMap<String, u16>,
+    pub token: Option<String>,
+}
+
+/// "http://127.0.0.1:<port>" exactly (a trailing slash allowed), as its port.
+fn loopback_port(url: &str) -> Option<u16> {
+    let rest = url.strip_prefix("http://127.0.0.1:")?;
+    let port = rest.strip_suffix('/').unwrap_or(rest);
+    if port.is_empty() || port.len() > 5 || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    port.parse::<u16>().ok().filter(|port| *port > 0)
 }
 
 impl Origin {
-    /// POST /v1/origin's body: { port, embedPort?, token }.
+    /// PUT /v1/origin's body: { targets: { a, e, h, m, p: "http://127.0.0.1:<port>" }, token? }.
     pub fn from_body(body: &Value) -> Result<Self, String> {
-        let port = |name: &str| -> Result<Option<u16>, String> {
-            match body.get(name) {
-                None | Some(Value::Null) => Ok(None),
-                Some(value) => value
-                    .as_u64()
-                    .and_then(|port| u16::try_from(port).ok())
-                    .filter(|port| *port > 0)
-                    .map(Some)
-                    .ok_or_else(|| format!("{name} must be a port number")),
+        let map = body
+            .get("targets")
+            .and_then(Value::as_object)
+            .ok_or("targets must name each surface's http://127.0.0.1:<port>")?;
+        let mut targets = BTreeMap::new();
+        for (surface, url) in map {
+            if !ORIGIN_SURFACES.contains(&surface.as_str()) {
+                return Err(format!("{surface} is not a surface RealTimeX serves"));
+            }
+            let port = url
+                .as_str()
+                .and_then(loopback_port)
+                .ok_or_else(|| format!("targets.{surface} must be http://127.0.0.1:<port>"))?;
+            targets.insert(surface.clone(), port);
+        }
+        if targets.is_empty() {
+            return Err("targets must name at least one surface".into());
+        }
+        let token = match body.get("token") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(token))
+                if (MIN_TOKEN..=MAX_TOKEN).contains(&token.len())
+                    && token.chars().all(|c| c.is_ascii_graphic()) =>
+            {
+                Some(token.clone())
+            }
+            Some(_) => {
+                return Err(format!(
+                    "token must be {MIN_TOKEN} to {MAX_TOKEN} visible ASCII characters"
+                ))
             }
         };
-        let token = body.get("token").and_then(Value::as_str).unwrap_or("");
-        if !(MIN_TOKEN..=MAX_TOKEN).contains(&token.len())
-            || !token.chars().all(|c| c.is_ascii_graphic())
-        {
-            return Err(format!(
-                "token must be {MIN_TOKEN} to {MAX_TOKEN} visible ASCII characters"
-            ));
-        }
-        Ok(Self {
-            port: port("port")?.ok_or("port is required")?,
-            embed_port: port("embedPort")?,
-            token: token.to_string(),
-        })
+        Ok(Self { targets, token })
+    }
+
+    /// For GET /v1/origin: { registered, targets }.
+    pub fn view(origin: Option<&Origin>) -> Value {
+        let targets: serde_json::Map<String, Value> = origin
+            .map(|origin| {
+                origin
+                    .targets
+                    .iter()
+                    .map(|(surface, port)| {
+                        (surface.clone(), json!(format!("http://127.0.0.1:{port}")))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        json!({ "registered": origin.is_some(), "targets": targets })
     }
 }
 
-/// Where one stream goes: the port for its surface, and the token.
+/// Where one stream goes: the port for its surface, the token, and which registration it was.
 pub(super) struct Target {
     port: u16,
-    token: String,
+    token: Option<String>,
+    surface: String,
+    generation: u64,
 }
 
-/// The registered origin, shared with the streams that use it.
+/// The registered origin (and how many registrations there were), shared with the streams.
 #[derive(Clone, Default)]
-pub struct Registry(Arc<Mutex<Option<Origin>>>);
+pub struct Registry(Arc<Mutex<(Option<Origin>, u64)>>);
 
 impl Registry {
-    fn current(&self) -> std::sync::MutexGuard<'_, Option<Origin>> {
+    fn current(&self) -> std::sync::MutexGuard<'_, (Option<Origin>, u64)> {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn set(&self, origin: Origin) {
-        *self.current() = Some(origin);
+        let mut current = self.current();
+        current.0 = Some(origin);
+        current.1 += 1;
     }
 
     pub fn clear(&self) {
-        *self.current() = None;
+        let mut current = self.current();
+        current.0 = None;
+        current.1 += 1;
     }
 
     pub fn get(&self) -> Option<Origin> {
-        self.current().clone()
+        self.current().0.clone()
     }
 
     pub fn registered(&self) -> bool {
-        self.current().is_some()
+        self.current().0.is_some()
     }
 
     pub(super) fn clone_handle(&self) -> Registry {
         self.clone()
     }
 
-    /// The embed widget goes to its proxy; every other surface to the backend.
+    /// The registered target of this surface, if any.
     pub(super) fn target(&self, surface: &str) -> Option<Target> {
-        let origin = self.get()?;
-        let port = match (surface, origin.embed_port) {
-            ("e", Some(port)) => port,
-            _ => origin.port,
-        };
+        let current = self.current();
+        let origin = current.0.as_ref()?;
         Some(Target {
-            port,
-            token: origin.token,
+            port: *origin.targets.get(surface)?,
+            token: origin.token.clone(),
+            surface: surface.to_string(),
+            generation: current.1,
         })
     }
 
-    /// Nothing answered on the origin's port: RealTimeX is gone (unless it registered again).
-    fn forget(&self, token: &str) {
+    /// Nothing answered on a target's port: that surface is offline until RealTimeX registers
+    /// again (unless it already did since). With no target left, no origin is registered.
+    fn forget(&self, target: &Target) {
         let mut current = self.current();
-        if current.as_ref().is_some_and(|origin| origin.token == token) {
-            *current = None;
+        if current.1 != target.generation {
+            return;
+        }
+        if let Some(origin) = current.0.as_mut() {
+            origin.targets.remove(&target.surface);
+            if origin.targets.is_empty() {
+                current.0 = None;
+            }
         }
     }
 }
 
 /// The headers RealTimeX's own connector set on a relayed request.
-fn forwarded(request: &RelayRequest, token: &str) -> Vec<(&'static str, String)> {
-    vec![
+fn forwarded(request: &RelayRequest, token: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut headers = vec![
         ("x-forwarded-host", request.public_host.clone()),
         ("x-forwarded-prefix", request.public_prefix.clone()),
         ("x-forwarded-proto", "https".into()),
         ("x-forwarded-for", request.client.to_string()),
         (RELAY_SURFACE_HEADER, request.surface.clone()),
         (RELAY_SOURCE_HEADER, PUBLIC_RELAY_SOURCE.into()),
-        (ORIGIN_TOKEN_HEADER, token.to_string()),
-    ]
+    ];
+    if let Some(token) = token {
+        headers.push((ORIGIN_TOKEN_HEADER, token.to_string()));
+    }
+    headers
 }
 
 async fn connect(target: &Target, registry: &Registry) -> Option<TcpStream> {
@@ -156,7 +208,7 @@ async fn connect(target: &Target, registry: &Registry) -> Option<TcpStream> {
     {
         Ok(Ok(stream)) => Some(stream),
         _ => {
-            registry.forget(&target.token);
+            registry.forget(target);
             None
         }
     }
@@ -194,7 +246,7 @@ pub(super) async fn http(
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }
-    for (name, value) in forwarded(&request, &target.token) {
+    for (name, value) in forwarded(&request, target.token.as_deref()) {
         builder = builder.header(name, value);
     }
     let Ok(outgoing) = builder.body(body) else {
@@ -276,7 +328,7 @@ pub(super) async fn websocket(
         .iter()
         .map(|(name, value)| (name.as_str(), value.clone()))
         .chain(
-            forwarded(&request, &target.token)
+            forwarded(&request, target.token.as_deref())
                 .into_iter()
                 .map(|(name, value)| (name, value)),
         )
@@ -379,7 +431,7 @@ async fn offline(id: u32, request: &RelayRequest, send: &Sender) {
     } else {
         (
             "application/json",
-            json!({ "error": "desktop offline", "code": "DESKTOP_OFFLINE" }).to_string(),
+            json!({ "error": "desktop offline", "code": "desktop-offline" }).to_string(),
         )
     };
     respond(
@@ -465,51 +517,70 @@ mod tests {
     }
 
     #[test]
-    fn an_origin_needs_a_port_and_a_long_token() {
+    fn an_origin_names_loopback_targets_and_maybe_a_long_token() {
         let token = "t".repeat(32);
-        let origin =
-            Origin::from_body(&json!({ "port": 3001, "embedPort": 3456, "token": token })).unwrap();
+        let origin = Origin::from_body(&json!({
+            "targets": { "a": "http://127.0.0.1:3001", "e": "http://127.0.0.1:3395/" },
+            "token": token,
+        }))
+        .unwrap();
         assert_eq!(
             origin,
             Origin {
-                port: 3001,
-                embed_port: Some(3456),
-                token: token.clone()
+                targets: BTreeMap::from([("a".into(), 3001), ("e".into(), 3395)]),
+                token: Some(token.clone()),
             }
+        );
+        assert!(
+            Origin::from_body(&json!({ "targets": { "h": "http://127.0.0.1:3001" } }))
+                .unwrap()
+                .token
+                .is_none()
         );
         for body in [
             json!({ "token": token }),
-            json!({ "port": 0, "token": token }),
-            json!({ "port": 70000, "token": token }),
-            json!({ "port": "3001", "token": token }),
-            json!({ "port": 3001, "token": "short" }),
-            json!({ "port": 3001, "token": format!("{} ", "t".repeat(32)) }),
+            json!({ "targets": {} }),
+            json!({ "targets": { "d": "http://127.0.0.1:3001" } }),
+            json!({ "targets": { "a": "http://localhost:3001" } }),
+            json!({ "targets": { "a": "http://127.0.0.1:0" } }),
+            json!({ "targets": { "a": "http://127.0.0.1:70000" } }),
+            json!({ "targets": { "a": "http://127.0.0.1:3001/api" } }),
+            json!({ "targets": { "a": "https://127.0.0.1:3001" } }),
+            json!({ "targets": { "a": 3001 } }),
+            json!({ "targets": { "a": "http://127.0.0.1:3001" }, "token": "short" }),
         ] {
             assert!(Origin::from_body(&body).is_err(), "{body}");
         }
     }
 
     #[test]
-    fn the_widget_goes_to_its_proxy_and_a_dead_origin_is_forgotten() {
+    fn each_surface_has_its_target_and_a_dead_one_is_forgotten() {
         let registry = Registry::default();
         assert!(registry.target("a").is_none());
         registry.set(Origin {
-            port: 3001,
-            embed_port: Some(3456),
-            token: "one".into(),
+            targets: BTreeMap::from([("e".into(), 3395), ("h".into(), 3001)]),
+            token: None,
         });
-        assert_eq!(registry.target("e").unwrap().port, 3456);
-        assert_eq!(registry.target("h").unwrap().port, 3001);
-        // An answer about an origin registered before doesn't forget the current one.
-        registry.forget("other");
+        assert_eq!(registry.target("e").unwrap().port, 3395);
+        let webhooks = registry.target("h").unwrap();
+        assert_eq!(webhooks.port, 3001);
+        assert!(registry.target("m").is_none());
+        // An answer about a registration made before doesn't forget the current one.
+        let stale = registry.target("e").unwrap();
+        registry.set(registry.get().unwrap());
+        registry.forget(&stale);
+        assert!(registry.target("e").is_some());
+        registry.forget(&registry.target("e").unwrap());
+        assert!(registry.target("e").is_none());
         assert!(registry.registered());
-        registry.forget("one");
+        registry.forget(&registry.target("h").unwrap());
         assert!(!registry.registered());
+        let _ = webhooks;
     }
 
     #[test]
     fn relayed_requests_carry_realtimexs_forwarding_headers() {
-        let headers = forwarded(&request(), "secret");
+        let headers = forwarded(&request(), Some("secret"));
         let get = |name: &str| {
             headers
                 .iter()
@@ -523,6 +594,9 @@ mod tests {
         assert_eq!(get("x-realtimex-relay-surface"), Some("e"));
         assert_eq!(get("x-realtimex-relay-source"), Some("public-relay"));
         assert_eq!(get(ORIGIN_TOKEN_HEADER), Some("secret"));
+        assert!(!forwarded(&request(), None)
+            .iter()
+            .any(|(n, _)| *n == ORIGIN_TOKEN_HEADER));
     }
 
     #[tokio::test]
@@ -574,9 +648,8 @@ mod tests {
         });
         let registry = Registry::default();
         registry.set(Origin {
-            port,
-            embed_port: None,
-            token: "t".repeat(32),
+            targets: BTreeMap::from([("a".into(), port)]),
+            token: Some("t".repeat(32)),
         });
         let (data, mut sent) = mpsc::channel(8);
         let (control, _) = mpsc::unbounded_channel();
@@ -592,6 +665,7 @@ mod tests {
         assert!(seen.contains(&format!("host: 127.0.0.1:{port}")));
         assert!(seen.contains("x-realtimex-relay-source: public-relay"));
         assert!(seen.contains("x-realtimex-relay-surface: a"));
+        assert!(seen.contains(&format!("x-realtimex-link-origin: {}", "t".repeat(32))));
         let mut decoder = super::super::Decoder::default();
         let mut frames = Vec::new();
         while let Ok(Message::Binary(chunk)) = sent.try_recv() {

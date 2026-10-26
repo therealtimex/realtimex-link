@@ -12,13 +12,12 @@ struct Row {
     badge: (String, Tone),
 }
 
-fn number(section: &Value, name: &str) -> u64 {
-    section.get(name).and_then(Value::as_u64).unwrap_or(0)
+fn count(item: &Value) -> u64 {
+    item.get("count").and_then(Value::as_u64).unwrap_or(0)
 }
 
-fn names(section: &Value, name: &str) -> Vec<String> {
-    section
-        .get(name)
+fn names(item: &Value) -> Vec<String> {
+    item.get("names")
         .and_then(Value::as_array)
         .map(|list| {
             list.iter()
@@ -37,74 +36,78 @@ fn counted(key: &str, count: u64) -> String {
     )
 }
 
-/// The card's rows, in the prototype's order. `open`: RealTimeX runs (an origin is registered).
-fn rows(shared: &Value, open: bool) -> Vec<Row> {
+/// The card's rows from RealTimeX's items (already in the card's order, rtx-linkd's shared.rs).
+/// `open`: RealTimeX runs (an origin is registered).
+fn rows(items: &Value, open: bool) -> Vec<Row> {
     let up = || (t("shared.up"), Tone::Success);
     let offline = || (t("shared.offline"), Tone::Neutral);
     let mut rows = Vec::new();
-    if let Some(section) = shared.get("artifacts") {
-        rows.push(Row {
-            name: t("shared.artifacts"),
-            detail: counted("shared.published", number(section, "published")),
+    for item in items.as_array().into_iter().flatten() {
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+        let row = match kind {
             // Served by RealTimeX until Link serves their folders itself (realtimex-link#6 M2).
-            badge: if open { up() } else { offline() },
-        });
-    }
-    if let Some(section) = shared.get("webhooks") {
-        rows.push(Row {
-            name: t("shared.webhooks"),
-            detail: counted("shared.endpoints", number(section, "endpoints")),
-            badge: if open { up() } else { offline() },
-        });
-    }
-    if let Some(section) = shared.get("embed") {
-        let widgets = counted("shared.widgets", number(section, "widgets"));
-        let sites = names(section, "sites");
-        rows.push(Row {
-            name: t("shared.embed"),
-            detail: if !open {
-                format!("{widgets} · {}", t("shared.chatWhenOpen"))
-            } else if sites.is_empty() {
-                widgets
-            } else {
-                tf(
-                    "shared.widgetsOn",
-                    &[
-                        ("widgets", widgets.as_str()),
-                        ("sites", sites.join(", ").as_str()),
-                    ],
-                )
+            "artifacts" => Row {
+                name: t("shared.artifacts"),
+                detail: counted("shared.published", count(item)),
+                badge: if open { up() } else { offline() },
             },
-            badge: if open {
-                up()
-            } else {
-                (t("shared.chatOffline"), Tone::Neutral)
+            "webhooks" => Row {
+                name: t("shared.webhooks"),
+                detail: counted("shared.endpoints", count(item)),
+                badge: if open { up() } else { offline() },
             },
-        });
-    }
-    if let Some(section) = shared.get("mobile") {
-        let phones = counted("shared.phones", number(section, "phones"));
-        rows.push(Row {
-            name: t("shared.mobile"),
-            detail: if open {
-                phones
-            } else {
-                format!("{phones} · {}", t("shared.reconnectWhenOpen"))
-            },
-            badge: if open { up() } else { offline() },
-        });
-    }
-    if let Some(section) = shared.get("peers") {
-        let desktops = names(section, "desktops").join(", ");
-        rows.push(Row {
-            name: t("shared.peers"),
-            detail: if open {
-                desktops
-            } else {
-                format!("{desktops} · {}", t("shared.whileOpen"))
-            },
-            badge: if open { up() } else { offline() },
-        });
+            "widget" => {
+                let widgets = counted("shared.widgets", count(item));
+                let sites = names(item);
+                Row {
+                    name: t("shared.embed"),
+                    detail: if !open {
+                        format!("{widgets} · {}", t("shared.chatWhenOpen"))
+                    } else if sites.is_empty() {
+                        widgets
+                    } else {
+                        tf(
+                            "shared.widgetsOn",
+                            &[
+                                ("widgets", widgets.as_str()),
+                                ("sites", sites.join(", ").as_str()),
+                            ],
+                        )
+                    },
+                    badge: if open {
+                        up()
+                    } else {
+                        (t("shared.chatOffline"), Tone::Neutral)
+                    },
+                }
+            }
+            "mobile" => {
+                let phones = counted("shared.phones", count(item));
+                Row {
+                    name: t("shared.mobile"),
+                    detail: if open {
+                        phones
+                    } else {
+                        format!("{phones} · {}", t("shared.reconnectWhenOpen"))
+                    },
+                    badge: if open { up() } else { offline() },
+                }
+            }
+            "messaging" => {
+                let desktops = names(item).join(", ");
+                Row {
+                    name: t("shared.peers"),
+                    detail: match (open, desktops.is_empty()) {
+                        (true, _) => desktops,
+                        (false, true) => t("shared.whileOpen"),
+                        (false, false) => format!("{desktops} · {}", t("shared.whileOpen")),
+                    },
+                    badge: if open { up() } else { offline() },
+                }
+            }
+            _ => continue,
+        };
+        rows.push(row);
     }
     rows
 }
@@ -127,7 +130,7 @@ impl LinkApp {
                         if wanted {
                             self.act(
                                 ctx,
-                                "/v1/keep-running",
+                                "/v1/running",
                                 json!({ "on": true }),
                                 &t("link.turnedOn"),
                             );
@@ -175,20 +178,20 @@ impl LinkApp {
         ui: &mut egui::Ui,
         shared: Option<&Value>,
         account: Option<&Value>,
+        exposure: Option<&Value>,
     ) {
         let Some(answer) = shared else { return };
-        let Some(list) = answer.get("shared").filter(|s| {
-            s.as_object()
-                .is_some_and(|map| map.keys().any(|k| k != "account"))
-        }) else {
+        let Some(items) = answer
+            .get("items")
+            .filter(|items| items.as_array().is_some_and(|list| !list.is_empty()))
+        else {
             return;
         };
         let open = answer.get("origin") == Some(&Value::Bool(true));
-        // RealTimeX signed in to another account than Link: nothing of RealTimeX's goes through.
-        let theirs = text(list, "account");
+        // RealTimeX handed over another account than Link's: nothing of RealTimeX's goes through.
+        let other_account = exposure.map(|e| text(e, "state")).as_deref() == Some("other-account");
+        let theirs = account.map(|a| text(a, "offer")).unwrap_or_default();
         let ours = account.map(|a| text(a, "email")).unwrap_or_default();
-        let other_account =
-            !theirs.is_empty() && !ours.is_empty() && !theirs.eq_ignore_ascii_case(&ours);
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(semibold(t("shared.title")).size(15.0));
@@ -207,11 +210,7 @@ impl LinkApp {
                         "shared.otherAccount",
                         &[("realtimex", theirs.as_str()), ("link", ours.as_str())],
                     ));
-                    let offered = account
-                        .and_then(|a| a.get("offer"))
-                        .and_then(Value::as_str)
-                        .is_some();
-                    if offered
+                    if !theirs.is_empty()
                         && ui
                             .button(tf("shared.useAccount", &[("name", theirs.as_str())]))
                             .clicked()
@@ -226,7 +225,7 @@ impl LinkApp {
                     ui.label(t("shared.closed"));
                 });
             }
-            for row in rows(list, open) {
+            for row in rows(items, open) {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(semibold(&row.name));
@@ -249,19 +248,20 @@ mod tests {
 
     #[test]
     fn rows_follow_what_realtimex_pushed_and_whether_it_runs() {
-        let shared = json!({
-            "artifacts": { "published": 3 },
-            "webhooks": { "endpoints": 2 },
-            "embed": { "widgets": 1, "sites": ["support.example.com"] },
-            "peers": { "desktops": ["Office Mac", "Studio PC"] },
-        });
-        let open = rows(&shared, true);
+        let items = json!([
+            { "kind": "artifacts", "count": 3, "names": [] },
+            { "kind": "webhooks", "count": 2, "names": [] },
+            { "kind": "widget", "count": 1, "names": ["support.example.com"] },
+            { "kind": "messaging", "count": 2, "names": ["Office Mac", "Studio PC"] },
+            { "kind": "later", "count": 1 },
+        ]);
+        let open = rows(&items, true);
         assert_eq!(open.len(), 4);
         assert!(open.iter().all(|row| row.badge.1 == Tone::Success));
         assert!(open[2].detail.contains("support.example.com"));
         assert_eq!(open[3].detail, "Office Mac, Studio PC");
-        let closed = rows(&shared, false);
+        let closed = rows(&items, false);
         assert!(closed.iter().all(|row| row.badge.1 == Tone::Neutral));
-        assert!(rows(&json!({}), true).is_empty());
+        assert!(rows(&json!([]), true).is_empty());
     }
 }

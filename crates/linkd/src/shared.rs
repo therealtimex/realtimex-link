@@ -1,103 +1,84 @@
 //! "Shared from this computer" (realtimex-ai-app#2836): what RealTimeX shares through Link, as it
 //! pushes it (PUT /v1/shared), for the window's read-only card. Kept, so the card still shows
 //! while RealTimeX is closed; RealTimeX sends it again at each start. Link writes the rows' text
-//! and badges itself, from these counts and whether RealTimeX is running (relay::origin).
+//! and badges itself, from these counts and names and whether RealTimeX is running.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use crate::error::ApiError;
 use crate::store::Store;
 
 pub const KEY: &str = "shared";
+/// The rows, in the window's order.
+pub const KINDS: [&str; 5] = ["artifacts", "webhooks", "widget", "mobile", "messaging"];
 const MAX_COUNT: u64 = 1_000_000;
 const MAX_NAMES: usize = 20;
 const MAX_NAME: usize = 253;
 
-/// A count field: a whole number, or absent.
-fn count(section: &Value, name: &str) -> Result<Option<u64>, ApiError> {
-    match section.get(name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .filter(|n| *n <= MAX_COUNT)
-            .map(Some)
-            .ok_or_else(|| ApiError::bad_request(format!("{name} must be a count"))),
-    }
-}
-
-/// A list of names (sites, desktops): short strings, a few of them.
-fn names(section: &Value, name: &str) -> Result<Option<Vec<String>>, ApiError> {
-    match section.get(name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(list)) if list.len() <= MAX_NAMES => list
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .map(str::trim)
-                    .filter(|s| {
-                        !s.is_empty() && s.len() <= MAX_NAME && !s.chars().any(char::is_control)
-                    })
-                    .map(str::to_string)
-                    .ok_or_else(|| ApiError::bad_request(format!("{name} must be a list of names")))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        Some(_) => Err(ApiError::bad_request(format!(
-            "{name} must be a list of at most {MAX_NAMES} names"
-        ))),
-    }
-}
-
-/// PUT /v1/shared's body, checked and reduced to what the card shows: { account?, artifacts?:
-/// { published }, webhooks?: { endpoints }, embed?: { widgets, sites }, mobile?: { phones },
-/// peers?: { desktops } }. A section left out hides its row.
+/// PUT /v1/shared's items, checked and reduced to what the card shows: [{ kind, count, names }],
+/// one per kind, in KINDS' order. names: the widget's sites, the messaging desktops. A kind left
+/// out hides its row.
 pub fn parse(body: &Value) -> Result<Value, ApiError> {
-    let mut shared = Map::new();
-    match body.get("account") {
-        None | Some(Value::Null) => {}
-        Some(Value::String(account))
-            if !account.trim().is_empty()
-                && account.len() <= 320
-                && !account.chars().any(char::is_control) =>
-        {
-            shared.insert("account".into(), json!(account.trim()));
+    let items = body
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad_request("items must be a list"))?;
+    let mut kept: Vec<(usize, Value)> = Vec::new();
+    for item in items {
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+        let order = KINDS.iter().position(|k| *k == kind).ok_or_else(|| {
+            ApiError::bad_request(format!("kind must be one of {}", KINDS.join(", ")))
+        })?;
+        if kept.iter().any(|(o, _)| *o == order) {
+            return Err(ApiError::bad_request(format!("{kind} is listed twice")));
         }
-        Some(_) => return Err(ApiError::bad_request("account must be an email address")),
-    }
-    let sections: [(&str, &[&str], &[&str]); 5] = [
-        ("artifacts", &["published"], &[]),
-        ("webhooks", &["endpoints"], &[]),
-        ("embed", &["widgets"], &["sites"]),
-        ("mobile", &["phones"], &[]),
-        ("peers", &[], &["desktops"]),
-    ];
-    for (name, counts, lists) in sections {
-        let section = match body.get(name) {
-            None | Some(Value::Null) => continue,
-            Some(section @ Value::Object(_)) => section,
-            Some(_) => return Err(ApiError::bad_request(format!("{name} must be an object"))),
+        let count = match item.get("count") {
+            None | Some(Value::Null) => 0,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n <= MAX_COUNT)
+                .ok_or_else(|| ApiError::bad_request("count must be a whole number"))?,
         };
-        let mut kept = Map::new();
-        for field in counts {
-            kept.insert((*field).into(), json!(count(section, field)?.unwrap_or(0)));
-        }
-        for field in lists {
-            kept.insert(
-                (*field).into(),
-                json!(names(section, field)?.unwrap_or_default()),
-            );
-        }
-        shared.insert(name.into(), Value::Object(kept));
+        let names = match item.get("names") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(list)) if list.len() <= MAX_NAMES => list
+                .iter()
+                .map(|name| {
+                    name.as_str()
+                        .map(str::trim)
+                        .filter(|s| {
+                            !s.is_empty() && s.len() <= MAX_NAME && !s.chars().any(char::is_control)
+                        })
+                        .map(str::to_string)
+                        .ok_or_else(|| ApiError::bad_request("names must be short names"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(ApiError::bad_request(format!(
+                    "names must be a list of at most {MAX_NAMES}"
+                )))
+            }
+        };
+        kept.push((
+            order,
+            json!({ "kind": kind, "count": count, "names": names }),
+        ));
     }
-    Ok(Value::Object(shared))
+    kept.sort_by_key(|(order, _)| *order);
+    Ok(Value::Array(
+        kept.into_iter().map(|(_, item)| item).collect(),
+    ))
 }
 
 pub fn get(store: &Store) -> Value {
-    store.get(KEY).unwrap_or_else(|| json!({}))
+    store
+        .get(KEY)
+        .filter(Value::is_array)
+        .unwrap_or_else(|| json!([]))
 }
 
-pub fn set(store: &Store, shared: &Value) -> Result<(), ApiError> {
-    store.set(KEY, shared)?;
+pub fn set(store: &Store, items: &Value) -> Result<(), ApiError> {
+    store.set(KEY, items)?;
     Ok(())
 }
 
@@ -106,37 +87,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_cards_fields_are_kept() {
-        let shared = parse(&json!({
-            "account": " phuong@realtimex.ai ",
-            "artifacts": { "published": 3, "secret": "x" },
-            "embed": { "widgets": 1, "sites": ["support.example.com"] },
-            "peers": { "desktops": ["Office Mac", "Studio PC"] },
-            "other": { "n": 1 },
+    fn items_are_kept_in_the_cards_order() {
+        let items = parse(&json!({
+            "exposureId": "x",
+            "items": [
+                { "kind": "messaging", "count": 2, "names": ["Office Mac", " Studio PC "] },
+                { "kind": "artifacts", "count": 3, "detail": "ignored" },
+                { "kind": "widget", "count": 1, "names": ["support.example.com"] },
+            ],
         }))
         .unwrap();
         assert_eq!(
-            shared,
-            json!({
-                "account": "phuong@realtimex.ai",
-                "artifacts": { "published": 3 },
-                "embed": { "widgets": 1, "sites": ["support.example.com"] },
-                "peers": { "desktops": ["Office Mac", "Studio PC"] },
-            })
+            items,
+            json!([
+                { "kind": "artifacts", "count": 3, "names": [] },
+                { "kind": "widget", "count": 1, "names": ["support.example.com"] },
+                { "kind": "messaging", "count": 2, "names": ["Office Mac", "Studio PC"] },
+            ])
         );
-        assert_eq!(parse(&json!({})).unwrap(), json!({}));
+        assert_eq!(parse(&json!({ "items": [] })).unwrap(), json!([]));
     }
 
     #[test]
-    fn bad_fields_are_refused() {
+    fn bad_items_are_refused() {
         for body in [
-            json!({ "account": 3 }),
-            json!({ "artifacts": [] }),
-            json!({ "artifacts": { "published": -1 } }),
-            json!({ "webhooks": { "endpoints": "2" } }),
-            json!({ "peers": { "desktops": [""] } }),
-            json!({ "peers": { "desktops": ["a\nb"] } }),
-            json!({ "embed": { "sites": vec!["x"; 21] } }),
+            json!({}),
+            json!({ "items": {} }),
+            json!({ "items": [{ "kind": "shares" }] }),
+            json!({ "items": [{ "kind": "mobile" }, { "kind": "mobile" }] }),
+            json!({ "items": [{ "kind": "mobile", "count": -1 }] }),
+            json!({ "items": [{ "kind": "mobile", "count": "2" }] }),
+            json!({ "items": [{ "kind": "messaging", "names": [""] }] }),
+            json!({ "items": [{ "kind": "messaging", "names": ["a\nb"] }] }),
+            json!({ "items": [{ "kind": "widget", "names": vec!["x"; 21] }] }),
         ] {
             assert!(parse(&body).is_err(), "{body}");
         }

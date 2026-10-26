@@ -69,12 +69,59 @@ and the draft is published, as Link's latest unless a newer release is out (`ci/
   (`POST /v1/account/token`) is the quick way in: it signs Link in only while Link has no sign-in of
   its own, and after Sign out it is only offered (`POST /v1/account/use-realtimex`).
   `RTX_LINK_AUTH_ISSUER` points at another realm for development.
-- **Public Exposure:** Link enrolls its own exposure with the account's access token (only Remote Control's route),
-  and its App ID becomes that exposure's ID. Remote Control always uses Link's own App ID;
-  RealTimeX keeps its Public Exposure ID for its other features, and hands Link only the
-  signed-in account. `/hello` lists the App ID Link made for itself before its exposure
-  (`formerAppIds`), and RealTimeX moves a computer saved under it to the new one. The tunnel
-  runs on Link's own credential, so it stays up while RealTimeX is closed.
+- **Public Exposure** (realtimex-ai-app#2836): Link is this computer's only connector to
+  RealTimeX's relay (`relay.rs`). It enrolls every surface: published artifacts (`a`), the embed
+  widget (`e`), webhooks (`h`), the mobile app (`m`), desktop messaging (`p`) and Remote Control
+  (`d`, served in-process). It runs while **Keep RealTimeX Link running** is on, whatever "Allow
+  remote control" says, and stays up while RealTimeX is closed. Frames to the relay, request
+  bodies and WebSockets wait in bounded queues, and each surface has a request body limit
+  (below).
+
+### Local API for RealTimeX's Public Exposure
+
+The contract agreed with RealTimeX (realtimex-ai-app#2836, `loop-briefs/issue-2836-design.md` §6).
+All of it is on the local API (127.0.0.1, the data folder's bearer token, `POST /v1/hello` first)
+with JSON bodies; each block is a flag in `GET /v1/version`'s `features`. Error codes are
+kebab-case.
+
+- **`running`:** `GET /v1/running` → `{ on }`; `POST /v1/running { on }`. On by default. Off stops
+  the relay and remote control and removes the login item; the local API keeps answering, so
+  RealTimeX can offer Turn on. Turning it on clears an opt-out made through `POST /v1/autostart`.
+  RealTimeX turns it on only when the person asks.
+- **`exposure`:**
+  - `GET /v1/exposure` → `{ state, appId, installId, account, surfaces: { <surface>:
+    publicBaseUrl }, formerAppIds, error? }`. `state`: `off`, `other-account`, `signed-out`,
+    `connecting`, `online` or `error`. `p` is enrolled only where the Marketplace allows it.
+  - `POST /v1/exposure/adopt { exposureId, installId, account }` (`account`: the Keycloak subject)
+    → `{ appId, formerAppIds }`. RealTimeX hands its account over first (`POST /v1/account/token`)
+    and stops its connector's re-registration. Link recovers the exposure with its own token for
+    that account (the credential rotates), enrolls it with every surface under RealTimeX's install
+    ID and app ID, keeps it and connects; RealTimeX then stops its connector and counts the
+    adoption done once `GET /v1/exposure` is `online` with that `appId`. Link's previous App ID
+    joins `formerAppIds`, and its own exposure is retired once the adopted one has been online.
+    409 `other-account { linkAccount, realtimexAccount }`, `signed-out`, or `adopted-other` (one
+    RealTimeX per Link); `adopt-failed` or `exposure-not-found` when the Marketplace refuses, and
+    then nothing changed in Link. Adopting the same exposure again gives the same answer.
+- **`origin`:** `PUT /v1/origin { exposureId, targets: { a, e, h, m, p: "http://127.0.0.1:<port>" },
+  token? }`, `DELETE /v1/origin`, `GET /v1/origin` → `{ registered, targets }`. Link passes each
+  surface's requests to its target, HTTP and WebSockets (not `p`, GET and POST only), with the
+  headers RealTimeX's own connector set: `x-forwarded-host`, `x-forwarded-prefix`
+  (`/<surface>/<id>`), `x-forwarded-proto: https`, `x-forwarded-for` (the relay's client address),
+  `x-realtimex-relay-surface`, `x-realtimex-relay-source: public-relay`, and with a token
+  `x-realtimex-link-origin: <token>`. The client's own `x-forwarded-*` and `x-realtimex-*` headers
+  are dropped. Paths follow the enrollment's `pathAllowlist`, else relayConnector.cjs's defaults
+  (`p` never leaves `/api/peer/v1`). The origin is kept in memory: RealTimeX sends it at each start
+  and when Link's `startedAt` changes. With no target, or when nothing answers on it (it is then
+  forgotten), the answer is 503 `{ error: "desktop offline", code: "desktop-offline" }` with
+  `Retry-After: 30`, or a page for browsers.
+- **`shared`:** `PUT /v1/shared { exposureId, items: [{ kind, count, names? }] }` (kinds:
+  `artifacts`, `webhooks`, `widget`, `mobile`, `messaging`; `names`: the widget's sites, the
+  messaging desktops) replaces the window's read-only "Shared from this computer" card; a kind left
+  out hides its row, and Link writes the text. `GET /v1/shared` → `{ items, origin }`. Kept across
+  restarts. Up to 1 MiB.
+- `PUT /v1/origin` and `PUT /v1/shared` name the adopted exposure; any other is 409
+  `exposure-mismatch`.
+- **Public request bodies** (413 beyond): `a` and `e` 1 MiB, `h` 15 MiB, `m` 50 MiB, `p` 10 MiB.
 
 ## Build
 

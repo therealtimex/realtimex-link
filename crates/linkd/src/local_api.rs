@@ -27,6 +27,8 @@ use crate::util::same_bytes;
 /// The local API's protocol: a caller that speaks another one says so instead of misreading it.
 pub const PROTOCOL: u32 = 1;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// RealTimeX's full-list pushes (PUT /v1/shared, later /v1/artifacts and /v1/webhooks).
+const MAX_LIST_BYTES: usize = 1024 * 1024;
 pub const FEATURES: &[&str] = &[
     "host",
     "autostart",
@@ -35,11 +37,11 @@ pub const FEATURES: &[&str] = &[
     "hello",
     "appearance",
     "language",
-    // realtimex-ai-app#2836 / realtimex-link#6, M1: GET/POST /v1/keep-running; POST/DELETE/GET
-    // /v1/origin (a e h m p go to RealTimeX); POST /v1/exposure/adopt; GET/PUT /v1/shared.
-    "keep-running",
+    // realtimex-ai-app#2836 / realtimex-link#6 M1 (README): GET/POST /v1/running; GET
+    // /v1/exposure and POST /v1/exposure/adopt; PUT/DELETE/GET /v1/origin; GET/PUT /v1/shared.
+    "running",
+    "exposure",
     "origin",
-    "exposure-adopt",
     "shared",
 ];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
@@ -77,14 +79,20 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/autostart", get(autostart).post(set_autostart))
         .route("/v1/appearance", get(appearance).post(set_appearance))
         .route("/v1/window/open", post(open_window))
-        .route("/v1/keep-running", get(keep_running).post(set_keep_running))
-        .route(
-            "/v1/origin",
-            get(origin).post(set_origin).delete(clear_origin),
-        )
+        .route("/v1/running", get(running).post(set_running))
+        .route("/v1/exposure", get(exposure))
         .route("/v1/exposure/adopt", post(adopt_exposure))
         .route("/v1/exposure/notice-seen", post(exposure_notice_seen))
-        .route("/v1/shared", get(shared).put(set_shared))
+        .route(
+            "/v1/origin",
+            get(origin).put(set_origin).delete(clear_origin),
+        )
+        .route(
+            "/v1/shared",
+            get(shared)
+                .put(set_shared)
+                .layer(DefaultBodyLimit::max(MAX_LIST_BYTES)),
+        )
         .route("/v1/account", get(account))
         .route("/v1/account/token", post(account_token))
         .route("/v1/account/sign-in", post(sign_in))
@@ -226,8 +234,8 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         // The window follows it (light, dark, system) as it polls.
         "appearance": state.host.appearance(),
         "language": state.host.language(),
-        "keepRunning": state.host.settings().keep_running,
-        // { appId, adopted, surfaces, origin, notice }
+        "running": state.host.settings().keep_running,
+        // GET /v1/exposure's answer.
         "exposure": state.host.relay.exposure(),
     }))
 }
@@ -309,38 +317,57 @@ async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answe
 }
 
 /// "Keep RealTimeX Link running": { on }.
-async fn keep_running(State(state): State<Shared>) -> Answer {
+async fn running(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({ "on": state.host.settings().keep_running })))
 }
 
 /// { on: bool }: Link's own switch, which RealTimeX's Sharing page shows too. RealTimeX turns
 /// it on only when the person asks there (Turn on), never by itself.
-async fn set_keep_running(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+async fn set_running(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let on = body
         .get("on")
         .and_then(Value::as_bool)
         .ok_or_else(|| ApiError::bad_request("on must be true or false"))?;
     state.host.set_keep_running(on).await?;
-    keep_running(State(state)).await
+    running(State(state)).await
 }
 
-/// RealTimeX's servers: { registered, port, embedPort }.
+/// This computer's Public Exposure, for RealTimeX's Sharing page (relay.rs `exposure`).
+async fn exposure(State(state): State<Shared>) -> Answer {
+    Ok(Json(state.host.relay.exposure()))
+}
+
+/// One RealTimeX per Link (realtimex-ai-app#2836 C3): its pushes name the exposure Link adopted
+/// from it, and anything else is refused.
+fn same_exposure(state: &LocalState, body: &Value) -> Result<(), ApiError> {
+    let named = body.get("exposureId").and_then(Value::as_str).unwrap_or("");
+    match state.host.relay.adopted_id() {
+        Some(adopted) if adopted == named => Ok(()),
+        adopted => Err(ApiError::coded(
+            409,
+            "exposure-mismatch",
+            "This isn't the exposure RealTimeX Link carries for RealTimeX",
+        )
+        .with_details(json!({ "appId": adopted }))),
+    }
+}
+
+/// RealTimeX's servers: { registered, targets }.
 async fn origin(State(state): State<Shared>) -> Answer {
-    let origin = state.host.relay.origin.get();
-    Ok(Json(json!({
-        "registered": origin.is_some(),
-        "port": origin.as_ref().map(|o| o.port),
-        "embedPort": origin.as_ref().and_then(|o| o.embed_port),
-    })))
+    Ok(Json(crate::relay::Origin::view(
+        state.host.relay.origin.get().as_ref(),
+    )))
 }
 
-/// { port, embedPort?, token }: RealTimeX runs, and the relay's requests for its surfaces go to
-/// http://127.0.0.1:<port> (the widget's to embedPort), each with the token (relay/origin.rs).
+/// { exposureId, targets: { a, e, h, m, p: "http://127.0.0.1:<port>" }, token? }: RealTimeX
+/// runs, and the relay's requests for its surfaces go there (relay/origin.rs).
 async fn set_origin(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    same_exposure(&state, &body)?;
     let origin = crate::relay::Origin::from_body(&body).map_err(ApiError::bad_request)?;
+    let answer = crate::relay::Origin::view(Some(&origin));
     state.host.relay.origin.set(origin);
     (state.host.log)("[relay] RealTimeX registered as the origin");
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(answer))
 }
 
 /// RealTimeX is quitting: its surfaces answer "desktop offline" until it registers again.
@@ -350,20 +377,15 @@ async fn clear_origin(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({ "ok": true })))
 }
 
-/// { exposureId, installId, token, apiBase? }: take over RealTimeX's exposure, so this computer
-/// has one App ID (relay.rs `adopt`): { appId, formerAppIds }. 409 ACCOUNT_MISMATCH { linkAccount,
-/// realtimexAccount } when Link is signed in to another account.
+/// { exposureId, installId, account: <Keycloak subject> }: take over RealTimeX's exposure, so
+/// this computer has one App ID (relay.rs `adopt`): { appId, formerAppIds }. 409 other-account,
+/// signed-out or adopted-other.
 async fn adopt_exposure(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let text = |name: &str| body.get(name).and_then(Value::as_str).unwrap_or("").trim();
-    let token = text("token");
-    if token.is_empty() {
-        return Err(ApiError::bad_request("token is required"));
-    }
-    let api_base = body.get("apiBase").and_then(Value::as_str);
     let answer = state
         .host
         .relay
-        .adopt(text("exposureId"), text("installId"), token, api_base)
+        .adopt(text("exposureId"), text("installId"), text("account"))
         .await?;
     Ok(Json(answer))
 }
@@ -375,18 +397,20 @@ async fn exposure_notice_seen(State(state): State<Shared>) -> Answer {
 }
 
 /// "Shared from this computer", as RealTimeX last pushed it, and whether RealTimeX runs:
-/// { shared, origin }.
+/// { items, origin }.
 async fn shared(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({
-        "shared": crate::shared::get(&state.host.store),
+        "items": crate::shared::get(&state.host.store),
         "origin": state.host.relay.origin.registered(),
     })))
 }
 
-/// The whole list, replacing the last one (shared.rs).
+/// { exposureId, items: [{ kind, count, names? }] }: the whole list, replacing the last one
+/// (shared.rs).
 async fn set_shared(State(state): State<Shared>, Body64(body): Body64) -> Answer {
-    let shared = crate::shared::parse(&body)?;
-    crate::shared::set(&state.host.store, &shared)?;
+    same_exposure(&state, &body)?;
+    let items = crate::shared::parse(&body)?;
+    crate::shared::set(&state.host.store, &items)?;
     Ok(Json(json!({ "ok": true })))
 }
 

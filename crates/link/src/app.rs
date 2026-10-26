@@ -35,7 +35,7 @@ pub struct Snapshot {
     pub account: Option<Value>,
     /// Link's own updates (GET /v1/update).
     pub update: Option<Value>,
-    /// GET /v1/status: keepRunning, and exposure { appId, adopted, surfaces, origin, notice }.
+    /// GET /v1/status: running, and exposure (GET /v1/exposure: state, appId, notice…).
     pub status: Option<Value>,
     /// What RealTimeX shares through Link, and whether it runs (GET /v1/shared).
     pub shared: Option<Value>,
@@ -791,7 +791,7 @@ impl eframe::App for LinkApp {
                     // Link on or off comes first; off, nothing else is running to show.
                     if let Some(on) = status
                         .as_ref()
-                        .and_then(|s| s.get("keepRunning"))
+                        .and_then(|s| s.get("running"))
                         .and_then(Value::as_bool)
                     {
                         if !self.settings {
@@ -838,10 +838,20 @@ impl eframe::App for LinkApp {
                             if !signed_in && desktop::realtimex_app().is_none() {
                                 self.account_ui(ui, ctx, account.as_ref());
                                 self.this_computer_ui(ui, ctx, overview, &password);
-                                self.shared_ui(ui, shared.as_ref(), account.as_ref());
+                                self.shared_ui(
+                                    ui,
+                                    shared.as_ref(),
+                                    account.as_ref(),
+                                    status.as_ref().and_then(|s| s.get("exposure")),
+                                );
                             } else {
                                 self.this_computer_ui(ui, ctx, overview, &password);
-                                self.shared_ui(ui, shared.as_ref(), account.as_ref());
+                                self.shared_ui(
+                                    ui,
+                                    shared.as_ref(),
+                                    account.as_ref(),
+                                    status.as_ref().and_then(|s| s.get("exposure")),
+                                );
                                 self.account_ui(ui, ctx, account.as_ref());
                             }
                         }
@@ -1657,7 +1667,7 @@ impl LinkApp {
                 ),
                 Some(Confirm::TurnOffLink) => self.act(
                     ctx,
-                    "/v1/keep-running",
+                    "/v1/running",
                     json!({ "on": false }),
                     &t("link.turnedOff"),
                 ),
