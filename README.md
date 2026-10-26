@@ -91,8 +91,9 @@ kebab-case.
 - **`exposure`:**
   - `GET /v1/exposure` → `{ state, appId, installId, account, surfaces: { <surface>:
     publicBaseUrl }, formerAppIds, error? }`. `state`: `off`, `other-account`, `signed-out`,
-    `connecting`, `online` or `error` (then `error: { code, message }`). `p` is enrolled only where
-    the Marketplace allows it.
+    `connecting`, `online` or `error` (then `error: { code, message }`). `online` means connected
+    with every surface enrolled; until then Link keeps enrolling in the background. `p` is enrolled
+    only where the Marketplace allows it.
   - `POST /v1/exposure/adopt { exposureId, installId, account }` (`account`: the Keycloak subject)
     → `{ appId, formerAppIds }`. RealTimeX hands its account over first (`POST /v1/account/token`)
     and stops its connector's re-registration. Link recovers the exposure with its own token for

@@ -193,6 +193,8 @@ pub struct Relay {
     pub origin: origin::Registry,
     /// One adoption at a time.
     adopting: tokio::sync::Mutex<()>,
+    /// A task is enrolling the surfaces the exposure still lacks (`converge`).
+    converging: AtomicBool,
     /// When Link last recovered its exposure by itself: capped, so it never fights another
     /// connector (an older RealTimeX) for it.
     recoveries: Mutex<Vec<Instant>>,
@@ -221,6 +223,7 @@ impl Relay {
             origin: origin::Registry::default(),
             adopting: tokio::sync::Mutex::new(()),
             recoveries: Mutex::new(Vec::new()),
+            converging: AtomicBool::new(false),
             task: Mutex::new(None),
             routes: Mutex::new(None),
         })
@@ -417,7 +420,8 @@ impl Relay {
             "other-account"
         } else {
             match state {
-                "ready" => "online",
+                "ready" if self.complete() => "online",
+                "ready" => "connecting",
                 "error" => "error",
                 "not-set-up" => "signed-out",
                 "off" => "off",
@@ -507,7 +511,7 @@ impl Relay {
             let usable = enrolled.is_some() && !refused;
             if refused || enrolled.is_none() || stale {
                 match self.account().await {
-                    None if usable => {}
+                    None if usable => self.converge(),
                     None => {
                         self.set_status(
                             "not-set-up",
@@ -523,6 +527,7 @@ impl Relay {
                             (host.log)(&format!(
                                 "[relay] enrolling every surface failed, serving what is enrolled: {error:#}"
                             ));
+                            self.converge();
                         }
                         Err(error) => {
                             (host.log)(&format!("[relay] enrollment failed: {error:#}"));
@@ -696,18 +701,12 @@ impl Relay {
         app_id: Option<&str>,
     ) -> Result<Value, EnrollFailure> {
         let body = registration(install_id, credential.clone(), surfaces, app_id);
-        let key = format!(
-            "relay-{}",
-            hex(&Sha256::digest(
-                json!({ "installId": install_id, "surfaces": surfaces, "appName": "RealTimeX Link", "appVersion": env!("CARGO_PKG_VERSION") })
-                    .to_string()
-                    .as_bytes()
-            ))
-        );
         let url = format!("{}/v1/relay-exposures", account.api_base);
-        match api_post(&url, &account.token, &key, &body).await {
+        match api_post(&url, &account.token, &enroll_key(&body), &body).await {
             Ok(answer) => Ok(answer),
-            Err(failure) if failure.status == 409 => {
+            // Only the service asking for the credential this install lost means recovering;
+            // any other conflict (an idempotency clash, a retired install) is an error.
+            Err(failure) if failure.status == 409 && credential_required(&failure) => {
                 if !self.may_recover() {
                     return Err(EnrollFailure::Other(anyhow!(
                         "this exposure was taken back {MAX_RECOVERIES} times within an hour; \
@@ -719,14 +718,9 @@ impl Relay {
                         "the relay knows this install, but not its exposure"
                     ))
                 })?;
-                let recover_key = format!(
-                    "relay-recovery-{}",
-                    hex(&Sha256::digest(
-                        json!({ "exposureId": exposure_id, "installId": install_id })
-                            .to_string()
-                            .as_bytes()
-                    ))
-                );
+                // Each recovery is its own operation: replaying an earlier one after another
+                // connector rotated the binding is refused as superseded.
+                let recover_key = format!("relay-recovery-{}", crate::util::uuid());
                 let recovered = recover(account, exposure_id, install_id, &recover_key)
                     .await
                     .map_err(EnrollFailure::from)?;
@@ -736,7 +730,7 @@ impl Relay {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let body = registration(install_id, credential, surfaces, app_id);
-                api_post(&url, &account.token, &format!("{key}-recovered"), &body)
+                api_post(&url, &account.token, &enroll_key(&body), &body)
                     .await
                     .map_err(EnrollFailure::from)
             }
@@ -753,6 +747,67 @@ impl Relay {
         }
         recoveries.push(Instant::now());
         true
+    }
+
+    /// Whether the stored exposure carries every surface Link carries here (the ones this
+    /// Marketplace supports). Until it does, the exposure isn't `online`, an adoption isn't done
+    /// and Link's own exposure isn't retired.
+    pub fn complete(&self) -> bool {
+        self.host
+            .upgrade()
+            .and_then(|host| self.connection(&host))
+            .is_some_and(|connection| connection.carries(&self.wanted_surfaces()))
+    }
+
+    /// Keep enrolling, with backoff, until the exposure carries every surface, while the
+    /// connector goes on serving what is enrolled; then connect again with the new routes.
+    fn converge(self: &Arc<Self>) {
+        if self.converging.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let relay = self.clone();
+        tokio::spawn(async move {
+            let mut attempt = 0usize;
+            loop {
+                match relay.converge_once().await {
+                    None => break,
+                    Some(true) => {
+                        relay.restart.store(true, Ordering::SeqCst);
+                        relay.wake();
+                        break;
+                    }
+                    Some(false) => {
+                        tokio::time::sleep(Duration::from_secs(backoff(attempt))).await;
+                        attempt += 1;
+                    }
+                }
+            }
+            relay.converging.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// One try at enrolling the missing surfaces: None when there is nothing to do (complete, or
+    /// Link turned off), else whether it worked.
+    async fn converge_once(&self) -> Option<bool> {
+        let host = self.host.upgrade()?;
+        if !Self::wanted(&host) || self.complete() {
+            return None;
+        }
+        let Some(account) = self.account().await else {
+            return Some(false);
+        };
+        match self.enroll(&host, &account).await {
+            Ok(()) => {
+                lock(&self.status).needs_enrollment = false;
+                Some(self.complete())
+            }
+            Err(error) => {
+                (host.log)(&format!(
+                    "[relay] enrolling every surface failed, trying again: {error:#}"
+                ));
+                Some(false)
+            }
+        }
     }
 
     /// The exposure adopted from RealTimeX, while it is the current one.
@@ -775,7 +830,7 @@ impl Relay {
     /// and app ID, keeps it and connects. Its previous App ID becomes a former one; its own
     /// exposure is retired once the adopted one has been online. Answers { appId, formerAppIds }.
     pub async fn adopt(
-        &self,
+        self: &Arc<Self>,
         exposure_id: &str,
         install_id: &str,
         account: &str,
@@ -830,6 +885,10 @@ impl Relay {
         // One RealTimeX per Link: adopting again is the same answer, another exposure is refused.
         if let Some(adopted) = self.adopted_id() {
             if adopted == exposure_id {
+                if !self.complete() {
+                    self.converge();
+                    return Err(adopt_pending("its surfaces are still being enrolled"));
+                }
                 return Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }));
             }
             return Err(ApiError::coded(
@@ -917,12 +976,8 @@ impl Relay {
             (host.log)(&format!(
                 "[relay] enrolling the adopted exposure failed, trying again: {message}"
             ));
-            return Err(ApiError::coded(
-                503,
-                "adopt-pending",
-                format!("The exposure is Link's now; enrolling it is being retried: {message}"),
-            )
-            .retry_after(5));
+            self.converge();
+            return Err(adopt_pending(&message));
         }
         Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }))
     }
@@ -939,10 +994,9 @@ impl Relay {
     ) -> Result<(), String> {
         let mut surfaces = self.wanted_surfaces();
         let answer = loop {
-            let key = format!("relay-adopt-enroll-{}", crate::util::uuid());
             let url = format!("{}/v1/relay-exposures", token.api_base);
             let body = registration(install_id, Some(credential.to_string()), &surfaces, app_id);
-            match api_post(&url, &token.token, &key, &body).await {
+            match api_post(&url, &token.token, &enroll_key(&body), &body).await {
                 Ok(answer) => break answer,
                 Err(failure) => match EnrollFailure::from(failure) {
                     EnrollFailure::Unsupported(surface) if surfaces.contains(&surface.as_str()) => {
@@ -968,6 +1022,10 @@ impl Relay {
         let Some(host) = self.host.upgrade() else {
             return;
         };
+        // Only once the adopted exposure carries everything (Remote Control too).
+        if !self.complete() {
+            return;
+        }
         let Some(id) = host
             .store
             .get(keys::ADOPTED)
@@ -1435,6 +1493,31 @@ fn registration(
         "osPlatform": os_platform(),
         "surfaces": surfaces,
     })
+}
+
+/// 503 adopt-pending: the exposure is Link's, and enrolling all of its surfaces is retried.
+fn adopt_pending(why: &str) -> crate::error::ApiError {
+    crate::error::ApiError::coded(
+        503,
+        "adopt-pending",
+        format!("The exposure is Link's now; enrolling it is being retried: {why}"),
+    )
+    .retry_after(5)
+}
+
+/// The Idempotency-Key of a registration: the whole body's digest (the credential and app ID
+/// too), so only a retry of the very same request shares it.
+fn enroll_key(body: &Value) -> String {
+    format!(
+        "relay-{}",
+        hex(&Sha256::digest(body.to_string().as_bytes()))
+    )
+}
+
+/// The service's 409 for an install that must present the credential it lost ("Existing installs
+/// must present their connectorCredential; use recovery if lost").
+fn credential_required(failure: &ApiFailure) -> bool {
+    failure.message.contains("connectorCredential")
 }
 
 /// POST /v1/relay-exposures/{id}/recover: the exposure bound to `install_id` with a new
@@ -2520,6 +2603,302 @@ mod tests {
             assert!(
                 delay >= (base as f64 * 0.8) as u64 && delay <= (base as f64 * 1.2).ceil() as u64
             );
+        }
+    }
+    // --- against a Marketplace on loopback ---------------------------------------------
+
+    /// One request the fake Marketplace saw: (method, path, Idempotency-Key, body).
+    type Seen = Arc<Mutex<Vec<(String, String, String, Value)>>>;
+
+    /// A Marketplace on 127.0.0.1 answering with `answer(method, path, body, how many times this
+    /// method and path were asked before)`: its base URL and what it saw.
+    async fn marketplace(
+        answer: impl Fn(&str, &str, &Value, usize) -> (u16, Value) + Send + Sync + 'static,
+    ) -> (String, Seen) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Seen = Arc::default();
+        let answer = Arc::new(answer);
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let (answer, log) = (answer.clone(), log.clone());
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(socket);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut parts = line.split_whitespace();
+                        let method = parts.next().unwrap_or("").to_string();
+                        let path = parts.next().unwrap_or("").to_string();
+                        let (mut length, mut key) = (0usize, String::new());
+                        loop {
+                            let mut header = String::new();
+                            reader.read_line(&mut header).await.unwrap();
+                            let header = header.trim_end();
+                            if header.is_empty() {
+                                break;
+                            }
+                            let (name, value) = header.split_once(':').unwrap_or((header, ""));
+                            match name.to_ascii_lowercase().as_str() {
+                                "content-length" => length = value.trim().parse().unwrap_or(0),
+                                "idempotency-key" => key = value.trim().to_string(),
+                                _ => {}
+                            }
+                        }
+                        let mut body = vec![0u8; length];
+                        reader.read_exact(&mut body).await.unwrap();
+                        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let before = {
+                            let mut log = log.lock().unwrap();
+                            let before = log
+                                .iter()
+                                .filter(|(m, p, _, _)| *m == method && *p == path)
+                                .count();
+                            log.push((method.clone(), path.clone(), key, body.clone()));
+                            before
+                        };
+                        let (status, reply) = answer(&method, &path, &body, before);
+                        let reply = reply.to_string();
+                        let head = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                            reply.len()
+                        );
+                        let socket = reader.get_mut();
+                        if socket.write_all(head.as_bytes()).await.is_err()
+                            || socket.write_all(reply.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    /// An exposure view as the Marketplace answers it, with these surfaces and credential.
+    fn view(exposure_id: &str, surfaces: &[&str], credential: &str) -> Value {
+        json!({
+            "exposureId": exposure_id,
+            "appId": "rtx-app",
+            "connector": { "url": "wss://relay.example/connect", "credential": credential },
+            "surfaces": surfaces.iter().map(|s| json!({
+                "surface": s,
+                "hostname": "x.realtimex.ai",
+                "pathPrefix": format!("/{s}/{exposure_id}"),
+                "publicBaseUrl": format!("https://x.realtimex.ai/{s}/{exposure_id}/"),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// A Host in a temporary folder, signed in (as RealTimeX's handover) to account `u1` against
+    /// the Marketplace at `base`, with Link's own d-only exposure.
+    fn signed_in_host(dir: &std::path::Path, base: &str) -> Arc<Host> {
+        use base64::Engine;
+        let host = Host::new(
+            Arc::new(crate::store::Store::open(dir).unwrap()),
+            crate::secret_box::SecretBox::new(dir),
+            crate::backend::Backend::with_detected(crate::backend::Detected {
+                binary: None,
+                reason: Some("test".into()),
+                code: None,
+            }),
+            0,
+            Arc::new(|_: &str| {}),
+        );
+        host.load_identity().unwrap();
+        *lock(&host.relay.api_base) = Some(base.to_string());
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"u1","email":"u1@example.com","exp":4000000000}"#);
+        host.relay.set_account(&format!("h.{claims}.s")).unwrap();
+        host.relay
+            .save(&host, &view("linkOwn", &["d"], "own-credential"))
+            .unwrap();
+        host.store
+            .set(keys::INSTALL_ID, &json!("link-install"))
+            .unwrap();
+        host
+    }
+
+    async fn eventually(what: &str, check: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("never: {what}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_adoption_whose_enrollment_fails_converges_before_it_counts() {
+        let all = ["a", "e", "h", "m", "p", "d"];
+        let (base, seen) = marketplace(move |method, path, _, before| match (method, path) {
+            // RealTimeX's exposure as it was: no Remote Control.
+            ("POST", "/v1/relay-exposures/rtxExposure/recover") => {
+                (200, view("rtxExposure", &["a", "e", "h", "m"], "recovered"))
+            }
+            // The Marketplace is down twice, then fine.
+            ("POST", "/v1/relay-exposures") if before < 2 => (503, json!({ "message": "busy" })),
+            ("POST", "/v1/relay-exposures") => (200, view("rtxExposure", &all, "recovered")),
+            ("DELETE", "/v1/relay-exposures/linkOwn") => (200, json!({})),
+            _ => (404, json!({ "message": "unexpected" })),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+
+        let pending = relay
+            .adopt("rtxExposure", "rtx-install", "u1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (pending.status, pending.code.as_deref()),
+            (503, Some("adopt-pending"))
+        );
+        // The exposure is Link's from the recovery on, but not complete.
+        assert_eq!(relay.exposure_id().as_deref(), Some("rtxExposure"));
+        assert_eq!(host.store.get(keys::INSTALL_ID), Some(json!("rtx-install")));
+        assert!(!relay.complete());
+        // A healthy connector serving what is enrolled is not "online", and retires nothing.
+        relay.set_status("ready", None);
+        assert_eq!(relay.exposure()["state"], "connecting");
+        relay.retire_own();
+        // Adopting again while incomplete is still pending.
+        let again = relay
+            .adopt("rtxExposure", "rtx-install", "u1")
+            .await
+            .unwrap_err();
+        assert_eq!(again.code.as_deref(), Some("adopt-pending"));
+
+        // The Marketplace recovers: enrollment converges by itself.
+        eventually("every surface enrolled", || relay.complete()).await;
+        assert!(relay.restart.load(Ordering::SeqCst));
+        assert_eq!(relay.exposure()["state"], "online");
+        let ok = relay
+            .adopt("rtxExposure", "rtx-install", "u1")
+            .await
+            .unwrap();
+        assert_eq!(ok["appId"], "rtxExposure");
+        assert!(ok["formerAppIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("linkOwn")));
+
+        let enrolls: Vec<(String, Value)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _, _)| m == "POST" && p == "/v1/relay-exposures")
+            .map(|(_, _, key, body)| (key.clone(), body.clone()))
+            .collect();
+        assert!(enrolls.len() >= 3, "{enrolls:?}");
+        for (key, body) in &enrolls {
+            // Every update keeps the exposure's app ID and carries Remote Control.
+            assert_eq!(body["appId"], "rtx-app");
+            assert_eq!(body["installId"], "rtx-install");
+            assert!(body["surfaces"].as_array().unwrap().contains(&json!("d")));
+            // A retry of the same request is the same operation.
+            assert_eq!(key, &enrolls[0].0);
+        }
+        // Only now is Link's own exposure retired.
+        let deleted = || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|(m, p, _, _)| m == "DELETE" && p == "/v1/relay-exposures/linkOwn")
+        };
+        assert!(!deleted());
+        relay.retire_own();
+        eventually("Link's own exposure retired", deleted).await;
+        eventually("retiring recorded", || {
+            host.store.get(keys::ADOPTED).unwrap()["retire"].is_null()
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_takeover_is_its_own_recovery_and_other_conflicts_never_recover() {
+        let (base, seen) = marketplace(|method, path, body, before| match (method, path) {
+            ("POST", "/v1/relay-exposures/linkOwn/recover") => (
+                200,
+                view("linkOwn", &["d"], &format!("fresh-{before}")),
+            ),
+            ("POST", "/v1/relay-exposures") => match body["connectorCredential"].as_str() {
+                Some("taken") => (
+                    409,
+                    json!({ "message": "Existing installs must present their connectorCredential; use recovery if lost" }),
+                ),
+                Some("clash") => (
+                    409,
+                    json!({ "message": "Idempotency-Key was already used for another request" }),
+                ),
+                Some(credential) => (200, view("linkOwn", &SURFACES, credential)),
+                None => (400, json!({ "message": "no credential" })),
+            },
+            _ => (404, json!({ "message": "unexpected" })),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = signed_in_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let account = relay.account().await.unwrap();
+        let set_credential = |credential: &str| {
+            host.store
+                .set(keys::CREDENTIAL, &host.seal_secret(credential).unwrap())
+                .unwrap();
+        };
+        // Another connector took the exposure, twice.
+        for _ in 0..2 {
+            set_credential("taken");
+            relay.enroll(&host, &account).await.unwrap();
+        }
+        let recoveries: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p, _, _)| p.ends_with("/recover"))
+            .map(|(_, _, key, _)| key.clone())
+            .collect();
+        assert_eq!(recoveries.len(), 2);
+        assert_ne!(recoveries[0], recoveries[1]);
+        // An idempotency clash is an error, never a lost credential.
+        set_credential("clash");
+        assert!(relay.enroll(&host, &account).await.is_err());
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, p, _, _)| p.ends_with("/recover"))
+                .count(),
+            2
+        );
+        // A third takeover within the hour is still recovered; a fourth is one too many: no fight.
+        set_credential("taken");
+        relay.enroll(&host, &account).await.unwrap();
+        set_credential("taken");
+        let capped = relay.enroll(&host, &account).await.unwrap_err();
+        assert!(format!("{capped:#}").contains("taken back"), "{capped:#}");
+    }
+
+    #[test]
+    fn only_the_same_registration_shares_an_idempotency_key() {
+        let body = registration("i", Some("one".into()), &SURFACES, Some("app"));
+        assert_eq!(enroll_key(&body), enroll_key(&body.clone()));
+        for other in [
+            registration("i", Some("two".into()), &SURFACES, Some("app")),
+            registration("i", Some("one".into()), &["d"], Some("app")),
+            registration("i", Some("one".into()), &SURFACES, None),
+        ] {
+            assert_ne!(enroll_key(&body), enroll_key(&other));
         }
     }
 }
