@@ -95,6 +95,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 const RECONNECT_DELAYS: [u64; 6] = [1, 2, 5, 10, 30, 60];
 const CLOSE_AUTH_FAILED: u16 = 4401;
+/// Recovering by itself (the relay refused the credential, or the service wants it) at most this
+/// often: past it something else keeps taking the exposure, and Link shows an error instead.
+const MAX_RECOVERIES: usize = 3;
+const RECOVERY_WINDOW: Duration = Duration::from_secs(60 * 60);
 const CLOSE_ALREADY_ACTIVE: u16 = 4409;
 const API_TIMEOUT: Duration = Duration::from_secs(60);
 const HOP_BY_HOP: [&str; 8] = [
@@ -189,6 +193,9 @@ pub struct Relay {
     pub origin: origin::Registry,
     /// One adoption at a time.
     adopting: tokio::sync::Mutex<()>,
+    /// When Link last recovered its exposure by itself: capped, so it never fights another
+    /// connector (an older RealTimeX) for it.
+    recoveries: Mutex<Vec<Instant>>,
     task: Mutex<Option<JoinHandle<()>>>,
     /// The routes of the open connection, so revoking a client ends its relayed sessions too.
     routes: Mutex<Option<Arc<PublicRoutes>>>,
@@ -213,6 +220,7 @@ impl Relay {
             unsupported: Mutex::new(HashSet::new()),
             origin: origin::Registry::default(),
             adopting: tokio::sync::Mutex::new(()),
+            recoveries: Mutex::new(Vec::new()),
             task: Mutex::new(None),
             routes: Mutex::new(None),
         })
@@ -433,7 +441,13 @@ impl Relay {
             "notice": notice,
         });
         if state == "error" {
-            answer["error"] = json!(detail);
+            let message = detail.unwrap_or_default();
+            let code = if message.starts_with("this exposure was taken back") {
+                "recovery-capped"
+            } else {
+                "relay-error"
+            };
+            answer["error"] = json!({ "code": code, "message": message });
         }
         answer
     }
@@ -694,6 +708,12 @@ impl Relay {
         match api_post(&url, &account.token, &key, &body).await {
             Ok(answer) => Ok(answer),
             Err(failure) if failure.status == 409 => {
+                if !self.may_recover() {
+                    return Err(EnrollFailure::Other(anyhow!(
+                        "this exposure was taken back {MAX_RECOVERIES} times within an hour; \
+                         another app (an older RealTimeX?) uses it"
+                    )));
+                }
                 let exposure_id = exposure_id.ok_or_else(|| {
                     EnrollFailure::Other(anyhow!(
                         "the relay knows this install, but not its exposure"
@@ -722,6 +742,17 @@ impl Relay {
             }
             Err(failure) => Err(failure.into()),
         }
+    }
+
+    /// Whether Link may recover its exposure by itself now (and counts it).
+    fn may_recover(&self) -> bool {
+        let mut recoveries = lock(&self.recoveries);
+        recoveries.retain(|at| at.elapsed() < RECOVERY_WINDOW);
+        if recoveries.len() >= MAX_RECOVERIES {
+            return false;
+        }
+        recoveries.push(Instant::now());
+        true
     }
 
     /// The exposure adopted from RealTimeX, while it is the current one.
@@ -835,42 +866,15 @@ impl Relay {
             .get("appId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        // Every surface on the adopted exposure, with its app ID, before anything is kept.
-        let mut surfaces = self.wanted_surfaces();
-        let answer = loop {
-            let key = format!("relay-adopt-enroll-{}", crate::util::uuid());
-            let url = format!("{}/v1/relay-exposures", token.api_base);
-            let body = registration(
-                install_id,
-                Some(credential.clone()),
-                &surfaces,
-                app_id.as_deref(),
-            );
-            match api_post(&url, &token.token, &key, &body).await {
-                Ok(answer) => break answer,
-                Err(failure) => match EnrollFailure::from(failure) {
-                    EnrollFailure::Unsupported(surface) if surfaces.contains(&surface.as_str()) => {
-                        surfaces.retain(|s| *s != surface);
-                        lock(&self.unsupported).insert(surface);
-                    }
-                    EnrollFailure::Unsupported(surface) => {
-                        return Err(failed(format!(
-                            "the relay service refused surface {surface}"
-                        )))
-                    }
-                    EnrollFailure::Other(error) => return Err(failed(format!("{error:#}"))),
-                },
-            }
-        };
-        if answer.get("exposureId").and_then(Value::as_str) != Some(exposure_id) {
-            return Err(failed("the relay service enrolled another exposure".into()));
-        }
+        // From here the exposure is Link's: its credential rotated, so RealTimeX can no longer
+        // connect with its own. It is kept at once; enrolling every surface follows, and if
+        // that fails now the relay loop keeps trying (the exposure counts as stale).
         let mut former = strings(host.store.get(keys::FORMER_IDS).as_ref());
         if !former.contains(&previous) {
             former.push(previous.clone());
         }
         former.retain(|id| id != exposure_id);
-        let (exposure, sealed) = self.stored(&host, &answer).map_err(ApiError::from)?;
+        let (exposure, sealed) = self.stored(&host, &recovered).map_err(ApiError::from)?;
         let mut values = vec![
             (keys::EXPOSURE, exposure),
             (keys::INSTALL_ID, json!(install_id)),
@@ -897,9 +901,66 @@ impl Relay {
         (host.log)(&format!(
             "[relay] adopted RealTimeX's exposure {exposure_id} (was {previous})"
         ));
+        let enrolled = self
+            .enroll_adopted(
+                &host,
+                &token,
+                exposure_id,
+                install_id,
+                &credential,
+                app_id.as_deref(),
+            )
+            .await;
         self.restart.store(true, Ordering::SeqCst);
         self.wake();
+        if let Err(message) = enrolled {
+            (host.log)(&format!(
+                "[relay] enrolling the adopted exposure failed, trying again: {message}"
+            ));
+            return Err(ApiError::coded(
+                503,
+                "adopt-pending",
+                format!("The exposure is Link's now; enrolling it is being retried: {message}"),
+            )
+            .retry_after(5));
+        }
         Ok(json!({ "appId": exposure_id, "formerAppIds": host.former_app_ids() }))
+    }
+
+    /// Every surface on the adopted exposure, with its app ID (an update without it clears it).
+    async fn enroll_adopted(
+        &self,
+        host: &Host,
+        token: &Account,
+        exposure_id: &str,
+        install_id: &str,
+        credential: &str,
+        app_id: Option<&str>,
+    ) -> Result<(), String> {
+        let mut surfaces = self.wanted_surfaces();
+        let answer = loop {
+            let key = format!("relay-adopt-enroll-{}", crate::util::uuid());
+            let url = format!("{}/v1/relay-exposures", token.api_base);
+            let body = registration(install_id, Some(credential.to_string()), &surfaces, app_id);
+            match api_post(&url, &token.token, &key, &body).await {
+                Ok(answer) => break answer,
+                Err(failure) => match EnrollFailure::from(failure) {
+                    EnrollFailure::Unsupported(surface) if surfaces.contains(&surface.as_str()) => {
+                        surfaces.retain(|s| *s != surface);
+                        lock(&self.unsupported).insert(surface);
+                    }
+                    EnrollFailure::Unsupported(surface) => {
+                        return Err(format!("the relay service refused surface {surface}"))
+                    }
+                    EnrollFailure::Other(error) => return Err(format!("{error:#}")),
+                },
+            }
+        };
+        if answer.get("exposureId").and_then(Value::as_str) != Some(exposure_id) {
+            return Err("the relay service enrolled another exposure".into());
+        }
+        self.save(host, &answer)
+            .map_err(|error| format!("{error:#}"))
     }
 
     /// The adopted exposure is online: Link's own one goes (tombstoned), once.

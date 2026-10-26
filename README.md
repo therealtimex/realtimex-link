@@ -91,7 +91,8 @@ kebab-case.
 - **`exposure`:**
   - `GET /v1/exposure` → `{ state, appId, installId, account, surfaces: { <surface>:
     publicBaseUrl }, formerAppIds, error? }`. `state`: `off`, `other-account`, `signed-out`,
-    `connecting`, `online` or `error`. `p` is enrolled only where the Marketplace allows it.
+    `connecting`, `online` or `error` (then `error: { code, message }`). `p` is enrolled only where
+    the Marketplace allows it.
   - `POST /v1/exposure/adopt { exposureId, installId, account }` (`account`: the Keycloak subject)
     → `{ appId, formerAppIds }`. RealTimeX hands its account over first (`POST /v1/account/token`)
     and stops its connector's re-registration. Link recovers the exposure with its own token for
@@ -100,8 +101,13 @@ kebab-case.
     adoption done once `GET /v1/exposure` is `online` with that `appId`. Link's previous App ID
     joins `formerAppIds`, and its own exposure is retired once the adopted one has been online.
     409 `other-account { linkAccount, realtimexAccount }`, `signed-out`, or `adopted-other` (one
-    RealTimeX per Link); `adopt-failed` or `exposure-not-found` when the Marketplace refuses, and
-    then nothing changed in Link. Adopting the same exposure again gives the same answer.
+    RealTimeX per Link); `adopt-failed` or `exposure-not-found` when the Marketplace refuses the
+    recovery, and then nothing changed in Link. Once recovered the exposure is Link's: if enrolling
+    it fails then, the answer is 503 `adopt-pending` and Link keeps trying (RealTimeX never recovers
+    it again; it waits for `online`). Adopting the same exposure again gives the same answer.
+    Link recovers an exposure by itself at most 3 times an hour; past that `GET /v1/exposure` is
+    `error` with `error: { code: "recovery-capped", message }` (another app, such as an older
+    RealTimeX, keeps taking it) instead of a fight.
 - **`origin`:** `PUT /v1/origin { exposureId, targets: { a, e, h, m, p: "http://127.0.0.1:<port>" },
   token? }`, `DELETE /v1/origin`, `GET /v1/origin` → `{ registered, targets }`. Link passes each
   surface's requests to its target, HTTP and WebSockets (not `p`, GET and POST only), with the
