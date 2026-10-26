@@ -150,10 +150,16 @@ def template(tray):
     return from_pixels(tray.size, out)
 
 
-def write_rgba(image, size, name, resample=Image.LANCZOS):
+def write_rgba(image, size, name, resample=Image.LANCZOS, inner=None):
     os.makedirs(RGBA_DIR, exist_ok=True)
     # Premultiplied while scaling, so the transparent pixels' colour doesn't bleed into the edges.
-    resized = image.convert("RGBa").resize((size, size), resample).convert("RGBA")
+    resized = image.convert("RGBa").resize((inner or size,) * 2, resample).convert("RGBA")
+    if inner:
+        # Drawn smaller, centred on the full canvas (transparent around it).
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        offset = (size - inner) // 2
+        canvas.paste(resized, (offset, offset))
+        resized = canvas
     with open(os.path.join(RGBA_DIR, name), "wb") as handle:
         handle.write(resized.tobytes())
 
@@ -190,7 +196,10 @@ def main():
     # The tray icons are scaled down by area (box): fine detail averages out instead of ringing.
     tray = without_background(windows[0])
     write_rgba(tray, 32, "tray-32.rgba", Image.BOX)
-    write_rgba(template(tray), 44, "tray-template-44.rgba", Image.BOX)
+    # macOS: the menu bar's 22 pt at 2x, the icon drawn at 16 pt in it (32 px), as RealTimeX's
+    # own tray icon is (frontend/assets/tray-icon.png shown at 16 pt), so the two side by side
+    # are the same size and weight.
+    write_rgba(template(tray), 44, "tray-template-44.rgba", Image.BOX, inner=32)
     print("icons written to assets/ and crates/link/icons/")
 
 
