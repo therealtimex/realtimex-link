@@ -1,14 +1,14 @@
-# Temporary: check and start AnyDesk's service on the M4 runner so the Human can log in there.
-m4-anydesk:
+# Temporary: why Link's keychain check behaves differently on the M4 (read-only diagnostics).
+m4-keychain-diag:
   tags: [usa-macmini-m4]
   script:
     - |
-      whoami; sw_vers -productVersion; uptime
-      echo "console user = $(stat -f %Su /dev/console)"
-      ls /Library/LaunchDaemons /Library/LaunchAgents 2>/dev/null | grep -i anydesk || echo "no anydesk launchd plists"
-      pgrep -lf -i anydesk || echo "anydesk not running"
-      (sudo -n true 2>/dev/null && echo "sudo yes") || echo "sudo no"
-      for s in $(ls /Library/LaunchDaemons 2>/dev/null | grep -i anydesk | sed 's/\.plist$//'); do
-        echo "kickstart $s"; sudo -n launchctl kickstart -k "system/$s" && echo started || echo "kickstart failed"
-      done
-      sleep 5; pgrep -lf -i anydesk || echo "anydesk still not running"
+      echo "user=$(whoami) HOME=$HOME console=$(stat -f %Su /dev/console)"
+      echo "launchd session = $(launchctl managername 2>&1)"
+      echo "gitlab-runner launchd jobs:"; ls /Library/LaunchDaemons ~/Library/LaunchAgents 2>/dev/null | grep -i gitlab || true
+      echo "keychain search list:"; security list-keychains
+      echo "default keychain:"; security default-keychain
+      ls -l ~/Library/Keychains/ | grep -i login || true
+      security show-keychain-info Login.keychain; echo "show-keychain-info Login.keychain exit=$?"
+      security show-keychain-info login.keychain-db; echo "show-keychain-info login.keychain-db exit=$?"
+      echo "codesign identities:"; security find-identity -v -p codesigning | grep -c "Developer ID Application"
