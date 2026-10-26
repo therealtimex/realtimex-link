@@ -1,6 +1,9 @@
 //! The daemon's own state: one SQLite file in its data folder, the same remote-host.db the
 //! daemon keeps: a `meta` table and a `state` table of JSON values under
 //! the keys the plugin used for its state files (clients, settings…).
+//!
+//! Schema 2 (realtimex-ai-app#2836 M3) adds `inbox`: webhook deliveries Link kept while RealTimeX
+//! wasn't running, until RealTimeX acknowledges them (inbox.rs).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -12,7 +15,7 @@ use serde_json::Value;
 use crate::files;
 use crate::util::iso_now;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const DB_FILE: &str = "remote-host.db";
 
 #[derive(Debug)]
@@ -60,6 +63,22 @@ impl Store {
         if version < 1 {
             db.execute_batch(
                 "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            )?;
+        }
+        if version < 2 {
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS inbox (
+                    id TEXT PRIMARY KEY,
+                    endpoint TEXT NOT NULL,
+                    received_at INTEGER NOT NULL,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    headers TEXT NOT NULL,
+                    body BLOB NOT NULL,
+                    size INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS inbox_endpoint ON inbox (endpoint, received_at);
+                 CREATE INDEX IF NOT EXISTS inbox_received ON inbox (received_at);",
             )?;
         }
         set_meta(&db, "schema_version", &SCHEMA_VERSION.to_string())?;
@@ -128,6 +147,136 @@ impl Store {
     }
 }
 
+/// A webhook delivery as the inbox keeps it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Delivery {
+    pub id: String,
+    /// The endpoint's URL token.
+    pub endpoint: String,
+    /// Milliseconds since the epoch.
+    pub received_at: i64,
+    pub method: String,
+    /// The local path and query, as RealTimeX's route sees it (/wh/<token>?…).
+    pub path: String,
+    /// [[name, value], …], in the order received.
+    pub headers: Value,
+    pub body: Vec<u8>,
+}
+
+/// Why a delivery wasn't kept.
+#[derive(Debug, PartialEq)]
+pub enum InboxRefusal {
+    /// The endpoint already holds `deliveries` deliveries or `bytes` bytes.
+    Full { deliveries: u64, bytes: u64 },
+}
+
+impl Store {
+    /// Keep a delivery, unless its endpoint is at its quota (checked and written together).
+    pub fn inbox_add(
+        &self,
+        delivery: &Delivery,
+        max_deliveries: u64,
+        max_bytes: u64,
+    ) -> Result<std::result::Result<(), InboxRefusal>> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (count, bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM inbox WHERE endpoint = ?1",
+            [&delivery.endpoint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let size = delivery.body.len() as u64;
+        if count as u64 >= max_deliveries || bytes as u64 + size > max_bytes {
+            return Ok(Err(InboxRefusal::Full {
+                deliveries: count as u64,
+                bytes: bytes as u64,
+            }));
+        }
+        tx.execute(
+            "INSERT INTO inbox (id, endpoint, received_at, method, path, headers, body, size) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                delivery.id,
+                delivery.endpoint,
+                delivery.received_at,
+                delivery.method,
+                delivery.path,
+                delivery.headers.to_string(),
+                delivery.body,
+                size as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Ok(()))
+    }
+
+    /// Up to `limit` deliveries, oldest first, after `after` (a delivery's id, from an earlier
+    /// page), and how many are kept in all.
+    pub fn inbox_list(&self, after: Option<&str>, limit: usize) -> Result<(Vec<Delivery>, u64)> {
+        let db = self.db();
+        let start: Option<(i64, String)> = match after {
+            Some(id) => db
+                .query_row(
+                    "SELECT received_at, id FROM inbox WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?,
+            None => None,
+        };
+        let (at, id) = start.unwrap_or((i64::MIN, String::new()));
+        let mut statement = db.prepare(
+            "SELECT id, endpoint, received_at, method, path, headers, body FROM inbox \
+             WHERE received_at > ?1 OR (received_at = ?1 AND id > ?2) \
+             ORDER BY received_at, id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![at, id, limit as i64], |row| {
+            let headers: String = row.get(5)?;
+            Ok(Delivery {
+                id: row.get(0)?,
+                endpoint: row.get(1)?,
+                received_at: row.get(2)?,
+                method: row.get(3)?,
+                path: row.get(4)?,
+                headers: serde_json::from_str(&headers).unwrap_or(Value::Array(Vec::new())),
+                body: row.get(6)?,
+            })
+        })?;
+        let deliveries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let total: i64 = db.query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))?;
+        Ok((deliveries, total as u64))
+    }
+
+    /// How many deliveries each endpoint holds: { token: count }.
+    pub fn inbox_counts(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let db = self.db();
+        let mut statement = db.prepare("SELECT endpoint, COUNT(*) FROM inbox GROUP BY endpoint")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// RealTimeX has these: they go. Answers how many went.
+    pub fn inbox_ack(&self, ids: &[String]) -> Result<usize> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let mut removed = 0;
+        for id in ids {
+            removed += tx.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Deliveries received before `before` (ms) go: the inbox keeps them for a while only.
+    pub fn inbox_prune(&self, before: i64) -> Result<usize> {
+        Ok(self
+            .db()
+            .execute("DELETE FROM inbox WHERE received_at < ?1", [before])?)
+    }
+}
+
 fn set_state(db: &Connection, key: &str, value: &Value) -> Result<()> {
     if value.is_null() {
         bail!("No value to save for {key}");
@@ -163,7 +312,7 @@ mod tests {
         drop(store);
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.get("clients"), Some(json!([{ "id": "c1" }])));
-        assert_eq!(store.meta_get("schema_version").as_deref(), Some("1"));
+        assert_eq!(store.meta_get("schema_version").as_deref(), Some("2"));
         assert_eq!(store.meta_get("legacy_import").as_deref(), Some("{}"));
         #[cfg(unix)]
         {
@@ -185,6 +334,91 @@ mod tests {
             .unwrap();
         let error = Store::open(dir.path()).err().unwrap();
         assert_eq!(error.downcast_ref::<StoreTooNew>().map(|e| e.0), Some(9));
+    }
+
+    fn delivery(id: &str, endpoint: &str, at: i64, body: &[u8]) -> Delivery {
+        Delivery {
+            id: id.into(),
+            endpoint: endpoint.into(),
+            received_at: at,
+            method: "POST".into(),
+            path: format!("/wh/{endpoint}"),
+            headers: json!([["content-type", "application/json"]]),
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_version_1_store_gains_the_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store
+                .set("settings", &json!({ "allowIncoming": true }))
+                .unwrap();
+            store.db().execute_batch("DROP TABLE inbox").unwrap();
+            store.meta_set("schema_version", "1").unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.meta_get("schema_version").as_deref(), Some("2"));
+        assert_eq!(
+            store.get("settings"),
+            Some(json!({ "allowIncoming": true }))
+        );
+        assert_eq!(store.inbox_list(None, 10).unwrap().1, 0);
+    }
+
+    #[test]
+    fn the_inbox_keeps_pages_quotas_acks_and_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for (i, at) in [(1, 100), (2, 100), (3, 200)] {
+            assert_eq!(
+                store
+                    .inbox_add(&delivery(&format!("d{i}"), "tok", at, b"{}"), 10, 1000)
+                    .unwrap(),
+                Ok(())
+            );
+        }
+        store
+            .inbox_add(&delivery("e1", "other", 150, b"x"), 10, 1000)
+            .unwrap()
+            .unwrap();
+        // Oldest first, a page at a time.
+        let (page, total) = store.inbox_list(None, 2).unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(
+            page.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["d1", "d2"]
+        );
+        assert_eq!(page[0], delivery("d1", "tok", 100, b"{}"));
+        let (page, _) = store.inbox_list(Some("d2"), 10).unwrap();
+        assert_eq!(
+            page.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["e1", "d3"]
+        );
+        // The quota is per endpoint, by count and by bytes.
+        assert!(matches!(
+            store
+                .inbox_add(&delivery("d4", "tok", 300, b"{}"), 3, 1000)
+                .unwrap(),
+            Err(InboxRefusal::Full { deliveries: 3, .. })
+        ));
+        assert!(matches!(
+            store
+                .inbox_add(&delivery("d4", "tok", 300, b"0123456789"), 10, 15)
+                .unwrap(),
+            Err(InboxRefusal::Full { bytes: 6, .. })
+        ));
+        assert_eq!(store.inbox_counts().unwrap()["tok"], 3);
+        assert_eq!(store.inbox_ack(&["d1".into(), "nope".into()]).unwrap(), 1);
+        assert_eq!(store.inbox_prune(150).unwrap(), 1);
+        let (left, total) = store.inbox_list(None, 10).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(
+            left.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["e1", "d3"]
+        );
     }
 
     #[test]
