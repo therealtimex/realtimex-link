@@ -1659,7 +1659,7 @@ impl LinkApp {
                 let cancel = ui.button(t("common.cancel"));
                 // Cancel has the focus when the dialog opens, so Enter or Space can't confirm by
                 // accident.
-                let focused = egui::Id::new("confirm-focused");
+                let focused = egui::Id::unique("confirm-focused");
                 if ctx.data(|d| d.get_temp::<bool>(focused)).is_none() {
                     cancel.request_focus();
                     ctx.data_mut(|d| d.insert_temp(focused, true));
@@ -1670,7 +1670,7 @@ impl LinkApp {
             });
         });
         if confirmed || close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            ctx.data_mut(|d| d.remove::<bool>(egui::Id::new("confirm-focused")));
+            ctx.data_mut(|d| d.remove::<bool>(egui::Id::unique("confirm-focused")));
         }
         if confirmed {
             match self.confirm.take() {

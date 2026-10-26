@@ -701,6 +701,7 @@ impl Relay {
 
     /// POST /v1/relay-exposures; on 409 (the service wants the credential this install lost) the
     /// exposure is recovered first (its credential rotates).
+    #[allow(clippy::too_many_arguments)]
     async fn register(
         &self,
         host: &Host,

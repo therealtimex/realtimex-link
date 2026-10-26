@@ -327,11 +327,7 @@ pub(super) async fn websocket(
         .headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.clone()))
-        .chain(
-            forwarded(&request, target.token.as_deref())
-                .into_iter()
-                .map(|(name, value)| (name, value)),
-        )
+        .chain(forwarded(&request, target.token.as_deref()))
         .collect::<Vec<_>>();
     for (name, value) in headers {
         if let (Ok(name), Ok(value)) = (
