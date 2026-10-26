@@ -55,6 +55,8 @@ pub struct Tray {
     realtimex: MenuItem,
     quit: MenuItem,
     last: std::cell::RefCell<(String, String, String)>,
+    /// Whether the items that need Link running are enabled now.
+    enabled: std::cell::Cell<Option<bool>>,
     /// The locale the fixed items are in (they change only with the language).
     language: std::cell::Cell<&'static str>,
 }
@@ -207,13 +209,24 @@ impl Tray {
             realtimex,
             quit,
             last: Default::default(),
+            enabled: std::cell::Cell::new(None),
             language: std::cell::Cell::new(crate::i18n::current().code),
         })
     }
 
     /// The status line, the switch's and the update item's labels, from the latest state; every
-    /// label when the language changed.
-    pub fn update(&self, overview: Option<&Value>, update: Option<&Value>) {
+    /// label when the language changed. `status` is GET /v1/status: with "Keep RealTimeX Link
+    /// running" off, the status says so and copying and remote control are unavailable (turning
+    /// Link on is the switch at the top of the window).
+    pub fn update(&self, overview: Option<&Value>, update: Option<&Value>, status: Option<&Value>) {
+        let running = status
+            .and_then(|s| s.get("running"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if self.enabled.replace(Some(running)) != Some(running) {
+            self.copy.set_enabled(running);
+            self.toggle.set_enabled(running);
+        }
         let language = crate::i18n::current().code;
         if self.language.replace(language) != language {
             self.copy.set_text(t("tray.copy"));
@@ -229,6 +242,7 @@ impl Tray {
             .and_then(Value::as_str);
         let status = match (overview, on, holder) {
             (None, ..) => t("tray.starting"),
+            _ if !running => t("tray.linkOff"),
             (_, false, _) => t("tray.off"),
             (_, true, Some(name)) => tf("session.controlling", &[("name", name)]),
             (_, true, None) => t("tray.on"),

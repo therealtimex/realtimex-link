@@ -172,7 +172,8 @@ impl LinkApp {
     }
 
     /// "Shared from this computer": only when RealTimeX pushed what it shares. Read-only; the
-    /// footer says where to change it.
+    /// footer says where to change it. Whether Link serves comes first (GET /v1/exposure's state),
+    /// whether RealTimeX runs only then.
     pub(super) fn shared_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -187,45 +188,53 @@ impl LinkApp {
         else {
             return;
         };
-        let open = answer.get("origin") == Some(&Value::Bool(true));
-        // RealTimeX handed over another account than Link's: nothing of RealTimeX's goes through.
-        let other_account = exposure.map(|e| text(e, "state")).as_deref() == Some("other-account");
+        let reach = Reach::of(exposure, answer.get("origin") == Some(&Value::Bool(true)));
         let theirs = account.map(|a| text(a, "offer")).unwrap_or_default();
         let ours = account.map(|a| text(a, "email")).unwrap_or_default();
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(semibold(t("shared.title")).size(15.0));
-                if other_account {
-                    badge(ui, &t("shared.notShared"), Tone::Warning);
-                } else if open {
-                    badge(ui, &t("shared.online"), Tone::Success);
-                } else {
-                    badge(ui, &t("shared.realtimexClosed"), Tone::Info);
-                }
+                let (label, tone) = reach.badge();
+                badge(ui, &label, tone);
             });
             caption(ui, t("shared.explain"));
-            if other_account {
-                alert(ui, Tone::Warning, &t("shared.otherAccountTitle"), |ui| {
-                    ui.label(tf(
-                        "shared.otherAccount",
-                        &[("realtimex", theirs.as_str()), ("link", ours.as_str())],
-                    ));
-                    if !theirs.is_empty()
-                        && ui
-                            .button(tf("shared.useAccount", &[("name", theirs.as_str())]))
-                            .clicked()
-                    {
-                        self.confirm = Some(Confirm::UseAccount(theirs.clone()));
-                    }
-                });
-                return;
+            match &reach {
+                Reach::OtherAccount => {
+                    alert(ui, Tone::Warning, &t("shared.otherAccountTitle"), |ui| {
+                        ui.label(tf(
+                            "shared.otherAccount",
+                            &[("realtimex", theirs.as_str()), ("link", ours.as_str())],
+                        ));
+                        if !theirs.is_empty()
+                            && ui
+                                .button(tf("shared.useAccount", &[("name", theirs.as_str())]))
+                                .clicked()
+                        {
+                            self.confirm = Some(Confirm::UseAccount(theirs.clone()));
+                        }
+                    });
+                }
+                Reach::SignedOut => {
+                    alert(ui, Tone::Warning, &t("shared.signedOutTitle"), |ui| {
+                        ui.label(t("shared.signedOut"));
+                    });
+                }
+                Reach::Error(message) => {
+                    alert(ui, Tone::Danger, &t("shared.errorTitle"), |ui| {
+                        if !message.is_empty() {
+                            ui.label(message);
+                        }
+                        ui.label(t("shared.keepsTrying"));
+                    });
+                }
+                Reach::Closed => {
+                    alert(ui, Tone::Info, &t("shared.closedTitle"), |ui| {
+                        ui.label(t("shared.closed"));
+                    });
+                }
+                Reach::Online | Reach::Connecting => {}
             }
-            if !open {
-                alert(ui, Tone::Info, &t("shared.closedTitle"), |ui| {
-                    ui.label(t("shared.closed"));
-                });
-            }
-            for row in rows(items, open) {
+            for row in card_rows(items, &reach) {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(semibold(&row.name));
@@ -240,6 +249,65 @@ impl LinkApp {
             }
         });
     }
+}
+
+/// What the Shared card says about reaching this computer: Link's exposure state first
+/// (GET /v1/exposure), and only when it is online whether RealTimeX runs (an origin).
+#[derive(Debug, PartialEq)]
+enum Reach {
+    Online,
+    Closed,
+    Connecting,
+    SignedOut,
+    Error(String),
+    OtherAccount,
+}
+
+impl Reach {
+    fn of(exposure: Option<&Value>, origin: bool) -> Self {
+        let state = exposure.map(|e| text(e, "state"));
+        match state.as_deref() {
+            Some("other-account") => Reach::OtherAccount,
+            Some("signed-out") => Reach::SignedOut,
+            Some("error") => Reach::Error(
+                exposure
+                    .and_then(|e| e.pointer("/error/message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            Some("connecting") => Reach::Connecting,
+            // Online, or a daemon that doesn't say (before #6): RealTimeX decides.
+            _ if origin => Reach::Online,
+            _ => Reach::Closed,
+        }
+    }
+
+    fn badge(&self) -> (String, Tone) {
+        match self {
+            Reach::Online => (t("shared.online"), Tone::Success),
+            Reach::Closed => (t("shared.realtimexClosed"), Tone::Info),
+            Reach::Connecting => (t("shared.connecting"), Tone::Info),
+            Reach::SignedOut | Reach::OtherAccount => (t("shared.notShared"), Tone::Warning),
+            Reach::Error(_) => (t("shared.notReachable"), Tone::Danger),
+        }
+    }
+}
+
+/// The rows as `reach` shows them: hidden when nothing of RealTimeX's can go through (signed out,
+/// another account); "Connecting" or "Offline" while Link doesn't serve.
+fn card_rows(items: &Value, reach: &Reach) -> Vec<Row> {
+    let mut rows = rows(items, *reach == Reach::Online);
+    let badge = match reach {
+        Reach::SignedOut | Reach::OtherAccount => return Vec::new(),
+        Reach::Connecting => (t("shared.connecting"), Tone::Neutral),
+        Reach::Error(_) => (t("shared.offline"), Tone::Neutral),
+        Reach::Online | Reach::Closed => return rows,
+    };
+    for row in &mut rows {
+        row.badge = badge.clone();
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -263,5 +331,59 @@ mod tests {
         let closed = rows(&items, false);
         assert!(closed.iter().all(|row| row.badge.1 == Tone::Neutral));
         assert!(rows(&json!([]), true).is_empty());
+    }
+
+    #[test]
+    fn whether_link_serves_comes_before_whether_realtimex_runs() {
+        let items = json!([
+            { "kind": "artifacts", "count": 3, "names": [] },
+            { "kind": "mobile", "count": 2, "names": [] },
+        ]);
+        let exposure = |state: &str| json!({ "state": state, "error": { "code": "recovery-capped", "message": "taken back" } });
+        let cases = [
+            ("online", true, Reach::Online, Some(Tone::Success)),
+            ("online", false, Reach::Closed, Some(Tone::Neutral)),
+            ("connecting", true, Reach::Connecting, Some(Tone::Neutral)),
+            ("connecting", false, Reach::Connecting, Some(Tone::Neutral)),
+            ("signed-out", true, Reach::SignedOut, None),
+            ("signed-out", false, Reach::SignedOut, None),
+            ("other-account", true, Reach::OtherAccount, None),
+            (
+                "error",
+                true,
+                Reach::Error("taken back".into()),
+                Some(Tone::Neutral),
+            ),
+        ];
+        for (state, origin, reach, row_tone) in cases {
+            let got = Reach::of(Some(&exposure(state)), origin);
+            assert_eq!(got, reach, "{state} {origin}");
+            let shown = card_rows(&items, &got);
+            match row_tone {
+                None => assert!(shown.is_empty(), "{state}"),
+                Some(tone) => {
+                    assert_eq!(shown.len(), 2, "{state}");
+                    assert!(
+                        shown.iter().all(|row| row.badge.1 == tone),
+                        "{state} {origin}"
+                    );
+                }
+            }
+        }
+        // Not "Online" while connecting with RealTimeX open, nor "RealTimeX closed" when signed out.
+        assert_eq!(
+            Reach::of(Some(&exposure("connecting")), true).badge().1,
+            Tone::Info
+        );
+        assert_eq!(
+            Reach::of(Some(&exposure("signed-out")), false).badge().1,
+            Tone::Warning
+        );
+        assert_eq!(
+            Reach::of(Some(&exposure("error")), true).badge().1,
+            Tone::Danger
+        );
+        // A daemon from before #6 says nothing: RealTimeX decides.
+        assert_eq!(Reach::of(None, true), Reach::Online);
     }
 }

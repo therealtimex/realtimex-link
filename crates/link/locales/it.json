@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} telefoni associati",
   "shared.chatWhenOpen": "la chat risponde quando RealTimeX si apre",
   "shared.reconnectWhenOpen": "si riconnette quando RealTimeX si apre",
-  "shared.whileOpen": "mentre RealTimeX è aperto"
+  "shared.whileOpen": "mentre RealTimeX è aperto",
+  "shared.connecting": "Connessione in corso",
+  "shared.notReachable": "Non raggiungibile",
+  "shared.signedOutTitle": "RealTimeX Link è disconnesso",
+  "shared.signedOut": "Ciò che RealTimeX condivide non può raggiungere questo computer finché RealTimeX Link non ha effettuato l'accesso. Accedi in Account qui sotto.",
+  "shared.errorTitle": "Ciò che RealTimeX condivide non è raggiungibile",
+  "shared.keepsTrying": "RealTimeX Link continua a provare.",
+  "tray.linkOff": "RealTimeX Link è spento"
 }

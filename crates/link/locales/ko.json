@@ -221,5 +221,12 @@
   "shared.phones.other": "휴대폰 {count}대 페어링됨",
   "shared.chatWhenOpen": "RealTimeX를 열면 채팅이 응답합니다",
   "shared.reconnectWhenOpen": "RealTimeX를 열면 다시 연결됩니다",
-  "shared.whileOpen": "RealTimeX가 열려 있는 동안"
+  "shared.whileOpen": "RealTimeX가 열려 있는 동안",
+  "shared.connecting": "연결 중",
+  "shared.notReachable": "연결할 수 없음",
+  "shared.signedOutTitle": "RealTimeX Link가 로그아웃됨",
+  "shared.signedOut": "RealTimeX Link가 로그인할 때까지 RealTimeX가 공유하는 항목은 이 컴퓨터에 도달할 수 없습니다. 아래 계정에서 로그인하세요.",
+  "shared.errorTitle": "RealTimeX가 공유하는 항목에 연결할 수 없습니다",
+  "shared.keepsTrying": "RealTimeX Link가 계속 시도합니다.",
+  "tray.linkOff": "RealTimeX Link가 꺼져 있음"
 }

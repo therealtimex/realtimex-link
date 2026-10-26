@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} تلفن جفت‌شده",
   "shared.chatWhenOpen": "گفتگو با باز شدن RealTimeX پاسخ می‌دهد",
   "shared.reconnectWhenOpen": "با باز شدن RealTimeX دوباره وصل می‌شود",
-  "shared.whileOpen": "تا وقتی RealTimeX باز است"
+  "shared.whileOpen": "تا وقتی RealTimeX باز است",
+  "shared.connecting": "در حال اتصال",
+  "shared.notReachable": "در دسترس نیست",
+  "shared.signedOutTitle": "RealTimeX Link از حساب خارج شده است",
+  "shared.signedOut": "تا وقتی RealTimeX Link وارد حساب نشود، آنچه RealTimeX هم‌رسانی می‌کند به این رایانه نمی‌رسد. از بخش حساب در پایین وارد شوید.",
+  "shared.errorTitle": "آنچه RealTimeX هم‌رسانی می‌کند در دسترس نیست",
+  "shared.keepsTrying": "RealTimeX Link همچنان تلاش می‌کند.",
+  "tray.linkOff": "RealTimeX Link خاموش است"
 }

@@ -221,5 +221,12 @@
   "shared.phones.other": "Telefoane asociate: {count}",
   "shared.chatWhenOpen": "chatul răspunde când se deschide RealTimeX",
   "shared.reconnectWhenOpen": "se reconectează când se deschide RealTimeX",
-  "shared.whileOpen": "cât timp RealTimeX este deschis"
+  "shared.whileOpen": "cât timp RealTimeX este deschis",
+  "shared.connecting": "Se conectează",
+  "shared.notReachable": "Inaccesibil",
+  "shared.signedOutTitle": "RealTimeX Link este deconectat",
+  "shared.signedOut": "Ce partajează RealTimeX nu poate ajunge la acest computer până când RealTimeX Link nu este conectat. Conectați-vă mai jos, la Cont.",
+  "shared.errorTitle": "Ce partajează RealTimeX nu poate fi accesat",
+  "shared.keepsTrying": "RealTimeX Link continuă să încerce.",
+  "tray.linkOff": "RealTimeX Link este oprit"
 }

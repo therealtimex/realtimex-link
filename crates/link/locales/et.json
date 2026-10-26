@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} telefoni seotud",
   "shared.chatWhenOpen": "vestlus vastab, kui RealTimeX avaneb",
   "shared.reconnectWhenOpen": "ühendub uuesti, kui RealTimeX avaneb",
-  "shared.whileOpen": "kuni RealTimeX on avatud"
+  "shared.whileOpen": "kuni RealTimeX on avatud",
+  "shared.connecting": "Ühendamine",
+  "shared.notReachable": "Pole kättesaadav",
+  "shared.signedOutTitle": "RealTimeX Link on välja logitud",
+  "shared.signedOut": "RealTimeXi jagatu ei jõua selle arvutini enne, kui RealTimeX Link on sisse logitud. Logi sisse allpool jaotises Konto.",
+  "shared.errorTitle": "RealTimeXi jagatu pole kättesaadav",
+  "shared.keepsTrying": "RealTimeX Link proovib edasi.",
+  "tray.linkOff": "RealTimeX Link on välja lülitatud"
 }

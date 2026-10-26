@@ -97,7 +97,11 @@ pub fn run() -> eframe::Result {
     };
     loop {
         let state = lock(&shared);
-        tray.update(state.overview.as_ref(), state.update.as_ref());
+        tray.update(
+            state.overview.as_ref(),
+            state.update.as_ref(),
+            state.status.as_ref(),
+        );
         drop(state);
         std::thread::sleep(Duration::from_millis(500));
     }

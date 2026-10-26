@@ -617,7 +617,11 @@ impl eframe::App for LinkApp {
         crate::dock::apply();
         if let Some(tray) = &self.tray {
             let state = lock(&self.shared);
-            tray.update(state.overview.as_ref(), state.update.as_ref());
+            tray.update(
+                state.overview.as_ref(),
+                state.update.as_ref(),
+                state.status.as_ref(),
+            );
         }
     }
 
@@ -1652,11 +1656,22 @@ impl LinkApp {
                 {
                     confirmed = true;
                 }
-                if ui.button(t("common.cancel")).clicked() {
+                let cancel = ui.button(t("common.cancel"));
+                // Cancel has the focus when the dialog opens, so Enter or Space can't confirm by
+                // accident.
+                let focused = egui::Id::new("confirm-focused");
+                if ctx.data(|d| d.get_temp::<bool>(focused)).is_none() {
+                    cancel.request_focus();
+                    ctx.data_mut(|d| d.insert_temp(focused, true));
+                }
+                if cancel.clicked() {
                     close = true;
                 }
             });
         });
+        if confirmed || close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.data_mut(|d| d.remove::<bool>(egui::Id::new("confirm-focused")));
+        }
         if confirmed {
             match self.confirm.take() {
                 Some(Confirm::TurnOff) => self.act(

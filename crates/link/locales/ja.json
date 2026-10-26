@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} 台のスマートフォンをペアリング済み",
   "shared.chatWhenOpen": "RealTimeX を開くとチャットが応答します",
   "shared.reconnectWhenOpen": "RealTimeX を開くと再接続します",
-  "shared.whileOpen": "RealTimeX を開いている間"
+  "shared.whileOpen": "RealTimeX を開いている間",
+  "shared.connecting": "接続中",
+  "shared.notReachable": "到達不可",
+  "shared.signedOutTitle": "RealTimeX Link はサインアウトしています",
+  "shared.signedOut": "RealTimeX Link がサインインするまで、RealTimeX が共有しているものはこのコンピューターに届きません。下の「アカウント」でサインインしてください。",
+  "shared.errorTitle": "RealTimeX が共有しているものに到達できません",
+  "shared.keepsTrying": "RealTimeX Link は再試行を続けます。",
+  "tray.linkOff": "RealTimeX Link はオフです"
 }

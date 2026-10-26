@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} Telefone gekoppelt",
   "shared.chatWhenOpen": "Chat antwortet, sobald RealTimeX geöffnet wird",
   "shared.reconnectWhenOpen": "verbindet sich wieder, sobald RealTimeX geöffnet wird",
-  "shared.whileOpen": "solange RealTimeX geöffnet ist"
+  "shared.whileOpen": "solange RealTimeX geöffnet ist",
+  "shared.connecting": "Verbindung wird hergestellt",
+  "shared.notReachable": "Nicht erreichbar",
+  "shared.signedOutTitle": "RealTimeX Link ist abgemeldet",
+  "shared.signedOut": "Was RealTimeX teilt, erreicht diesen Computer erst, wenn RealTimeX Link angemeldet ist. Melden Sie sich unten unter Konto an.",
+  "shared.errorTitle": "Was RealTimeX teilt, ist nicht erreichbar",
+  "shared.keepsTrying": "RealTimeX Link versucht es weiter.",
+  "tray.linkOff": "RealTimeX Link ist aus"
 }

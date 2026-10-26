@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} phones paired",
   "shared.chatWhenOpen": "chat answers when RealTimeX opens",
   "shared.reconnectWhenOpen": "reconnects when RealTimeX opens",
-  "shared.whileOpen": "while RealTimeX is open"
+  "shared.whileOpen": "while RealTimeX is open",
+  "shared.connecting": "Connecting",
+  "shared.notReachable": "Not reachable",
+  "shared.signedOutTitle": "RealTimeX Link is signed out",
+  "shared.signedOut": "What RealTimeX shares can't reach this computer until RealTimeX Link is signed in. Sign in under Account below.",
+  "shared.errorTitle": "What RealTimeX shares can't be reached",
+  "shared.keepsTrying": "RealTimeX Link keeps trying.",
+  "tray.linkOff": "RealTimeX Link is off"
 }

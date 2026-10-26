@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} telefon eşlendi",
   "shared.chatWhenOpen": "sohbet, RealTimeX açıldığında yanıt verir",
   "shared.reconnectWhenOpen": "RealTimeX açıldığında yeniden bağlanır",
-  "shared.whileOpen": "RealTimeX açıkken"
+  "shared.whileOpen": "RealTimeX açıkken",
+  "shared.connecting": "Bağlanıyor",
+  "shared.notReachable": "Erişilemiyor",
+  "shared.signedOutTitle": "RealTimeX Link oturumu kapalı",
+  "shared.signedOut": "RealTimeX'in paylaştıkları, RealTimeX Link oturum açana kadar bu bilgisayara ulaşamaz. Aşağıda Hesap bölümünden oturum açın.",
+  "shared.errorTitle": "RealTimeX'in paylaştıklarına erişilemiyor",
+  "shared.keepsTrying": "RealTimeX Link denemeye devam ediyor.",
+  "tray.linkOff": "RealTimeX Link kapalı"
 }

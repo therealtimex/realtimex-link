@@ -221,5 +221,12 @@
   "shared.phones.other": "Savienoti tālruņi: {count}",
   "shared.chatWhenOpen": "tērzēšana atbild, kad RealTimeX tiek atvērts",
   "shared.reconnectWhenOpen": "atkal savienojas, kad RealTimeX tiek atvērts",
-  "shared.whileOpen": "kamēr RealTimeX ir atvērts"
+  "shared.whileOpen": "kamēr RealTimeX ir atvērts",
+  "shared.connecting": "Savienojas",
+  "shared.notReachable": "Nav sasniedzams",
+  "shared.signedOutTitle": "RealTimeX Link ir izrakstījies",
+  "shared.signedOut": "RealTimeX kopīgotais nevar sasniegt šo datoru, kamēr RealTimeX Link nav pierakstījies. Pierakstieties zemāk sadaļā Konts.",
+  "shared.errorTitle": "RealTimeX kopīgotais nav sasniedzams",
+  "shared.keepsTrying": "RealTimeX Link turpina mēģināt.",
+  "tray.linkOff": "RealTimeX Link ir izslēgts"
 }

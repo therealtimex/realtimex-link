@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} telefoner parret",
   "shared.chatWhenOpen": "chatten svarer, når RealTimeX åbner",
   "shared.reconnectWhenOpen": "forbinder igen, når RealTimeX åbner",
-  "shared.whileOpen": "mens RealTimeX er åben"
+  "shared.whileOpen": "mens RealTimeX er åben",
+  "shared.connecting": "Forbinder",
+  "shared.notReachable": "Kan ikke nås",
+  "shared.signedOutTitle": "RealTimeX Link er logget ud",
+  "shared.signedOut": "Det, RealTimeX deler, kan ikke nå denne computer, før RealTimeX Link er logget ind. Log ind under Konto nedenfor.",
+  "shared.errorTitle": "Det, RealTimeX deler, kan ikke nås",
+  "shared.keepsTrying": "RealTimeX Link bliver ved med at prøve.",
+  "tray.linkOff": "RealTimeX Link er slået fra"
 }

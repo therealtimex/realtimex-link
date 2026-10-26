@@ -221,5 +221,12 @@
   "shared.phones.other": "已配对 {count} 部手机",
   "shared.chatWhenOpen": "RealTimeX 打开后聊天会回复",
   "shared.reconnectWhenOpen": "RealTimeX 打开后会重新连接",
-  "shared.whileOpen": "RealTimeX 打开期间"
+  "shared.whileOpen": "RealTimeX 打开期间",
+  "shared.connecting": "正在连接",
+  "shared.notReachable": "无法访问",
+  "shared.signedOutTitle": "RealTimeX Link 已退出登录",
+  "shared.signedOut": "在 RealTimeX Link 登录之前，RealTimeX 共享的内容无法到达这台电脑。请在下方“账户”中登录。",
+  "shared.errorTitle": "无法访问 RealTimeX 共享的内容",
+  "shared.keepsTrying": "RealTimeX Link 会继续尝试。",
+  "tray.linkOff": "RealTimeX Link 已关闭"
 }

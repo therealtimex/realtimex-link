@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} טלפונים מוצמדים",
   "shared.chatWhenOpen": "הצ'אט יענה כש-RealTimeX ייפתח",
   "shared.reconnectWhenOpen": "יתחבר מחדש כש-RealTimeX ייפתח",
-  "shared.whileOpen": "כל עוד RealTimeX פתוח"
+  "shared.whileOpen": "כל עוד RealTimeX פתוח",
+  "shared.connecting": "מתחבר",
+  "shared.notReachable": "לא ניתן להגיע",
+  "shared.signedOutTitle": "RealTimeX Link מנותק מהחשבון",
+  "shared.signedOut": "מה ש-RealTimeX משתף לא יכול להגיע למחשב הזה עד ש-RealTimeX Link יתחבר. התחבר/י בקטע חשבון למטה.",
+  "shared.errorTitle": "לא ניתן להגיע למה ש-RealTimeX משתף",
+  "shared.keepsTrying": "RealTimeX Link ממשיך לנסות.",
+  "tray.linkOff": "RealTimeX Link כבוי"
 }

@@ -221,5 +221,12 @@
   "shared.phones.other": "{count} điện thoại đã ghép nối",
   "shared.chatWhenOpen": "trò chuyện sẽ trả lời khi RealTimeX mở",
   "shared.reconnectWhenOpen": "kết nối lại khi RealTimeX mở",
-  "shared.whileOpen": "khi RealTimeX đang mở"
+  "shared.whileOpen": "khi RealTimeX đang mở",
+  "shared.connecting": "Đang kết nối",
+  "shared.notReachable": "Không truy cập được",
+  "shared.signedOutTitle": "RealTimeX Link đã đăng xuất",
+  "shared.signedOut": "Những gì RealTimeX chia sẻ không thể đến máy tính này cho đến khi RealTimeX Link được đăng nhập. Hãy đăng nhập trong mục Tài khoản bên dưới.",
+  "shared.errorTitle": "Không thể truy cập những gì RealTimeX chia sẻ",
+  "shared.keepsTrying": "RealTimeX Link sẽ tiếp tục thử.",
+  "tray.linkOff": "RealTimeX Link đang tắt"
 }

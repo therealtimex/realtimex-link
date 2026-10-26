@@ -221,5 +221,12 @@
   "shared.phones.other": "Сопряжённые телефоны: {count}",
   "shared.chatWhenOpen": "чат ответит, когда откроется RealTimeX",
   "shared.reconnectWhenOpen": "переподключится, когда откроется RealTimeX",
-  "shared.whileOpen": "пока RealTimeX открыт"
+  "shared.whileOpen": "пока RealTimeX открыт",
+  "shared.connecting": "Подключение",
+  "shared.notReachable": "Недоступно",
+  "shared.signedOutTitle": "RealTimeX Link не выполнил вход",
+  "shared.signedOut": "То, чем делится RealTimeX, не сможет попасть на этот компьютер, пока в RealTimeX Link не выполнен вход. Войдите в разделе «Аккаунт» ниже.",
+  "shared.errorTitle": "То, чем делится RealTimeX, недоступно",
+  "shared.keepsTrying": "RealTimeX Link продолжает попытки.",
+  "tray.linkOff": "RealTimeX Link выключен"
 }

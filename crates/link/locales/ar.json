@@ -221,5 +221,12 @@
   "shared.phones.other": "الهواتف المقترنة: {count}",
   "shared.chatWhenOpen": "تردّ الدردشة عند فتح RealTimeX",
   "shared.reconnectWhenOpen": "يُعاد الاتصال عند فتح RealTimeX",
-  "shared.whileOpen": "أثناء فتح RealTimeX"
+  "shared.whileOpen": "أثناء فتح RealTimeX",
+  "shared.connecting": "جارٍ الاتصال",
+  "shared.notReachable": "لا يمكن الوصول",
+  "shared.signedOutTitle": "تم تسجيل خروج RealTimeX Link",
+  "shared.signedOut": "لا يمكن لما يشاركه RealTimeX الوصول إلى هذا الكمبيوتر حتى يتم تسجيل الدخول إلى RealTimeX Link. سجّل الدخول من الحساب أدناه.",
+  "shared.errorTitle": "لا يمكن الوصول إلى ما يشاركه RealTimeX",
+  "shared.keepsTrying": "يواصل RealTimeX Link المحاولة.",
+  "tray.linkOff": "RealTimeX Link متوقف"
 }
