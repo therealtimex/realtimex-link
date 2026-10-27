@@ -157,6 +157,8 @@
   "tray.checkUpdates": "檢查更新",
   "tray.updateTo": "更新到 RealTimeX Link {version}…",
   "tray.quit": "結束，直到下次登入",
+  "tray.quitPlain": "結束",
+  "tray.quitRestartNote": "RealTimeX 會再次啟動 Link",
   "tray.starting": "RealTimeX Link 正在啟動…",
   "tray.off": "遠端控制已關閉",
   "tray.on": "遠端控制已開啟",
@@ -179,11 +181,15 @@
   "link.off": "已關閉",
   "link.keepRunning": "讓 RealTimeX Link 保持執行",
   "link.onDescription": "登入時啟動，即使 RealTimeX 已關閉，也能讓這台電腦保持可連線。",
+  "link.onDescriptionNoLogin": "讓這台電腦保持可連線。由 RealTimeX 啟動，不會在登入時啟動。",
   "link.offDescription": "已發佈的製品、Webhooks、行動應用程式和遠端控制都無法連線到這台電腦。RealTimeX Link 不會在登入時啟動。",
+  "link.offDescriptionNoLogin": "已發佈的製品、Webhooks、行動應用程式和遠端控制都無法連線到這台電腦。",
   "link.turnedOn": "RealTimeX Link 已開啟，會在登入時啟動。",
+  "link.turnedOnNoLogin": "RealTimeX Link 已開啟。",
   "link.turnedOff": "RealTimeX Link 已關閉。",
   "confirm.turnOffLink.title": "要關閉 RealTimeX Link 嗎？",
   "confirm.turnOffLink.message": "已發佈的製品將會離線，Webhooks 將無法接收，行動應用程式和其他電腦將無法連線到這台電腦，也沒有人能連線進行遠端控制。在你重新開啟之前，它不會在登入時啟動。",
+  "confirm.turnOffLink.messageNoLogin": "已發佈的製品將會離線，Webhooks 將無法接收，行動應用程式和其他電腦將無法連線到這台電腦，也沒有人能連線進行遠端控制。",
   "confirm.turnOffLink.action": "關閉",
   "moved.title": "這台電腦現在只有一個 App ID",
   "moved.message": "RealTimeX Link 現在以 RealTimeX 的 App ID {appId} 共用這台電腦上的所有內容。已發佈的連結和 Webhook URL 不會變更。使用 {old} 的電腦會自動移轉過來。",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "已為 RealTimeX 保留 {count} 筆投遞",
   "shared.deliveriesKept.other": "已為 RealTimeX 保留 {count} 筆投遞",
   "shared.waiting.one": "{count} 個等待中",
-  "shared.waiting.other": "{count} 個等待中"
+  "shared.waiting.other": "{count} 個等待中",
+  "instance.unnamed": "未命名"
 }

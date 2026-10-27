@@ -155,7 +155,7 @@ impl LinkApp {
                                 ctx,
                                 "/v1/running",
                                 json!({ "on": true }),
-                                &t("link.turnedOn"),
+                                &t(&keep_running_copy("link.turnedOn")),
                             );
                         } else {
                             self.confirm = Some(Confirm::TurnOffLink);
@@ -165,11 +165,11 @@ impl LinkApp {
             });
             caption(
                 ui,
-                t(if on {
+                t(&keep_running_copy(if on {
                     "link.onDescription"
                 } else {
                     "link.offDescription"
-                }),
+                })),
             );
         });
     }

@@ -210,6 +210,9 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
         if let Some(api) = api {
             let edits = lock(&shared).choices.edits();
             let status = api.get("/v1/status").ok();
+            if let Some(status) = &status {
+                crate::instance::remember(status);
+            }
             // The stored theme and language (RealTimeX's, or chosen in Settings), unless a change
             // was made since this read started; an older daemon has no language. A failed read
             // changes nothing: the window keeps what it shows.
@@ -381,6 +384,8 @@ pub struct LinkApp {
     /// Whether the window had the focus last frame: gaining it (opened, shown again) checks
     /// whether RealTimeX still owns Link.
     focused: bool,
+    /// The window's title: the instance's name (instance.rs).
+    title: String,
 }
 
 impl LinkApp {
@@ -422,6 +427,7 @@ impl LinkApp {
             editing_password: None,
             confirm: None,
             focused: false,
+            title: crate::instance::current().name(),
         }
     }
 
@@ -431,6 +437,17 @@ impl LinkApp {
 
     fn has_tray(&self) -> bool {
         self.tray.is_some()
+    }
+
+    /// The title, and on macOS the process name, follow the instance's name: it is known only
+    /// once the daemon answers, which may be after the window opened.
+    fn name_window(&mut self, ctx: &egui::Context, instance: &crate::instance::Instance) {
+        let name = instance.name();
+        if self.title != name {
+            ctx.send_viewport_cmd(ViewportCommand::Title(name.clone()));
+            crate::dock::name_process(&instance.short_name());
+            self.title = name;
+        }
     }
 }
 
@@ -486,16 +503,45 @@ fn badge(ui: &mut egui::Ui, text: &str, tone: Tone) {
 /// The computer's name in the header: it takes only the room the title and the gear leave, and
 /// a long name ends in "…" with the whole name on hover.
 fn machine_badge(ui: &mut egui::Ui, machine: &str) {
+    let room = ui.available_width() - ui.spacing().item_spacing.x;
+    short_badge(ui, machine, room);
+}
+
+/// Another instance's label after the title (instance.rs): the first to give way when the header
+/// is short of room, leaving the computer's name and the gear whole; never wider than 160 pt.
+fn instance_badge(ui: &mut egui::Ui, label: &str, machine: Option<&str>) {
+    let spacing = ui.spacing().item_spacing.x;
+    let machine = machine.map_or(0.0, |machine| badge_width(ui, machine) + spacing);
+    let room = ui.available_width() - machine - theme::CONTROL_HEIGHT - 2.0 * spacing;
+    short_badge(ui, label, room.min(160.0));
+}
+
+/// A neutral pill at most `room` wide: longer text ends in "…" with the whole of it on hover.
+fn short_badge(ui: &mut egui::Ui, text: &str, room: f32) {
     let (fill, _, fg) = tone_colors(ui, Tone::Neutral);
-    let room = (ui.available_width() - ui.spacing().item_spacing.x - 16.0).max(24.0);
+    let room = (room - 16.0).max(24.0);
     egui::Frame::new()
         .fill(fill)
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
             ui.set_max_width(room);
-            ui.add(egui::Label::new(semibold(machine).small().color(fg)).truncate());
+            ui.add(egui::Label::new(semibold(text).small().color(fg)).truncate());
         });
+}
+
+/// How wide a badge with `text` is, whole.
+fn badge_width(ui: &egui::Ui, text: &str) -> f32 {
+    egui::WidgetText::from(semibold(text).small())
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        )
+        .size()
+        .x
+        + 16.0
 }
 
 /// No click in this frame. egui takes the focus away from a widget when a click lands elsewhere,
@@ -544,6 +590,16 @@ fn alert<R>(ui: &mut egui::Ui, tone: Tone, title: &str, add: impl FnOnce(&mut eg
             add(ui)
         })
         .inner
+}
+
+/// The key of Keep running's copy: another instance (instance.rs) never starts at login, and its
+/// copy (`<key>NoLogin`) doesn't say it does.
+fn keep_running_copy(key: &str) -> String {
+    if crate::instance::current().default {
+        key.to_string()
+    } else {
+        format!("{key}NoLogin")
+    }
 }
 
 fn caption(ui: &mut egui::Ui, text: impl Into<String>) {
@@ -664,6 +720,8 @@ impl eframe::App for LinkApp {
             let state = lock(&self.shared);
             (state.status.clone(), state.shared.clone())
         };
+        let instance = crate::instance::current();
+        self.name_window(ctx, &instance);
         let (overview, requests, password, account, update, error, notice, stored) = {
             let mut state = lock(&self.shared);
             if state
@@ -716,9 +774,16 @@ impl eframe::App for LinkApp {
                 }
             }
             ui.add_space(8.0);
+            let machine = overview
+                .as_ref()
+                .map(|o| text(o, "machine"))
+                .filter(|m| !m.is_empty());
             ui.horizontal(|ui| {
                 ui.add(egui::Image::new((self.icon.id(), egui::vec2(24.0, 24.0))));
                 ui.label(semibold("RealTimeX Link").size(16.0));
+                if let Some(label) = instance.label() {
+                    instance_badge(ui, &label, machine.as_deref());
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let gear = theme::icon_button(ui, theme::Icon::Gear, &t("settings.title"));
                     self.chrome[0] = Some(gear.id);
@@ -736,12 +801,8 @@ impl eframe::App for LinkApp {
                             Focus::Gear
                         });
                     }
-                    if let Some(machine) = overview
-                        .as_ref()
-                        .map(|o| text(o, "machine"))
-                        .filter(|m| !m.is_empty())
-                    {
-                        machine_badge(ui, &machine);
+                    if let Some(machine) = &machine {
+                        machine_badge(ui, machine);
                     }
                 });
             });
@@ -751,17 +812,21 @@ impl eframe::App for LinkApp {
 
         egui::Panel::bottom("footer").show(ui, |ui| {
             ui.add_space(8.0);
-            let installed = desktop::realtimex_app().is_some();
+            // Another instance's RealTimeX is the one that runs it, not the installed app Open
+            // RealTimeX would start: the hint alone.
+            let installed = !instance.default || desktop::realtimex_app().is_some();
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Link on its own is the whole point here: RealTimeX is a quiet link.
-                    let open = if installed {
-                        primary_button(ui, &t("footer.openRealtimex"))
+                    let open = if !instance.default {
+                        None
+                    } else if installed {
+                        Some(primary_button(ui, &t("footer.openRealtimex")))
                     } else {
-                        ui.link(t("footer.getRealtimex"))
+                        Some(ui.link(t("footer.getRealtimex")))
                     };
-                    self.chrome[1] = Some(open.id);
-                    if open.clicked() {
+                    self.chrome[1] = open.as_ref().map(|open| open.id);
+                    if open.is_some_and(|open| open.clicked()) {
                         desktop::open_realtimex();
                     }
                     ui.add(
@@ -996,9 +1061,12 @@ impl LinkApp {
                 return;
             }
             if managed {
-                // RealTimeX signed out: signing in happens there.
+                // RealTimeX signed out: signing in happens there (another instance's RealTimeX
+                // isn't the installed app Open RealTimeX would start).
                 caption(ui, t("account.signInInRealtimex"));
-                if primary_button(ui, &t("footer.openRealtimex")).clicked() {
+                if crate::instance::current().default
+                    && primary_button(ui, &t("footer.openRealtimex")).clicked()
+                {
                     desktop::open_realtimex();
                 }
                 return;
@@ -1676,7 +1744,11 @@ impl LinkApp {
             Confirm::SignOut => ("signOut", ""),
         };
         let part = |part: &str| tf(&format!("confirm.{which}.{part}"), &[("name", name)]);
-        let (title, message, action) = (part("title"), part("message"), part("action"));
+        let message = match confirm {
+            Confirm::TurnOffLink => part(&keep_running_copy("message")),
+            _ => part("message"),
+        };
+        let (title, action) = (part("title"), part("action"));
         let mut close = false;
         let mut confirmed = false;
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {

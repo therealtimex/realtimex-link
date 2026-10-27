@@ -157,6 +157,8 @@
   "tray.checkUpdates": "بررسی به‌روزرسانی",
   "tray.updateTo": "به‌روزرسانی به RealTimeX Link {version}…",
   "tray.quit": "خروج تا ورود بعدی",
+  "tray.quitPlain": "خروج",
+  "tray.quitRestartNote": "RealTimeX دوباره Link را اجرا می‌کند",
   "tray.starting": "RealTimeX Link در حال اجراست…",
   "tray.off": "کنترل از راه دور خاموش است",
   "tray.on": "کنترل از راه دور روشن است",
@@ -179,11 +181,15 @@
   "link.off": "خاموش",
   "link.keepRunning": "RealTimeX Link در حال اجرا بماند",
   "link.onDescription": "هنگام ورود اجرا می‌شود و این رایانه را در دسترس نگه می‌دارد، حتی وقتی RealTimeX بسته است.",
+  "link.onDescriptionNoLogin": "این رایانه را در دسترس نگه می‌دارد. RealTimeX آن را اجرا می‌کند و هنگام ورود اجرا نمی‌شود.",
   "link.offDescription": "آرتیفکت‌های منتشرشده، وب‌قلاب‌ها، اپلیکیشن موبایل و کنترل از راه دور نمی‌توانند به این رایانه دسترسی پیدا کنند. RealTimeX Link هنگام ورود اجرا نمی‌شود.",
+  "link.offDescriptionNoLogin": "آرتیفکت‌های منتشرشده، وب‌قلاب‌ها، اپلیکیشن موبایل و کنترل از راه دور نمی‌توانند به این رایانه دسترسی پیدا کنند.",
   "link.turnedOn": "RealTimeX Link روشن است. هنگام ورود اجرا می‌شود.",
+  "link.turnedOnNoLogin": "RealTimeX Link روشن است.",
   "link.turnedOff": "RealTimeX Link خاموش است.",
   "confirm.turnOffLink.title": "RealTimeX Link خاموش شود؟",
   "confirm.turnOffLink.message": "آرتیفکت‌های منتشرشده آفلاین می‌شوند، وب‌قلاب‌ها دریافت نمی‌شوند، اپلیکیشن موبایل و دسکتاپ‌های دیگر نمی‌توانند به این رایانه دسترسی پیدا کنند و هیچ‌کس نمی‌تواند برای کنترل از راه دور وصل شود. تا وقتی دوباره روشنش نکنید، هنگام ورود اجرا نمی‌شود.",
+  "confirm.turnOffLink.messageNoLogin": "آرتیفکت‌های منتشرشده آفلاین می‌شوند، وب‌قلاب‌ها دریافت نمی‌شوند، اپلیکیشن موبایل و دسکتاپ‌های دیگر نمی‌توانند به این رایانه دسترسی پیدا کنند و هیچ‌کس نمی‌تواند برای کنترل از راه دور وصل شود.",
   "confirm.turnOffLink.action": "خاموش کردن",
   "moved.title": "این رایانه اکنون یک شناسهٔ برنامه دارد",
   "moved.message": "RealTimeX Link اکنون همه‌چیز را از این رایانه با شناسهٔ برنامهٔ RealTimeX، {appId}، به اشتراک می‌گذارد. پیوندهای منتشرشده و نشانی‌های وب‌قلاب تغییر نمی‌کنند. رایانه‌هایی که از {old} استفاده می‌کردند، خودشان منتقل می‌شوند.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} تحویل برای RealTimeX نگه داشته شده",
   "shared.deliveriesKept.other": "{count} تحویل برای RealTimeX نگه داشته شده",
   "shared.waiting.one": "{count} در انتظار",
-  "shared.waiting.other": "{count} در انتظار"
+  "shared.waiting.other": "{count} در انتظار",
+  "instance.unnamed": "بی‌نام"
 }

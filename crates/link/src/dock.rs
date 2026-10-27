@@ -45,13 +45,16 @@ fn show_in_dock(open: bool) {
 }
 
 /// macOS: the app menu says "About RealTimeX Link", "Quit RealTimeX Link": winit names its items
-/// after the process, which is the executable's name (rtx-link). Before the window is made.
-pub fn name_process() {
+/// after the process, which is the executable's name (rtx-link). Before the window is made. Another
+/// instance's name carries its label (instance.rs): "Quit RealTimeX Link (dev)".
+pub fn name_process(name: &str) {
     #[cfg(target_os = "macos")]
     {
         use objc2_foundation::{NSProcessInfo, NSString};
-        NSProcessInfo::processInfo().setProcessName(&NSString::from_str("RealTimeX Link"));
+        NSProcessInfo::processInfo().setProcessName(&NSString::from_str(name));
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = name;
 }
 
 /// macOS: whether "Double-click a window's title bar to" is Minimize (the header's double-click,

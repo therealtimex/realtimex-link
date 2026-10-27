@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Verificar atualizações",
   "tray.updateTo": "Atualizar para o RealTimeX Link {version}…",
   "tray.quit": "Sair até o próximo login",
+  "tray.quitPlain": "Sair",
+  "tray.quitRestartNote": "O RealTimeX vai iniciar o Link de novo",
   "tray.starting": "O RealTimeX Link está iniciando…",
   "tray.off": "O controle remoto está desativado",
   "tray.on": "O controle remoto está ativado",
@@ -179,11 +181,15 @@
   "link.off": "Desativado",
   "link.keepRunning": "Manter o RealTimeX Link em execução",
   "link.onDescription": "Inicia no login e mantém este computador acessível, mesmo com o RealTimeX fechado.",
+  "link.onDescriptionNoLogin": "Mantém este computador acessível. O RealTimeX o inicia, e ele não inicia no login.",
   "link.offDescription": "Artefatos publicados, webhooks, o app móvel e o controle remoto não conseguem acessar este computador. O RealTimeX Link não vai iniciar no login.",
+  "link.offDescriptionNoLogin": "Artefatos publicados, webhooks, o app móvel e o controle remoto não conseguem acessar este computador.",
   "link.turnedOn": "O RealTimeX Link está ativado. Ele inicia no login.",
+  "link.turnedOnNoLogin": "O RealTimeX Link está ativado.",
   "link.turnedOff": "O RealTimeX Link está desativado.",
   "confirm.turnOffLink.title": "Desativar o RealTimeX Link?",
   "confirm.turnOffLink.message": "Os artefatos publicados ficam offline, os webhooks não são recebidos, o app móvel e outros computadores não conseguem acessar este computador, e ninguém pode se conectar para controle remoto. Ele não vai iniciar no login até você ativá-lo de novo.",
+  "confirm.turnOffLink.messageNoLogin": "Os artefatos publicados ficam offline, os webhooks não são recebidos, o app móvel e outros computadores não conseguem acessar este computador, e ninguém pode se conectar para controle remoto.",
   "confirm.turnOffLink.action": "Desativar",
   "moved.title": "Este computador agora tem um só App ID",
   "moved.message": "O RealTimeX Link agora compartilha tudo deste computador sob o App ID do RealTimeX, {appId}. Links publicados e URLs de webhook não mudam. Os computadores que usavam {old} migram sozinhos.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} entrega guardada para o RealTimeX",
   "shared.deliveriesKept.other": "{count} entregas guardadas para o RealTimeX",
   "shared.waiting.one": "{count} aguardando",
-  "shared.waiting.other": "{count} aguardando"
+  "shared.waiting.other": "{count} aguardando",
+  "instance.unnamed": "sem nome"
 }

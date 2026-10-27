@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Проверить обновления",
   "tray.updateTo": "Обновить до RealTimeX Link {version}…",
   "tray.quit": "Выйти до следующего входа в систему",
+  "tray.quitPlain": "Выйти",
+  "tray.quitRestartNote": "RealTimeX снова запустит Link",
   "tray.starting": "RealTimeX Link запускается…",
   "tray.off": "Удалённое управление выключено",
   "tray.on": "Удалённое управление включено",
@@ -179,11 +181,15 @@
   "link.off": "Выключено",
   "link.keepRunning": "Не закрывать RealTimeX Link",
   "link.onDescription": "Запускается при входе в систему и сохраняет доступ к этому компьютеру, даже когда RealTimeX закрыт.",
+  "link.onDescriptionNoLogin": "Сохраняет доступ к этому компьютеру. Его запускает RealTimeX, при входе в систему он не запускается.",
   "link.offDescription": "Опубликованные артефакты, вебхуки, мобильное приложение и удалённое управление не могут связаться с этим компьютером. RealTimeX Link не будет запускаться при входе в систему.",
+  "link.offDescriptionNoLogin": "Опубликованные артефакты, вебхуки, мобильное приложение и удалённое управление не могут связаться с этим компьютером.",
   "link.turnedOn": "RealTimeX Link включён. Он запускается при входе в систему.",
+  "link.turnedOnNoLogin": "RealTimeX Link включён.",
   "link.turnedOff": "RealTimeX Link выключен.",
   "confirm.turnOffLink.title": "Выключить RealTimeX Link?",
   "confirm.turnOffLink.message": "Опубликованные артефакты станут недоступны, вебхуки не будут приниматься, мобильное приложение и другие компьютеры не смогут связаться с этим компьютером, и никто не сможет подключиться для удалённого управления. Он не будет запускаться при входе в систему, пока вы снова его не включите.",
+  "confirm.turnOffLink.messageNoLogin": "Опубликованные артефакты станут недоступны, вебхуки не будут приниматься, мобильное приложение и другие компьютеры не смогут связаться с этим компьютером, и никто не сможет подключиться для удалённого управления.",
   "confirm.turnOffLink.action": "Выключить",
   "moved.title": "Теперь у этого компьютера один App ID",
   "moved.message": "RealTimeX Link теперь открывает доступ ко всему на этом компьютере под App ID RealTimeX — {appId}. Опубликованные ссылки и URL вебхуков не меняются. Компьютеры, которые использовали {old}, перейдут сами.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} доставка сохранена для RealTimeX",
   "shared.deliveriesKept.other": "Сохранённые для RealTimeX доставки: {count}",
   "shared.waiting.one": "{count} ожидает",
-  "shared.waiting.other": "Ожидают: {count}"
+  "shared.waiting.other": "Ожидают: {count}",
+  "instance.unnamed": "без имени"
 }
