@@ -126,6 +126,25 @@ impl Controller {
         }
     }
 
+    /// When the input session has work of its own due: on Windows, the clipboard text a paste
+    /// took off comes back a moment after the last paste.
+    #[cfg(windows)]
+    fn due(&self) -> Option<std::time::Instant> {
+        self.input.as_ref().and_then(Input::restore_due)
+    }
+
+    #[cfg(not(windows))]
+    fn due(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn run_due(&mut self) {
+        #[cfg(windows)]
+        if let Some(input) = self.input.as_mut() {
+            input.restore_clipboard();
+        }
+    }
+
     /// End the input session, releasing anything still held first.
     fn end_session(&mut self) {
         self.release_held();
@@ -506,7 +525,23 @@ pub fn run() -> Result<()> {
         }
         let _ = to_main.send(Msg::Eof);
     });
-    for message in inbox {
+    loop {
+        let message = match controller.due() {
+            Some(due) => {
+                match inbox.recv_timeout(due.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(message) => message,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        controller.run_due();
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match inbox.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
         let line = match message {
             Msg::Line(line) => line,
             Msg::Eof => break,

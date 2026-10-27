@@ -448,9 +448,10 @@ async fn set_shared(State(state): State<Shared>, Body64(body): Body64) -> Answer
     Ok(Json(json!({ "ok": true })))
 }
 
-/// { exposureId, items: [{ id, dir, entry, status, expiresAt? }], embedAssetsDir? }: the
-/// published artifacts Link serves on surface a, and the widget's assets on surface e
-/// (artifacts.rs). The whole list, replacing the last one.
+/// { exposureId, items: [{ id, dir, entry, status, expiresAt? }], embedAssetsDir?,
+/// restrictedRoots? }: the published artifacts Link serves on surface a, the widget's assets on
+/// surface e, and the folders none of them may come from (artifacts.rs). The whole list,
+/// replacing the last one.
 async fn set_artifacts(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     same_exposure(&state, &body)?;
     let kept = crate::artifacts::parse(&body)?;

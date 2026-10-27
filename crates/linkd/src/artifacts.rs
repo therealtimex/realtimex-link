@@ -9,8 +9,18 @@
 //! Deliberately stricter than RealTimeX's route (§6.1 a–e): one URL decode, any dot segment is
 //! hidden, no credentialed CORS, X-Content-Type-Options: nosniff, and a containment check on
 //! canonical paths that holds on Windows too.
+//!
+//! Protected sources (realtimex-ai-app#2838, Link 0.2.3): RealTimeX also pushes
+//! `restrictedRoots`, the folders that must never be public. Link keeps them with the list, so
+//! they hold while RealTimeX is closed, and decides per request about the file it actually opened:
+//! that file's own path (from its handle) is inside the artifact's folder as it is now and outside
+//! every restricted folder, and the body, a range or a 304 all come from that one handle. A push
+//! that changes the list ends the bodies still streaming from the one before (`Fence`).
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde_json::{json, Value};
@@ -21,6 +31,7 @@ use crate::store::Store;
 pub const KEY: &str = "artifacts";
 const NOT_FOUND: &str = r#"{"error":"Artifact not found."}"#;
 const MAX_ITEMS: usize = 10_000;
+const MAX_RESTRICTED_ROOTS: usize = 1_000;
 
 /// One published artifact as RealTimeX pushed it.
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +118,26 @@ pub fn parse(body: &Value) -> Result<Value, ApiError> {
             "expiresAt": expires_at,
         }));
     }
+    let restricted = match body.get("restrictedRoots") {
+        // An older RealTimeX: nothing restricted.
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(roots)) if roots.len() <= MAX_RESTRICTED_ROOTS => roots
+            .iter()
+            .map(|root| match root.as_str() {
+                Some(root) if Path::new(root).is_absolute() && !root.contains('\0') => {
+                    Ok(json!(root))
+                }
+                _ => Err(ApiError::bad_request(
+                    "restrictedRoots must be absolute paths",
+                )),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(ApiError::bad_request(format!(
+                "restrictedRoots must be a list of at most {MAX_RESTRICTED_ROOTS} paths"
+            )))
+        }
+    };
     let assets = match body.get("embedAssetsDir") {
         None | Some(Value::Null) => Value::Null,
         Some(Value::String(dir)) if Path::new(dir).is_absolute() && !dir.contains('\0') => {
@@ -118,16 +149,33 @@ pub fn parse(body: &Value) -> Result<Value, ApiError> {
             ))
         }
     };
-    Ok(json!({ "items": kept, "embedAssetsDir": assets }))
+    Ok(json!({ "items": kept, "embedAssetsDir": assets, "restrictedRoots": restricted }))
 }
 
+/// Keep a checked push. The same list again (RealTimeX pushes on every start) changes nothing,
+/// so the bodies streaming from it go on.
 pub fn set(store: &Store, value: &Value) -> Result<(), ApiError> {
-    store.set(KEY, value)?;
+    if store.get(KEY).as_ref() != Some(value) {
+        store.set(KEY, value)?;
+    }
     Ok(())
 }
 
-fn find(store: &Store, id: &str) -> Option<Published> {
-    let kept = store.get(KEY)?;
+/// The restricted folders as RealTimeX pushed them.
+fn restricted_roots(kept: &Value) -> Vec<PathBuf> {
+    kept.get("restrictedRoots")
+        .and_then(Value::as_array)
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn find(kept: &Value, id: &str) -> Option<Published> {
     let item = kept
         .get("items")?
         .as_array()?
@@ -161,11 +209,32 @@ pub fn published_count(store: &Store) -> u64 {
 }
 
 pub fn embed_assets_dir(store: &Store) -> Option<PathBuf> {
-    store
-        .get(KEY)?
-        .get("embedAssetsDir")?
-        .as_str()
-        .map(PathBuf::from)
+    embed_dir(&store.get(KEY)?)
+}
+
+fn embed_dir(kept: &Value) -> Option<PathBuf> {
+    kept.get("embedAssetsDir")?.as_str().map(PathBuf::from)
+}
+
+/// What a body was decided from: the list as it was when the request came in. It no longer holds
+/// once a push changed the list, and a body still streaming then ends (relay/origin.rs).
+#[derive(Clone, Debug)]
+pub struct Fence {
+    changes: Arc<AtomicU64>,
+    seen: u64,
+}
+
+impl Fence {
+    /// Taken before the list is read, so a push in between ends the body too.
+    fn now(store: &Store) -> Self {
+        let changes = store.changes(KEY);
+        let seen = changes.load(Ordering::SeqCst);
+        Self { changes, seen }
+    }
+
+    pub fn holds(&self) -> bool {
+        self.changes.load(Ordering::SeqCst) == self.seen
+    }
 }
 
 /// Whether Link answers this request itself: surface a's artifacts, and surface e's widget
@@ -189,15 +258,33 @@ pub struct Answer {
     pub body: Body,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Body {
     Bytes(Vec<u8>),
-    /// `length` bytes of the file from `start`.
+    /// `length` bytes of the opened file from `start`, while `fence` holds.
     File {
-        path: PathBuf,
+        file: File,
         start: u64,
         length: u64,
+        fence: Fence,
     },
+}
+
+impl PartialEq for Body {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Body::Bytes(a), Body::Bytes(b)) => a == b,
+            (
+                Body::File { start, length, .. },
+                Body::File {
+                    start: other_start,
+                    length: other_length,
+                    ..
+                },
+            ) => (start, length) == (other_start, other_length),
+            _ => false,
+        }
+    }
 }
 
 impl Answer {
@@ -262,25 +349,151 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// A regular file under `root` (canonical paths compared, so symlinks may point inside the root
-/// but not out of it); a folder gives its index.html.
-fn resolve(root: &Path, segments: &[String]) -> Option<PathBuf> {
-    let root = std::fs::canonicalize(root).ok()?;
-    let mut target = root.clone();
-    for segment in segments {
-        target.push(segment);
+/// A path as compared with a restricted folder: Windows' and macOS' usual volumes ignore case, and
+/// on Windows a handle's path is verbatim (`\\?\C:\…`) where RealTimeX sends `C:\…`. Only ever
+/// to deny: on a case-sensitive volume it can take two folders for one, which is safe for a
+/// denial and never for an allowance (`open` decides containment on exact handle paths).
+fn comparable(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        let text = text.replace('/', "\\");
+        let text = match text.strip_prefix(r"\\?\UNC\") {
+            Some(share) => format!(r"\\{share}"),
+            None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_string(),
+        };
+        PathBuf::from(text.to_lowercase())
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(text.to_lowercase())
+    } else {
+        path.to_path_buf()
     }
-    let mut target = std::fs::canonicalize(&target).ok()?;
-    if !target.starts_with(&root) {
+}
+
+/// Whether `path` may be inside `root`, case aside (see `comparable`).
+fn maybe_inside(path: &Path, root: &Path) -> bool {
+    comparable(path).starts_with(comparable(root))
+}
+
+fn overlap(a: &Path, b: &Path) -> bool {
+    maybe_inside(a, b) || maybe_inside(b, a)
+}
+
+/// Every form a path has now: as given, canonical, and its handle's own path. One that no longer
+/// exists is only as given.
+fn forms(path: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![path.to_path_buf()];
+    forms.extend(std::fs::canonicalize(path).ok());
+    forms.extend(open_path(path, true).as_ref().and_then(opened_path));
+    forms
+}
+
+/// `path` opened for reading without following it anywhere else later; a folder too when `dir`.
+/// Never blocks on a FIFO.
+fn open_path(path: &Path, dir: bool) -> Option<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = dir;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    if dir {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options.open(path).ok()
+}
+
+/// Where an open file or folder actually is, asked of its handle, not of a path that may have
+/// changed since.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &File) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most MAXPATHLEN (PATH_MAX) bytes, NUL included.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
         return None;
     }
-    if target.is_dir() {
-        target = std::fs::canonicalize(target.join("index.html")).ok()?;
-        if !target.starts_with(&root) {
+    let end = buffer.iter().position(|b| *b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end])))
+}
+
+#[cfg(target_os = "linux")]
+fn opened_path(file: &File) -> Option<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+#[cfg(windows)]
+fn opened_path(file: &File) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+    let mut buffer = vec![0u16; 1024];
+    loop {
+        // SAFETY: the handle is open for the call; the buffer's length is passed with it.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle() as _,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if length == 0 {
             return None;
         }
+        // Too small: the length needed, NUL included.
+        if length >= buffer.len() {
+            buffer.resize(length + 1, 0);
+            continue;
+        }
+        buffer.truncate(length);
+        return Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
     }
-    target.is_file().then_some(target)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn opened_path(_file: &File) -> Option<PathBuf> {
+    None
+}
+
+/// The file a request names, opened once: a regular file whose own path is inside `root` as it is
+/// now and outside every restricted folder, with that path (its type comes from it). A folder
+/// gives its index.html. None for anything else, and for a root that is, holds or lies in a
+/// restricted folder.
+fn open(root: &Path, segments: &[String], restricted: &[PathBuf]) -> Option<(File, PathBuf)> {
+    let restricted: Vec<PathBuf> = restricted
+        .iter()
+        .map(PathBuf::as_path)
+        .flat_map(forms)
+        .collect();
+    let real_root = open_path(root, true).as_ref().and_then(opened_path)?;
+    if forms(root)
+        .iter()
+        .any(|form| restricted.iter().any(|r| overlap(form, r)))
+    {
+        return None;
+    }
+    let mut target = real_root.clone();
+    target.extend(segments);
+    if std::fs::metadata(&target).ok()?.is_dir() {
+        target.push("index.html");
+    }
+    let file = open_path(&target, false)?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let opened = opened_path(&file)?;
+    // Inside: both paths come from the system's handles in the same form, so they compare
+    // exactly, the way the volume tells its folders apart.
+    (opened.starts_with(&real_root) && !restricted.iter().any(|r| maybe_inside(&opened, r)))
+        .then_some((file, opened))
 }
 
 /// GET or HEAD /ar/<id>[/<path>] (surface a), as RealTimeX's route answered it.
@@ -300,7 +513,11 @@ pub fn artifact(
     if !valid_id(&id) {
         return Answer::not_found();
     }
-    let Some(published) = find(store, &id).filter(|p| p.active(crate::util::now_ms())) else {
+    let fence = Fence::now(store);
+    let Some(kept) = store.get(KEY) else {
+        return Answer::not_found();
+    };
+    let Some(published) = find(&kept, &id).filter(|p| p.active(crate::util::now_ms())) else {
         return Answer::not_found();
     };
     let requested = if path.trim_matches('/').is_empty() {
@@ -308,10 +525,12 @@ pub fn artifact(
     } else {
         segments(path)
     };
-    let Some(file) = requested.and_then(|segments| resolve(&published.dir, &segments)) else {
+    let restricted = restricted_roots(&kept);
+    let Some(opened) = requested.and_then(|segments| open(&published.dir, &segments, &restricted))
+    else {
         return Answer::not_found();
     };
-    let mut answer = file_answer(&file, method, headers);
+    let mut answer = file_answer(opened, fence, method, headers);
     answer
         .headers
         .push(("cache-control".into(), "no-store".into()));
@@ -342,15 +561,16 @@ pub fn embed_asset(
         return answer;
     }
     let rest = pathname.strip_prefix("/embed").unwrap_or("");
-    let file = embed_assets_dir(store).and_then(|dir| {
-        segments(rest)
-            .filter(|s| !s.is_empty())
-            .and_then(|segments| resolve(&dir, &segments))
+    let fence = Fence::now(store);
+    let opened = store.get(KEY).and_then(|kept| {
+        let dir = embed_dir(&kept)?;
+        let segments = segments(rest).filter(|s| !s.is_empty())?;
+        open(&dir, &segments, &restricted_roots(&kept))
     });
-    let Some(file) = file else {
+    let Some(opened) = opened else {
         return text(404, "Not found.");
     };
-    let mut answer = file_answer(&file, method, headers);
+    let mut answer = file_answer(opened, fence, method, headers);
     answer
         .headers
         .push(("cache-control".into(), "public, max-age=300".into()));
@@ -358,9 +578,15 @@ pub fn embed_asset(
 }
 
 /// A file as `send` (Express's sendFile) answers it: its type, Last-Modified, a weak ETag,
-/// Accept-Ranges, 304 for a fresh copy, 206 for one range and 416 for one out of bounds.
-fn file_answer(file: &Path, method: &str, headers: &[(String, String)]) -> Answer {
-    let Ok(meta) = std::fs::metadata(file) else {
+/// Accept-Ranges, 304 for a fresh copy, 206 for one range and 416 for one out of bounds. All of
+/// it from the opened file, never its path again.
+fn file_answer(
+    (file, path): (File, PathBuf),
+    fence: Fence,
+    method: &str,
+    headers: &[(String, String)],
+) -> Answer {
+    let Ok(meta) = file.metadata() else {
         return Answer::not_found();
     };
     let size = meta.len();
@@ -380,7 +606,7 @@ fn file_answer(file: &Path, method: &str, headers: &[(String, String)]) -> Answe
             .map(|(_, v)| v.as_str())
     };
     let mut out = vec![
-        ("content-type".to_string(), content_type(file).to_string()),
+        ("content-type".to_string(), content_type(&path).to_string()),
         ("accept-ranges".to_string(), "bytes".to_string()),
         ("last-modified".to_string(), last_modified.clone()),
         ("etag".to_string(), etag.clone()),
@@ -428,9 +654,10 @@ fn file_answer(file: &Path, method: &str, headers: &[(String, String)]) -> Answe
         Body::Bytes(Vec::new())
     } else {
         Body::File {
-            path: file.to_path_buf(),
+            file,
             start,
             length,
+            fence,
         }
     };
     Answer {
@@ -532,16 +759,52 @@ mod tests {
     use super::*;
 
     fn store_with(dir: &Path, items: Value) -> (tempfile::TempDir, Store) {
+        store_restricting(dir, items, &[])
+    }
+
+    /// `items`' dirs and the `restricted` folders are relative to `dir`.
+    fn store_restricting(
+        dir: &Path,
+        items: Value,
+        restricted: &[&str],
+    ) -> (tempfile::TempDir, Store) {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open(data.path()).unwrap();
-        let mut body = json!({ "items": items, "embedAssetsDir": dir.join("embed").to_str() });
+        set(&store, &push(dir, items, restricted)).unwrap();
+        (data, store)
+    }
+
+    fn push(dir: &Path, items: Value, restricted: &[&str]) -> Value {
+        let mut body = json!({
+            "items": items,
+            "embedAssetsDir": dir.join("embed").to_str(),
+            "restrictedRoots": restricted.iter().map(|r| dir.join(r).to_str().unwrap().to_string()).collect::<Vec<_>>(),
+        });
         if let Some(list) = body["items"].as_array_mut() {
             for item in list {
                 item["dir"] = json!(dir.join(item["dir"].as_str().unwrap()).to_str());
             }
         }
-        set(&store, &parse(&body).unwrap()).unwrap();
-        (data, store)
+        parse(&body).unwrap()
+    }
+
+    /// What the body sends: its bytes of the opened file.
+    fn sent(answer: Answer) -> Vec<u8> {
+        use std::io::{Read, Seek};
+        match answer.body {
+            Body::Bytes(bytes) => bytes,
+            Body::File {
+                mut file,
+                start,
+                length,
+                ..
+            } => {
+                file.seek(std::io::SeekFrom::Start(start)).unwrap();
+                let mut bytes = vec![0; length as usize];
+                file.read_exact(&mut bytes).unwrap();
+                bytes
+            }
+        }
     }
 
     fn get(store: &Store, path: &str, headers: &[(&str, &str)]) -> Answer {
@@ -756,6 +1019,193 @@ mod tests {
         );
         assert_eq!(embed_asset(&store, "GET", "/embed", &[]).status, 404);
         assert_eq!(embed_asset(&store, "POST", "/embed/x.js", &[]).status, 405);
+    }
+
+    const SITE: &str = "0123456789abcdef";
+
+    fn one_site(dir: &str) -> Value {
+        json!([{ "id": SITE, "dir": dir, "entry": "index.html", "status": "published" }])
+    }
+
+    #[test]
+    fn an_artifact_clear_of_every_restricted_folder_is_served_whole() {
+        let root = site();
+        std::fs::create_dir_all(root.path().join("protected")).unwrap();
+        let (_data, store) = store_restricting(
+            root.path(),
+            one_site("site"),
+            &["protected", "gone-since", "single"],
+        );
+        let page = get(&store, &format!("/ar/{SITE}"), &[]);
+        assert_eq!(page.status, 200);
+        assert_eq!(sent(page), b"<h1>hi</h1>");
+        let head = artifact(&store, "HEAD", &format!("/ar/{SITE}"), &[]);
+        assert_eq!((head.status, sent(head)), (200, Vec::new()));
+        let path = format!("/ar/{SITE}/assets/data.bin");
+        let part = get(&store, &path, &[("Range", "bytes=10-19")]);
+        assert_eq!((part.status, sent(part)), (206, vec![0u8; 10]));
+        let etag = header(&get(&store, &path, &[]), "etag")
+            .unwrap()
+            .to_string();
+        assert_eq!(get(&store, &path, &[("If-None-Match", &etag)]).status, 304);
+        let embed = embed_asset(&store, "GET", "/embed/realtimex-chat-widget.min.js", &[]);
+        assert_eq!(sent(embed), b"widget");
+    }
+
+    #[test]
+    fn a_root_that_is_holds_or_lies_in_a_restricted_folder_is_not_found() {
+        let root = site();
+        for (dir, restricted) in [
+            ("site", "site"),
+            ("site", "site/assets"),
+            ("site/assets", "site"),
+            // Only as stored: it no longer exists, and still counts.
+            ("site", "site/removed-later"),
+        ] {
+            let (_data, store) = store_restricting(root.path(), one_site(dir), &[restricted]);
+            for path in [format!("/ar/{SITE}"), format!("/ar/{SITE}/app.js")] {
+                let answer = get(&store, &path, &[]);
+                assert_eq!(
+                    answer.status, 404,
+                    "{dir} with {restricted} restricted: {path}"
+                );
+                assert_eq!(answer.body, Body::Bytes(NOT_FOUND.as_bytes().to_vec()));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_swapped_for_a_link_into_a_restricted_folder_is_not_found() {
+        let root = site();
+        let protected = root.path().join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("index.html"), "secret").unwrap();
+        let (_data, store) = store_restricting(root.path(), one_site("site"), &["protected"]);
+        assert_eq!(get(&store, &format!("/ar/{SITE}"), &[]).status, 200);
+        // After the push, with RealTimeX closed: the folder becomes a link to the protected one.
+        std::fs::rename(root.path().join("site"), root.path().join("site-before")).unwrap();
+        std::os::unix::fs::symlink(&protected, root.path().join("site")).unwrap();
+        let answer = get(&store, &format!("/ar/{SITE}"), &[]);
+        assert_eq!(answer.status, 404);
+        assert_eq!(answer.body, Body::Bytes(NOT_FOUND.as_bytes().to_vec()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_links_into_a_restricted_folder_is_not_found() {
+        let root = site();
+        let protected = root.path().join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("notes.html"), "secret").unwrap();
+        let site_dir = root.path().join("site");
+        std::os::unix::fs::symlink(protected.join("notes.html"), site_dir.join("notes.html"))
+            .unwrap();
+        std::os::unix::fs::symlink(&protected, site_dir.join("docs")).unwrap();
+        let (_data, store) = store_restricting(root.path(), one_site("site"), &["protected"]);
+        for path in ["notes.html", "docs/notes.html", "docs"] {
+            assert_eq!(
+                get(&store, &format!("/ar/{SITE}/{path}"), &[]).status,
+                404,
+                "{path}"
+            );
+        }
+        assert_eq!(get(&store, &format!("/ar/{SITE}"), &[]).status, 200);
+    }
+
+    /// A sibling folder that differs only in case (a case-sensitive volume: Linux, or a
+    /// case-sensitive APFS one) is outside the root, even with nothing restricted.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_a_folder_that_differs_only_in_case_is_not_found() {
+        let root = site();
+        let other = root.path().join("Site");
+        if std::fs::create_dir(&other).is_err() {
+            // A case-insensitive volume: "Site" is "site", there is no second folder.
+            return;
+        }
+        std::fs::write(other.join("private.txt"), "private").unwrap();
+        std::os::unix::fs::symlink("../Site/private.txt", root.path().join("site/leak.txt"))
+            .unwrap();
+        let (_data, store) = store_with(root.path(), one_site("site"));
+        let answer = get(&store, &format!("/ar/{SITE}/leak.txt"), &[]);
+        assert_eq!(answer.status, 404);
+        assert_eq!(answer.body, Body::Bytes(NOT_FOUND.as_bytes().to_vec()));
+        assert_eq!(get(&store, &format!("/ar/{SITE}"), &[]).status, 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_replaced_after_its_file_was_opened_sends_only_the_opened_file() {
+        let root = site();
+        let (_data, store) = store_with(root.path(), one_site("site"));
+        let answer = get(&store, &format!("/ar/{SITE}"), &[]);
+        assert_eq!(answer.status, 200);
+        let page = root.path().join("site/index.html");
+        let swap = root.path().join("swap.html");
+        std::fs::write(&swap, "<h1>replaced</h1>").unwrap();
+        std::fs::rename(&swap, &page).unwrap();
+        assert_eq!(sent(answer), b"<h1>hi</h1>");
+        let part = get(&store, &format!("/ar/{SITE}"), &[("Range", "bytes=4-11")]);
+        std::fs::remove_file(&page).unwrap();
+        assert_eq!(sent(part), b"replaced");
+    }
+
+    #[test]
+    fn only_a_push_that_changes_the_list_ends_the_bodies_from_the_last_one() {
+        let root = site();
+        let (_data, store) = store_with(root.path(), one_site("site"));
+        let fence = |answer: Answer| match answer.body {
+            Body::File { fence, .. } => fence,
+            body => panic!("{body:?}"),
+        };
+        let streaming = fence(get(&store, &format!("/ar/{SITE}"), &[]));
+        // RealTimeX starting again pushes the same list.
+        set(&store, &push(root.path(), one_site("site"), &[])).unwrap();
+        assert!(streaming.holds());
+        set(&store, &push(root.path(), one_site("site"), &["elsewhere"])).unwrap();
+        assert!(!streaming.holds());
+        let next = fence(get(&store, &format!("/ar/{SITE}"), &[]));
+        assert!(next.holds());
+        set(&store, &push(root.path(), json!([]), &["elsewhere"])).unwrap();
+        assert!(!next.holds());
+    }
+
+    #[test]
+    fn restricted_folders_still_hold_after_a_restart_without_realtimex() {
+        let root = site();
+        let data = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(data.path()).unwrap();
+            set(&store, &push(root.path(), one_site("site"), &["site"])).unwrap();
+        }
+        let store = Store::open(data.path()).unwrap();
+        assert_eq!(get(&store, &format!("/ar/{SITE}"), &[]).status, 404);
+        assert_eq!(
+            store.get(KEY).unwrap()["restrictedRoots"],
+            json!([root.path().join("site").to_str()])
+        );
+    }
+
+    #[test]
+    fn restricted_roots_are_absolute_paths_and_optional() {
+        let body = json!({ "items": [] });
+        assert_eq!(parse(&body).unwrap()["restrictedRoots"], json!([]));
+        let too_many: Vec<String> = (0..=MAX_RESTRICTED_ROOTS)
+            .map(|n| format!("/r/{n}"))
+            .collect();
+        for roots in [
+            json!("/one"),
+            json!(["relative"]),
+            json!([1]),
+            json!(["/nul\0"]),
+            json!(too_many),
+        ] {
+            assert!(
+                parse(&json!({ "items": [], "restrictedRoots": roots })).is_err(),
+                "{roots}"
+            );
+        }
     }
 
     #[test]

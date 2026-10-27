@@ -58,7 +58,9 @@ const VK_CONTROL: u16 = 0x11;
 const VK_SHIFT: u16 = 0x10;
 const VK_V: u16 = 0x56;
 /// How long the pasted text stays on the clipboard before the previous text comes back: the
-/// target app reads it when it handles Ctrl+V, after SendInput has returned.
+/// target app reads it when it handles Ctrl+V, after SendInput has returned. The paste doesn't
+/// wait for it (typing would take this long per batch): the control loop restores it when due
+/// (`restore_due`), and a paste before then moves it on.
 const RESTORE_CLIPBOARD_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Nothing to grant on Windows.
@@ -85,6 +87,8 @@ pub struct Input {
     /// The clipboard sequence number right after this helper's own last write (a paste, or
     /// putting back what was there): not a copy to send to the viewer (#2682).
     own_seq: Option<u32>,
+    /// The last paste's text to put back, and when.
+    restore: Option<(clipboard::Saved, std::time::Instant)>,
 }
 
 impl Input {
@@ -99,6 +103,7 @@ impl Input {
             screen: (w as f64, h as f64),
             clipboard: WinClipboard::new()?,
             own_seq: None,
+            restore: None,
         })
     }
 
@@ -180,19 +185,32 @@ impl Input {
     }
 
     /// Put the text on the clipboard and press Ctrl+V (Ctrl+Shift+V in terminals, which
-    /// Windows Terminal and most others accept), then bring the previous text back.
+    /// Windows Terminal and most others accept). The previous text comes back later
+    /// (`restore_clipboard`).
     pub fn paste_text(&mut self, text: &str, terminal: bool) -> Result<()> {
-        let saved = clipboard::put_text(&mut self.clipboard, text)?;
+        let pending = self.restore.take().map(|(saved, _)| saved);
+        let saved = clipboard::put_text(&mut self.clipboard, text, pending)?;
         self.note_own_write();
         let sent = press_paste(terminal);
         if saved.previous.is_some() {
-            std::thread::sleep(RESTORE_CLIPBOARD_AFTER);
-            // Kept as it is when newer content arrived meanwhile.
+            self.restore = Some((saved, std::time::Instant::now() + RESTORE_CLIPBOARD_AFTER));
+        }
+        sent
+    }
+
+    /// When the last paste's previous text is due back.
+    pub fn restore_due(&self) -> Option<std::time::Instant> {
+        self.restore.as_ref().map(|(_, due)| *due)
+    }
+
+    /// Put the last paste's previous text back now. Kept as it is when newer content arrived
+    /// meanwhile.
+    pub fn restore_clipboard(&mut self) {
+        if let Some((saved, _)) = self.restore.take() {
             if clipboard::restore(&mut self.clipboard, &saved).unwrap_or(false) {
                 self.note_own_write();
             }
         }
-        sent
     }
 
     fn note_own_write(&mut self) {
@@ -216,6 +234,8 @@ impl Input {
     /// Put these files on the clipboard as Explorer copies them (CF_HDROP, "copy") and press
     /// Ctrl+V: a folder copies them in, an app such as RealTimeX attaches them.
     pub fn paste_files(&mut self, paths: &[String]) -> Result<()> {
+        // They stay on the clipboard, as after a local paste.
+        self.restore = None;
         self.clipboard.open()?;
         let put = self.clipboard.replace_files(paths);
         self.clipboard.close();
@@ -229,12 +249,24 @@ impl Input {
     /// image from CF_DIB; PNG alone pasted nothing in RealTimeX (#2747). It stays on the
     /// clipboard, as after a local paste.
     pub fn paste_image(&mut self, png: &[u8], dib: Option<&[u8]>) -> Result<()> {
+        self.restore = None;
         self.clipboard.open()?;
         let put = self.clipboard.replace_png(png, dib);
         self.clipboard.close();
         put?;
         self.note_own_write();
         press_paste(false)
+    }
+}
+
+impl Drop for Input {
+    /// The session ends: the last paste's previous text still comes back, once the app had its
+    /// time to read the paste.
+    fn drop(&mut self) {
+        if let Some(due) = self.restore_due() {
+            std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+            self.restore_clipboard();
+        }
     }
 }
 

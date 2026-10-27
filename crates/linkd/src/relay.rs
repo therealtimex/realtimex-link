@@ -3591,13 +3591,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_adoption_whose_enrollment_fails_converges_before_it_counts() {
         let all = ["a", "e", "h", "m", "p", "d"];
-        let (base, seen) = marketplace(move |method, path, _, _, before| match (method, path) {
+        let enrolled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (base, seen) = marketplace(move |method, path, key, _, _| match (method, path) {
             // RealTimeX's exposure as it was: no Remote Control.
             ("POST", "/v1/relay-exposures/rtxExposure/recover") => {
                 (200, view("rtxExposure", &["a", "e", "h", "m"], "recovered"))
             }
-            // The Marketplace is down twice, then fine.
-            ("POST", "/v1/relay-exposures") if before < 2 => (503, json!({ "message": "busy" })),
+            // Adopting again asks first whether the exposure was taken: it wasn't.
+            ("POST", "/v1/relay-exposures") if key.starts_with("relay-probe-") => {
+                (200, view("rtxExposure", &all, "recovered"))
+            }
+            // The Marketplace is down for two enrollments, then fine (counted apart from the
+            // probes, which come whenever the test adopts).
+            ("POST", "/v1/relay-exposures") if enrolled.fetch_add(1, Ordering::SeqCst) < 2 => {
+                (503, json!({ "message": "busy" }))
+            }
             ("POST", "/v1/relay-exposures") => (200, view("rtxExposure", &all, "recovered")),
             ("DELETE", "/v1/relay-exposures/linkOwn") => (200, json!({})),
             _ => (404, json!({ "message": "unexpected" })),
