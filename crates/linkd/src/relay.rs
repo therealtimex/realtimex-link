@@ -1293,7 +1293,13 @@ impl Relay {
         let mut retaken = None;
         if let Some(adopted) = self.adopted_id() {
             if exposure_id.is_none_or(|id| id == adopted) {
-                if !self.taken(&host, &token, install_id).await {
+                // Whether it was taken must be known: a probe that failed (a timeout, the
+                // Marketplace busy) is no answer, and the adopt is asked again.
+                let taken = self
+                    .taken(&host, &token, install_id)
+                    .await
+                    .map_err(|message| adopt_pending(&message))?;
+                if !taken {
                     if !self.complete() {
                         self.converge();
                         return Err(adopt_pending("its surfaces are still being enrolled"));
@@ -1431,10 +1437,11 @@ impl Relay {
     /// Whether the relay wants the stored credential back (another connector took the exposure):
     /// asked with an update that presents it, which changes nothing while it still holds. Not
     /// while the relay serves the exposure with everything: a taken one's connection is closed.
-    /// Its own operation, so the enrollment's retries keep theirs.
-    async fn taken(&self, host: &Host, token: &Account, install_id: &str) -> bool {
+    /// Its own operation, so the enrollment's retries keep theirs. Any other failure is no
+    /// answer: Err.
+    async fn taken(&self, host: &Host, token: &Account, install_id: &str) -> Result<bool, String> {
         if self.serving_complete() {
-            return false;
+            return Ok(false);
         }
         let credential = host
             .store
@@ -1452,8 +1459,14 @@ impl Relay {
         );
         let url = format!("{}/v1/relay-exposures", token.api_base);
         let key = format!("relay-probe-{}", crate::util::uuid());
-        let answer = api_post(&url, &token.token, &key, &body).await;
-        matches!(answer, Err(failure) if failure.status == 409 && credential_required(&failure))
+        match api_post(&url, &token.token, &key, &body).await {
+            Ok(_) => Ok(false),
+            Err(failure) if failure.status == 409 && credential_required(&failure) => Ok(true),
+            Err(failure) => Err(format!(
+                "whether another install took the exposure is unknown: {}",
+                failure.message
+            )),
+        }
     }
 
     /// Every surface on the adopted exposure, with its app ID (an update without it clears it).
@@ -4052,6 +4065,53 @@ mod tests {
         let error = relay.enroll(&host, &account).await.unwrap_err();
         assert!(format!("{error:#}").contains(EXPOSURE_TAKEN), "{error:#}");
         assert_eq!(recoveries(&seen), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_adopt_whose_probe_fails_is_pending_and_its_retry_takes_the_exposure_back() {
+        // Adopted and complete, but another install took rtxExposure (c2); the first probe meets
+        // a busy Marketplace.
+        let current = Arc::new(Mutex::new("c2".to_string()));
+        let inner = adopted_marketplace(current.clone());
+        let busy = std::sync::atomic::AtomicBool::new(true);
+        let (base, seen) = marketplace(move |method, path, key, body, before| {
+            if key.starts_with("relay-probe-") && busy.swap(false, Ordering::SeqCst) {
+                return (503, json!({ "message": "busy" }));
+            }
+            inner(method, path, key, body, before)
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = adopted_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        assert!(relay.complete());
+        let pending = relay
+            .adopt(Some("rtxExposure"), "rtx-install", "u1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (pending.status, pending.code.as_deref()),
+            (503, Some("adopt-pending"))
+        );
+        assert_eq!(recoveries(&seen), 0);
+        assert_eq!(*current.lock().unwrap(), "c2");
+        // The retry gets its answer and takes the exposure back.
+        let answer = relay
+            .adopt(Some("rtxExposure"), "rtx-install", "u1")
+            .await
+            .unwrap();
+        assert_eq!(answer["appId"], "rtxExposure");
+        assert_eq!(recoveries(&seen), 1);
+        let credential = host
+            .open_secret(&host.store.get(keys::CREDENTIAL).unwrap())
+            .unwrap();
+        assert_eq!(credential, *current.lock().unwrap());
+        // No flip-flop: the relay loop never takes it back by itself.
+        *current.lock().unwrap() = "c3".into();
+        let account = relay.account().await.unwrap();
+        let error = relay.enroll(&host, &account).await.unwrap_err();
+        assert!(format!("{error:#}").contains(EXPOSURE_TAKEN), "{error:#}");
+        assert_eq!(recoveries(&seen), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

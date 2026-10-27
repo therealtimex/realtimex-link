@@ -39,6 +39,8 @@ pub fn veil(cc: &eframe::CreationContext<'_>) {
         };
         if see_through(raw, true) {
             VEILED.store(raw, Ordering::Relaxed);
+            #[cfg(target_os = "macos")]
+            never_key_while_veiled();
         }
     }
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -62,6 +64,36 @@ fn see_through(raw: usize, on: bool) -> bool {
     // Nor does it take a click in the moment it is on the screen.
     window.setIgnoresMouseEvents(on);
     true
+}
+
+/// macOS: eframe's first show is winit's makeKeyAndOrderFront, which would make the veiled window
+/// the key window for the moment it is on the screen. winit's window class always answers yes to
+/// becoming key (and main); while a window is veiled, the answer is no, so it never takes the
+/// keyboard. Once opened (apply), the answer is yes again.
+#[cfg(target_os = "macos")]
+fn never_key_while_veiled() {
+    use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+    extern "C-unwind" fn can_become(_this: &AnyObject, _cmd: Sel) -> Bool {
+        Bool::new(VEILED.load(Ordering::Relaxed) == 0)
+    }
+    let Some(class) = AnyClass::get(c"WinitWindow") else {
+        return;
+    };
+    for selector in [
+        objc2::sel!(canBecomeKeyWindow),
+        objc2::sel!(canBecomeMainWindow),
+    ] {
+        if let Some(method) = class.instance_method(selector) {
+            // SAFETY: the same signature as winit's methods (BOOL, no arguments), and as safe:
+            // it reads an atomic. Only on the main thread, before the first frame.
+            unsafe {
+                let imp = std::mem::transmute::<extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
+                    can_become,
+                );
+                method.set_implementation(imp);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
