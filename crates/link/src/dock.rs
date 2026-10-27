@@ -59,6 +59,8 @@ fn see_through(raw: usize, on: bool) -> bool {
         return false;
     };
     window.setAlphaValue(if on { 0.0 } else { 1.0 });
+    // Nor does it take a click in the moment it is on the screen.
+    window.setIgnoresMouseEvents(on);
     true
 }
 
