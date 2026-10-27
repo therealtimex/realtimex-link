@@ -848,7 +848,8 @@ impl Host {
     ///   adopted from it goes too (that instance adopts it next, and this one must never take it
     ///   back), and Link signs out for RealTimeX (no token: nothing to recover or enroll until the
     ///   next handover). In that order, the owner record last, so a crash part-way leaves a
-    ///   release RealTimeX can retry.
+    ///   release RealTimeX can retry; and with no work with the Marketplace in flight or starting
+    ///   until the token is gone, so nothing enrolls or recovers what moved.
     ///
     /// Answers the dropped exposure's ID. 409 adopted-other from anyone but the owner, and when
     /// no RealTimeX owns Link.
@@ -867,6 +868,7 @@ impl Host {
         crate::owner::check(&self.store, install_id)?;
         let mut dropped = None;
         if moves {
+            let _quiet = self.relay.hold_remote_work().await;
             dropped = self.relay.release_adopted().map_err(ApiError::internal)?;
             self.signin
                 .sign_out_for_realtimex()
