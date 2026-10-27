@@ -3,7 +3,8 @@
 //!
 //! The text goes on the clipboard, the paste keys are pressed, and the previous text comes
 //! back afterwards, unless something else (the person, another app) put newer content there in
-//! between.
+//! between. Pastes in a row (typing) bring it back once, after the last one: each one passes the
+//! text the first one took off to the next.
 //!
 //! How "unchanged" is decided: Windows' clipboard sequence number changes with every new
 //! content. The paste reads it while it still holds the clipboard lock, right after its own
@@ -38,11 +39,20 @@ pub struct Saved {
     pub sequence: u32,
 }
 
-/// Put the text on the clipboard, keeping its previous text. When the write fails the previous
-/// text goes back before the error is returned, so a failed paste doesn't erase the clipboard.
-pub fn put_text(clipboard: &mut impl Clipboard, text: &str) -> Result<Saved> {
+/// Put the text on the clipboard, keeping its previous text. `pending` is an earlier paste not
+/// restored yet: while the clipboard still holds its text, what comes back later is what that
+/// paste took off. When the write fails the previous text goes back before the error is
+/// returned, so a failed paste doesn't erase the clipboard.
+pub fn put_text(
+    clipboard: &mut impl Clipboard,
+    text: &str,
+    pending: Option<Saved>,
+) -> Result<Saved> {
     clipboard.open()?;
-    let previous = clipboard.text();
+    let previous = match pending {
+        Some(pending) if unchanged(clipboard, &pending) => pending.previous,
+        _ => clipboard.text(),
+    };
     if let Err(error) = clipboard.replace(text) {
         if let Some(previous) = &previous {
             let _ = clipboard.replace(previous);
@@ -65,16 +75,20 @@ pub fn restore(clipboard: &mut impl Clipboard, saved: &Saved) -> Result<bool> {
     };
     clipboard.open()?;
     // Checked under the clipboard lock, so nothing can change it between check and write.
-    let current = clipboard.sequence();
-    let unchanged = current == saved.sequence
-        || (current == saved.sequence.wrapping_add(1) && clipboard.owned());
-    let result = if unchanged {
+    let ours = unchanged(clipboard, saved);
+    let result = if ours {
         clipboard.replace(previous)
     } else {
         Ok(())
     };
     clipboard.close();
-    result.map(|()| unchanged)
+    result.map(|()| ours)
+}
+
+/// Whether the open clipboard still holds the paste's own write (see the module comment).
+fn unchanged(clipboard: &mut impl Clipboard, saved: &Saved) -> bool {
+    let current = clipboard.sequence();
+    current == saved.sequence || (current == saved.sequence.wrapping_add(1) && clipboard.owned())
 }
 
 #[cfg(test)]
@@ -173,7 +187,7 @@ mod tests {
     #[test]
     fn puts_the_text_on_then_restores_the_previous_text() {
         let mut clipboard = Fake::holding("before");
-        let saved = put_text(&mut clipboard, "pasted").unwrap();
+        let saved = put_text(&mut clipboard, "pasted", None).unwrap();
         assert_eq!(clipboard.content.as_deref(), Some("pasted"));
         assert_eq!(saved.previous.as_deref(), Some("before"));
         // The number is read while the lock is still held.
@@ -197,7 +211,7 @@ mod tests {
             bump_on_close: true,
             ..Fake::holding("before")
         };
-        let saved = put_text(&mut clipboard, "pasted").unwrap();
+        let saved = put_text(&mut clipboard, "pasted", None).unwrap();
         assert_eq!(clipboard.sequence, saved.sequence + 1);
         assert!(restore(&mut clipboard, &saved).unwrap());
         assert_eq!(clipboard.content.as_deref(), Some("before"));
@@ -211,7 +225,7 @@ mod tests {
                 written_after_first_close: Some("newer".into()),
                 ..Fake::holding("before")
             };
-            let saved = put_text(&mut clipboard, "pasted").unwrap();
+            let saved = put_text(&mut clipboard, "pasted", None).unwrap();
             assert_eq!(clipboard.content.as_deref(), Some("newer"));
             assert!(!restore(&mut clipboard, &saved).unwrap());
             assert_eq!(clipboard.content.as_deref(), Some("newer"));
@@ -223,7 +237,7 @@ mod tests {
     fn a_failed_write_puts_the_previous_text_back_and_closes() {
         let mut clipboard = Fake::holding("before");
         clipboard.fail_writes_of = Some("pasted".into());
-        assert!(put_text(&mut clipboard, "pasted").is_err());
+        assert!(put_text(&mut clipboard, "pasted", None).is_err());
         assert_eq!(clipboard.content.as_deref(), Some("before"));
         assert!(!clipboard.open);
         assert_eq!(
@@ -235,7 +249,7 @@ mod tests {
     #[test]
     fn keeps_newer_content_written_while_the_paste_waited() {
         let mut clipboard = Fake::holding("before");
-        let saved = put_text(&mut clipboard, "pasted").unwrap();
+        let saved = put_text(&mut clipboard, "pasted", None).unwrap();
         clipboard.written_by_someone_else("newer");
         assert!(!restore(&mut clipboard, &saved).unwrap());
         assert_eq!(clipboard.content.as_deref(), Some("newer"));
@@ -243,9 +257,36 @@ mod tests {
     }
 
     #[test]
+    fn pastes_in_a_row_bring_back_what_was_there_before_the_first() {
+        for bump_on_close in [false, true] {
+            let mut clipboard = Fake {
+                bump_on_close,
+                ..Fake::holding("before")
+            };
+            let first = put_text(&mut clipboard, "one", None).unwrap();
+            let second = put_text(&mut clipboard, "two", Some(first)).unwrap();
+            assert_eq!(clipboard.content.as_deref(), Some("two"));
+            assert_eq!(second.previous.as_deref(), Some("before"));
+            assert!(restore(&mut clipboard, &second).unwrap());
+            assert_eq!(clipboard.content.as_deref(), Some("before"));
+        }
+    }
+
+    #[test]
+    fn a_paste_after_someone_elses_copy_brings_that_copy_back() {
+        let mut clipboard = Fake::holding("before");
+        let first = put_text(&mut clipboard, "one", None).unwrap();
+        clipboard.written_by_someone_else("newer");
+        let second = put_text(&mut clipboard, "two", Some(first)).unwrap();
+        assert_eq!(second.previous.as_deref(), Some("newer"));
+        assert!(restore(&mut clipboard, &second).unwrap());
+        assert_eq!(clipboard.content.as_deref(), Some("newer"));
+    }
+
+    #[test]
     fn leaves_the_paste_text_when_the_clipboard_held_no_text() {
         let mut clipboard = Fake::default();
-        let saved = put_text(&mut clipboard, "pasted").unwrap();
+        let saved = put_text(&mut clipboard, "pasted", None).unwrap();
         assert_eq!(saved.previous, None);
         clipboard.log.clear();
         assert!(!restore(&mut clipboard, &saved).unwrap());

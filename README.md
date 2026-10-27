@@ -149,12 +149,18 @@ kebab-case.
   out hides its row, and Link writes the text. `GET /v1/shared` → `{ items, origin }`. Kept across
   restarts. Up to 1 MiB.
 - **`artifacts`** (M2): `PUT /v1/artifacts { exposureId, items: [{ id, dir, entry, status,
-  expiresAt? }], embedAssetsDir? }` (up to 1 MiB). Link serves surface `a`'s `/ar/<id>/…` from
+  expiresAt? }], embedAssetsDir?, restrictedRoots? }` (up to 1 MiB). Link serves surface `a`'s `/ar/<id>/…` from
   those folders itself, whether RealTimeX runs or not, as RealTimeX's route answered (the entry
   file; `index.html` for a folder; `Cache-Control: no-store`, `X-Robots-Tag: noindex`; types by
   extension; ETag, Last-Modified, 304 and one Range; paused, revoked, expired or missing: 404
   `{"error":"Artifact not found."}`), stricter on decoding, dot segments, symlinks out of the
   folder and `nosniff`. Surface `e`'s `/embed/<file>` comes from `embedAssetsDir`.
+  `restrictedRoots?` (0.2.3, realtimex-ai-app#2838; at most 1000 absolute paths) are the folders
+  nothing may be served from, kept with the list so they hold while RealTimeX is closed. Each
+  request opens its file once and checks the path of that open file: inside the artifact's folder
+  as it is now, outside every restricted folder (as pushed, canonical, or its own path now), and
+  the folder itself neither is, holds nor lies in one; the body, a range and a 304 come from that
+  file only. A push that changes the list ends the bodies still streaming from the last one.
 - **`webhooks`** (M3): `PUT /v1/webhooks { exposureId, items: [{ tokens, enabled, maxBodyBytes,
   perMinute, ackStatus, handshake, verifyTokenSha256? }] }` (up to 1 MiB). While RealTimeX isn't
   there (no origin, or one that refuses), `/wh/<token>` deliveries are checked for token, enabled,

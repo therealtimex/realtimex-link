@@ -456,9 +456,13 @@ async fn unanswered(
     }
 }
 
-/// An answer Link gives itself (artifacts.rs, webhooks.rs), a file streamed in frames.
+/// An answer Link gives itself (artifacts.rs, webhooks.rs), a file streamed in frames from the
+/// handle it was decided on. A push that changed the artifacts list since ends it.
 pub(super) async fn send_answer(id: u32, answer: Answer, send: &Sender) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if matches!(&answer.body, Body::File { fence, .. } if !fence.holds()) {
+        return reset(id, send, CHANGED).await;
+    }
     let headers: serde_json::Map<String, Value> = answer
         .headers
         .into_iter()
@@ -481,20 +485,21 @@ pub(super) async fn send_answer(id: u32, answer: Answer, send: &Sender) {
             }
         }
         Body::File {
-            path,
+            file,
             start,
             length,
+            fence,
         } => {
-            let file = tokio::fs::File::open(&path).await;
-            let Ok(mut file) = file else {
-                return reset(id, send, "the file went away").await;
-            };
+            let mut file = tokio::fs::File::from_std(file);
             if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
                 return reset(id, send, "the file went away").await;
             }
             let mut left = length;
             let mut buffer = vec![0u8; 64 * 1024];
             while left > 0 {
+                if !fence.holds() {
+                    return reset(id, send, CHANGED).await;
+                }
                 let want = left.min(buffer.len() as u64) as usize;
                 match file.read(&mut buffer[..want]).await {
                     Ok(0) | Err(_) => return reset(id, send, "the file changed").await,
@@ -510,6 +515,8 @@ pub(super) async fn send_answer(id: u32, answer: Answer, send: &Sender) {
     }
     send.raw(frame::END, id, &[], 0).await;
 }
+
+const CHANGED: &str = "the published artifacts changed";
 
 async fn reset(id: u32, send: &Sender, reason: &str) {
     send.meta(frame::RESET, id, &json!({ "error": reason }))
@@ -693,6 +700,56 @@ mod tests {
         assert!(!forwarded(&request(), None)
             .iter()
             .any(|(n, _)| *n == ORIGIN_TOKEN_HEADER));
+    }
+
+    #[tokio::test]
+    async fn a_push_that_changes_the_artifacts_ends_a_body_still_streaming() {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(site.path().join("index.html"), vec![b'x'; 1024 * 1024]).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(data.path()).unwrap();
+        let push = |restricted: &[&str]| {
+            crate::artifacts::parse(&json!({
+                "items": [{ "id": "streaming-page", "dir": site.path().to_str(), "entry": "index.html", "status": "published" }],
+                "restrictedRoots": restricted,
+            }))
+            .unwrap()
+        };
+        crate::artifacts::set(&store, &push(&[])).unwrap();
+        let answer = crate::artifacts::artifact(&store, "GET", "/ar/streaming-page", &[]);
+        let (data_frames, mut sent) = mpsc::channel(1);
+        let (control, _) = mpsc::unbounded_channel();
+        let send = Sender::new(data_frames, control);
+        let streaming = tokio::spawn(async move { send_answer(3, answer, &send).await });
+        let mut decoder = super::super::Decoder::default();
+        let mut frames = Vec::new();
+        while !frames
+            .iter()
+            .any(|f: &super::super::Frame| f.kind == frame::DATA)
+        {
+            let Some(Message::Binary(chunk)) = sent.recv().await else {
+                panic!("the body ended before it began");
+            };
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        // RealTimeX pushes new restricted folders while the page is still going out.
+        crate::artifacts::set(&store, &push(&["/elsewhere"])).unwrap();
+        while let Some(Message::Binary(chunk)) = sent.recv().await {
+            frames.extend(decoder.feed(&chunk).unwrap());
+        }
+        streaming.await.unwrap();
+        let headers: Value = serde_json::from_slice(&frames[0].payload).unwrap();
+        assert_eq!(headers["status"], 200);
+        let last = frames.last().unwrap();
+        assert_eq!(last.kind, frame::RESET);
+        assert!(String::from_utf8_lossy(&last.payload).contains(CHANGED));
+        let body: usize = frames
+            .iter()
+            .filter(|f| f.kind == frame::DATA)
+            .map(|f| f.payload.len())
+            .sum();
+        assert!(body < 1024 * 1024, "{body}");
+        assert!(!frames.iter().any(|f| f.kind == frame::END));
     }
 
     #[tokio::test]

@@ -5,8 +5,10 @@
 //! Schema 2 (realtimex-ai-app#2836 M3) adds `inbox`: webhook deliveries Link kept while RealTimeX
 //! wasn't running, until RealTimeX acknowledges them (inbox.rs).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -35,6 +37,9 @@ impl std::error::Error for StoreTooNew {}
 
 pub struct Store {
     db: Mutex<Connection>,
+    /// Per key, how many times it was written or removed since this process opened the store
+    /// (`changes`).
+    changes: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
 impl Store {
@@ -84,7 +89,10 @@ impl Store {
             )?;
         }
         set_meta(&db, "schema_version", &SCHEMA_VERSION.to_string())?;
-        Ok(Self { db: Mutex::new(db) })
+        Ok(Self {
+            db: Mutex::new(db),
+            changes: Mutex::default(),
+        })
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -108,14 +116,40 @@ impl Store {
     }
 
     pub fn set(&self, key: &str, value: &Value) -> Result<()> {
-        set_state(&self.db(), key, value)
+        set_state(&self.db(), key, value)?;
+        self.changed(&[key]);
+        Ok(())
     }
 
     /// Forget a value (get answers None again).
     pub fn remove(&self, key: &str) -> Result<()> {
         self.db()
             .execute("DELETE FROM state WHERE key = ?1", [key])?;
+        self.changed(&[key]);
         Ok(())
+    }
+
+    /// A counter that every later write or removal of `key` moves on: whatever was read from
+    /// `key` before it moved is out of date (artifacts.rs ends a body that is still streaming).
+    pub fn changes(&self, key: &str) -> Arc<AtomicU64> {
+        self.changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone()
+    }
+
+    fn changed(&self, keys: &[&str]) {
+        let changes = self
+            .changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in keys {
+            if let Some(counter) = changes.get(*key) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -162,6 +196,10 @@ impl Store {
             set_meta(&tx, key, value)?;
         }
         tx.commit()?;
+        drop(db);
+        let written: Vec<&str> = values.iter().map(|(key, _)| *key).collect();
+        self.changed(&written);
+        self.changed(removed);
         Ok(())
     }
 }
