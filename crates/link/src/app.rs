@@ -158,12 +158,13 @@ pub fn save_setting(
 /// the icon on its own (icon.rs).
 pub static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
-/// Register with the daemon as ROLE; false when another process already holds that role.
+/// Register with the daemon as ROLE again (it restarted); false when another process already
+/// holds that role. That one is not asked to show its window ("background").
 pub fn register(api: &Api) -> bool {
     let role = ROLE.get().copied().unwrap_or("window");
     let answer = api.post(
         "/v1/window/open",
-        json!({ "pid": std::process::id(), "role": role }),
+        json!({ "pid": std::process::id(), "role": role, "background": true }),
     );
     !answer.is_ok_and(|answer| answer["owner"] == false)
 }
@@ -411,6 +412,7 @@ impl LinkApp {
             .ok()
         };
         theme::apply(&cc.egui_ctx);
+        crate::dock::veil(cc);
         Self {
             icon: header_icon(&cc.egui_ctx),
             tray,
@@ -686,7 +688,7 @@ impl eframe::App for LinkApp {
             }
             std::process::exit(0);
         }
-        crate::dock::apply();
+        crate::dock::apply(ctx);
         let focused = ctx.input(|i| i.viewport().focused) == Some(true);
         if focused && !std::mem::replace(&mut self.focused, focused) {
             lock(&self.shared).check_presence = true;

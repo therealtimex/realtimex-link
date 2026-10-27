@@ -40,7 +40,9 @@ fn main() -> eframe::Result {
         }
         let answer = api.post(
             "/v1/window/open",
-            serde_json::json!({ "pid": std::process::id(), "role": "window" }),
+            // In the background (login, RealTimeX) it only exits when Link already runs: the
+            // running window stays as it is.
+            serde_json::json!({ "pid": std::process::id(), "role": "window", "background": background }),
         );
         if answer.as_ref().is_ok_and(|answer| answer["owner"] == false) {
             return Ok(());
