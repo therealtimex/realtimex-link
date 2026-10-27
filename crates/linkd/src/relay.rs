@@ -500,7 +500,7 @@ impl Relay {
         // An adoption whose exposure is gone already (a release before 0.2.1's single write
         // stopped part-way): what is left of it goes, so the next handover starts clean.
         if self.exposure_id().is_none() && host.store.get(keys::ADOPTED).is_some() {
-            self.transition(None, || host.store.transaction(&exposure_gone(), &[]))?;
+            self.transition(None, || host.store.replace(&[], &EXPOSURE_KEYS))?;
         }
         Ok(None)
     }
@@ -516,7 +516,7 @@ impl Relay {
         let mut former = strings(host.store.get(keys::FORMER_IDS).as_ref());
         // One write: a stop part-way never leaves the credential or install ID of an exposure
         // that is gone (a retry finds the exposure and does it all again).
-        let mut values = exposure_gone();
+        let mut values = Vec::new();
         match why {
             Dropped::Switched => {
                 if !former.contains(&previous) {
@@ -530,7 +530,7 @@ impl Relay {
             Dropped::Released => former.retain(|id| *id != previous),
         }
         values.push((keys::FORMER_IDS, json!(former)));
-        host.store.transaction(&values, &[])?;
+        host.store.replace(&values, &EXPOSURE_KEYS)?;
         {
             let mut status = lock(&self.status);
             status.needs_enrollment = false;
@@ -2664,20 +2664,14 @@ struct ApiFailure {
     body: Value,
 }
 
-/// The writes that forget the current exposure: its record, credential, adoption, install ID and
-/// account (the store reads null as absent).
-fn exposure_gone() -> Vec<(&'static str, Value)> {
-    [
-        keys::EXPOSURE,
-        keys::CREDENTIAL,
-        keys::ADOPTED,
-        keys::INSTALL_ID,
-        keys::SUBJECT,
-    ]
-    .into_iter()
-    .map(|key| (key, Value::Null))
-    .collect()
-}
+/// What is kept of the current exposure: its record, credential, adoption, install ID and account.
+const EXPOSURE_KEYS: [&str; 5] = [
+    keys::EXPOSURE,
+    keys::CREDENTIAL,
+    keys::ADOPTED,
+    keys::INSTALL_ID,
+    keys::SUBJECT,
+];
 
 /// Why the current exposure is dropped (`drop_current`).
 #[derive(Clone, Copy)]

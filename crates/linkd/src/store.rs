@@ -136,10 +136,27 @@ impl Store {
 
     /// Several writes that land together or not at all.
     pub fn transaction(&self, values: &[(&str, Value)], meta: &[(&str, String)]) -> Result<()> {
+        self.commit(values, &[], meta)
+    }
+
+    /// `values` saved and the `removed` keys forgotten together, or nothing at all.
+    pub fn replace(&self, values: &[(&str, Value)], removed: &[&str]) -> Result<()> {
+        self.commit(values, removed, &[])
+    }
+
+    fn commit(
+        &self,
+        values: &[(&str, Value)],
+        removed: &[&str],
+        meta: &[(&str, String)],
+    ) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for (key, value) in values {
             set_state(&tx, key, value)?;
+        }
+        for key in removed {
+            tx.execute("DELETE FROM state WHERE key = ?1", [*key])?;
         }
         for (key, value) in meta {
             set_meta(&tx, key, value)?;
@@ -494,5 +511,12 @@ mod tests {
             .unwrap();
         assert_eq!(store.get("a"), Some(json!(1)));
         assert_eq!(store.meta_get("mark").as_deref(), Some("x"));
+        // Saving and forgetting together: a failed save forgets nothing either.
+        store.set("b", &json!(2)).unwrap();
+        assert!(store.replace(&[("c", Value::Null)], &["a", "b"]).is_err());
+        assert_eq!(store.get("a"), Some(json!(1)));
+        store.replace(&[("c", json!(3))], &["a", "b"]).unwrap();
+        assert_eq!((store.get("a"), store.get("b")), (None, None));
+        assert_eq!(store.get("c"), Some(json!(3)));
     }
 }
