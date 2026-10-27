@@ -6,8 +6,15 @@ publish also needs Contents write).
                                    (its Actions artifact `release-unsigned`, checked against its
                                    SHA256SUMS), and the release commit's packaging/ in OUT/tree
   release.py publish VERSION DIR   the signed files in DIR replace or join the draft's assets,
-                                   SHA256SUMS is rewritten, and the draft is published (as Link's
-                                   latest only when no newer release is out)
+                                   SHA256SUMS is rewritten, and the draft is published as a
+                                   pre-release, never as Link's latest
+  release.py promote VERSION       the published pre-release becomes a release (Link's latest only
+                                   when no newer release is out), on the Human's go
+
+Why publish never makes a release latest: installed Links update from releases/latest, which never
+returns a pre-release. A new version is then invisible to them from the moment it is published,
+and RealTimeX can pin and test it (by tag) before anyone else gets it. Promotion is a separate,
+explicit step, so the safe state is the default and can't be forgotten on a later tag.
 
 Where the files come from (provenance). A draft release's assets can be replaced by anyone holding
 a Contents-write token, and its SHA256SUMS sits in the same draft, so the draft alone proves
@@ -123,7 +130,7 @@ def git(*args):
         raise SystemExit(f"git {' '.join(args)}: {error.stderr.decode(errors='replace').strip()}") from None
 
 
-# Pure checks (ci/test_release.py).
+# Pure checks (ci/test_ci.py).
 
 
 def run_problems(run, repository, commit, tag):
@@ -188,6 +195,35 @@ def asset_problems(assets, built, signed):
     for name in sorted(set(built) - present - set(signed)):
         problems.append(f"{name} is missing from the draft")
     return problems, unchecked
+
+
+def publish_payload(version):
+    """What publishing sets on the draft: always a pre-release and never latest (the docstring)."""
+    return {
+        "name": f"RealTimeX Link {version}",
+        "body": notes(version),
+        "draft": False,
+        "prerelease": True,
+        "make_latest": "false",
+    }
+
+
+def promote_payload(version, releases):
+    """(release, PATCH) that makes `version`'s published release a release. It must be published
+    (not a draft) and carry SHA256SUMS. Latest only when no newer release is out, so promoting an
+    older version after a newer one never moves latest back."""
+    tag = f"v{version}"
+    matches = [item for item in releases if item.get("tag_name") == tag]
+    if len(matches) != 1:
+        raise SystemExit(f"{REPOSITORY} has {len(matches)} releases for {tag}, not one")
+    item = matches[0]
+    if item.get("draft"):
+        raise SystemExit(f"release {tag} is still a draft: its pipeline's publish job hasn't run")
+    if not any(asset.get("name") == "SHA256SUMS" for asset in item.get("assets", [])):
+        raise SystemExit(f"release {tag} has no SHA256SUMS")
+    published = [r["tag_name"] for r in releases if not r.get("draft") and not r.get("prerelease")]
+    latest = should_be_latest(version, published)
+    return item, {"prerelease": False, "make_latest": "true" if latest else "false"}
 
 
 # GitHub and git.
@@ -354,8 +390,6 @@ def publish(version, folder):
     if problems:
         raise SystemExit(f"draft {tag} isn't what {run['html_url']} built:\n  " + "\n  ".join(problems))
 
-    published = [r["tag_name"] for r in releases if not r.get("draft") and not r.get("prerelease")]
-    latest = should_be_latest(version, published)
     sums = format_sums({**built, **signed})
 
     def upload(name, data):
@@ -378,16 +412,26 @@ def publish(version, folder):
     done = call(
         "PATCH",
         f"/repos/{REPOSITORY}/releases/{item['id']}",
-        {
-            "name": f"RealTimeX Link {version}",
-            "body": notes(version),
-            "draft": False,
-            "prerelease": False,
-            "make_latest": "true" if latest else "false",
-        },
+        publish_payload(version),
     )
-    print(f"published {done['html_url']}" + ("" if latest else " (not as latest: a newer release is out)"))
+    print(f"published {done['html_url']} as a pre-release (release.py promote {version} makes it a release)")
     print(sums, end="")
+
+
+def promote(version):
+    tag = f"v{version}"
+    commit = release_commit(tag)
+    mirrored = mirror_commit(tag)
+    if mirrored != commit:
+        raise SystemExit(f"the mirror's {tag} is {mirrored}, but GitLab's is {commit}")
+    item, payload = promote_payload(version, all_releases())
+    if not item.get("prerelease"):
+        print(f"{tag} is already a release; applying make_latest={payload['make_latest']} again")
+    call("PATCH", f"/repos/{REPOSITORY}/releases/{item['id']}", payload)
+    done = call("GET", f"/repos/{REPOSITORY}/releases/{item['id']}")
+    latest = call("GET", f"/repos/{REPOSITORY}/releases/latest")
+    print(f"promoted {done['html_url']}: prerelease={done.get('prerelease')}, draft={done.get('draft')}")
+    print(f"Link's latest release: {latest.get('tag_name')}")
 
 
 def notes(version):
@@ -414,6 +458,8 @@ def main(argv):
         fetch(argv[1].lstrip("v"), argv[2])
     elif len(argv) == 3 and argv[0] == "publish":
         publish(argv[1].lstrip("v"), argv[2])
+    elif len(argv) == 2 and argv[0] == "promote":
+        promote(argv[1].lstrip("v"))
     else:
         raise SystemExit(__doc__)
 

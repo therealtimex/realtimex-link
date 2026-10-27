@@ -121,6 +121,11 @@ const CLOSE_AUTH_FAILED: u16 = 4401;
 /// The detail while enrolling or recovering needs a token only RealTimeX hands over.
 const WAITING_FOR_REALTIMEX: &str =
     "waiting for RealTimeX: open it so it hands its account over again";
+/// The detail when the relay wants the credential of an adopted exposure back: another Link
+/// instance (or RealTimeX) took it, on purpose. Link never takes RealTimeX's exposure back by
+/// itself while RealTimeX owns this Link; the owning RealTimeX's next adopt does, if it is still
+/// this Link's.
+const EXPOSURE_TAKEN: &str = "Another RealTimeX Link or RealTimeX uses this App ID now";
 /// Recovering by itself (the relay refused the credential, or the service wants it) at most this
 /// often: past it something else keeps taking the exposure, and Link shows an error instead.
 const MAX_RECOVERIES: usize = 3;
@@ -254,6 +259,10 @@ pub struct Relay {
     switched_to: Mutex<Option<String>>,
     /// Held while a transition happens and while a fenced result is checked and written.
     writes: Mutex<()>,
+    /// Work with the Marketplace (enrolling, recovering, adopting, retiring) holds it shared, from
+    /// reading the token to its result; a release for an instance holds it alone
+    /// (`hold_remote_work`), so none is in flight or starts from the drop until the token is gone.
+    remote: tokio::sync::RwLock<()>,
     /// The current enrollment operation, part of its Idempotency-Key: a retry of the same request
     /// replays it; after the relay refused the credential, or the service called the replay
     /// superseded (another connector took the exposure), a new one starts.
@@ -294,6 +303,7 @@ impl Relay {
             epoch: std::sync::atomic::AtomicU64::new(0),
             switched_to: Mutex::new(None),
             writes: Mutex::new(()),
+            remote: tokio::sync::RwLock::new(()),
             operation: Mutex::new(crate::util::uuid()),
             serving: Mutex::new(None),
             task: Mutex::new(None),
@@ -411,13 +421,24 @@ impl Relay {
     /// for another account than the last transition switched to.
     fn fenced<R>(&self, fence: &Fence, write: impl FnOnce() -> Result<R>) -> Result<R> {
         let _writes = lock(&self.writes);
-        let current = lock(&self.switched_to).clone();
-        if self.epoch.load(Ordering::SeqCst) != fence.epoch
-            || current.is_some_and(|to| fence.subject.as_deref() != Some(to.as_str()))
-        {
+        if self.overtaken(fence) {
             bail!(STALE);
         }
         write()
+    }
+
+    /// Whether a transition happened since `fence`, or it is for another account than the last
+    /// one switched to. Under `writes` when a write depends on it.
+    fn overtaken(&self, fence: &Fence) -> bool {
+        let current = lock(&self.switched_to).clone();
+        self.epoch.load(Ordering::SeqCst) != fence.epoch
+            || current.is_some_and(|to| fence.subject.as_deref() != Some(to.as_str()))
+    }
+
+    /// Hold off all work with the Marketplace until the guard drops: what is in flight finishes
+    /// first, and nothing starts meanwhile (Host::release_by_realtimex).
+    pub async fn hold_remote_work(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.remote.write().await
     }
 
     /// An account transition: everything started before it is stale from here on.
@@ -461,45 +482,71 @@ impl Relay {
 
     /// `drop_exposure`'s work, inside a transition.
     fn drop_unfenced(&self, host: &Host) -> Result<()> {
+        self.drop_current(host, Dropped::Switched).map(|_| ())
+    }
+
+    /// The owning RealTimeX released this Link for an instance of its own (POST
+    /// /v1/account/release, movesTo "instance"): the exposure adopted from it goes, so this Link never serves or takes back what now lives in another instance
+    /// (a dev RealTimeX's own Link adopts it next). Its ID doesn't become a former App ID either:
+    /// controllers that saved it must reach the instance that carries it. Link's own exposure
+    /// (not adopted) stays. Answers the dropped exposure's ID.
+    pub fn release_adopted(&self) -> Result<Option<String>> {
+        let Some(host) = self.host.upgrade() else {
+            return Ok(None);
+        };
+        if self.adopted_id().is_some() {
+            return self.transition(None, || self.drop_current(&host, Dropped::Released));
+        }
+        // An adoption whose exposure is gone already (a release before 0.2.1's single write
+        // stopped part-way): what is left of it goes, so the next handover starts clean.
+        if self.exposure_id().is_none() && host.store.get(keys::ADOPTED).is_some() {
+            self.transition(None, || host.store.replace(&[], &EXPOSURE_KEYS))?;
+        }
+        Ok(None)
+    }
+
+    /// Forget the current exposure and what was shared on it, inside a transition: its
+    /// credential, its install ID, the adoption. Answers its ID.
+    fn drop_current(&self, host: &Host, why: Dropped) -> Result<Option<String>> {
         self.forget_shared_state(host)?;
         let Some(previous) = self.exposure_id() else {
             host.store.remove(keys::SUBJECT)?;
-            return Ok(());
+            return Ok(None);
         };
         let mut former = strings(host.store.get(keys::FORMER_IDS).as_ref());
-        if !former.contains(&previous) {
-            former.push(previous.clone());
-        }
-        host.store.transaction(
-            &[
-                (keys::FORMER_IDS, json!(former)),
-                (
+        // One write: a stop part-way never leaves the credential or install ID of an exposure
+        // that is gone (a retry finds the exposure and does it all again).
+        let mut values = Vec::new();
+        match why {
+            Dropped::Switched => {
+                if !former.contains(&previous) {
+                    former.push(previous.clone());
+                }
+                values.push((
                     keys::SWITCHED,
                     json!({ "from": previous, "at": crate::util::iso_now() }),
-                ),
-            ],
-            &[],
-        )?;
-        for key in [
-            keys::EXPOSURE,
-            keys::CREDENTIAL,
-            keys::ADOPTED,
-            keys::INSTALL_ID,
-            keys::SUBJECT,
-        ] {
-            host.store.remove(key)?;
+                ));
+            }
+            Dropped::Released => former.retain(|id| *id != previous),
         }
+        values.push((keys::FORMER_IDS, json!(former)));
+        host.store.replace(&values, &EXPOSURE_KEYS)?;
         {
             let mut status = lock(&self.status);
             status.needs_enrollment = false;
             status.awaiting_account = false;
         }
-        (host.log)(&format!(
-            "[relay] RealTimeX switched accounts: dropped exposure {previous}"
-        ));
+        (host.log)(&match why {
+            Dropped::Switched => {
+                format!("[relay] RealTimeX switched accounts: dropped exposure {previous}")
+            }
+            Dropped::Released => {
+                format!("[relay] RealTimeX released RealTimeX Link: dropped exposure {previous}")
+            }
+        });
         self.restart.store(true, Ordering::SeqCst);
         self.wake();
-        Ok(())
+        Ok(Some(previous))
     }
 
     /// Another API base is another issuer: the identity keys kept for the last one go with it.
@@ -682,6 +729,8 @@ impl Relay {
             let message = detail.unwrap_or_default();
             let code = if message.starts_with("this exposure was taken back") {
                 "recovery-capped"
+            } else if message.contains(EXPOSURE_TAKEN) {
+                "exposure-taken"
             } else if message == WAITING_FOR_REALTIMEX {
                 "waiting-for-realtimex"
             } else {
@@ -764,7 +813,7 @@ impl Relay {
                 .is_some_and(|connection| !connection.carries(&self.wanted_surfaces()));
             let usable = enrolled.is_some() && !refused;
             if refused || enrolled.is_none() || stale {
-                match self.account().await {
+                match self.enroll_now(&host).await {
                     None if usable => {
                         if !std::mem::replace(&mut lock(&self.status).awaiting_account, true) {
                             (host.log)(
@@ -790,27 +839,32 @@ impl Relay {
                         self.changed.notified().await;
                         continue;
                     }
-                    Some(account) => match self.enroll(&host, &account).await {
-                        Ok(()) => {
-                            let mut status = lock(&self.status);
-                            status.needs_enrollment = false;
-                            status.awaiting_account = false;
-                        }
-                        Err(error) if usable => {
-                            (host.log)(&format!(
-                                "[relay] enrolling every surface failed, serving what is enrolled: {error:#}"
-                            ));
-                            self.converge();
-                        }
-                        Err(error) => {
-                            (host.log)(&format!("[relay] enrollment failed: {error:#}"));
-                            self.set_status("error", Some(format!("{error:#}")));
-                            drop(host);
-                            self.wait(Duration::from_secs(backoff(attempt))).await;
-                            attempt += 1;
-                            continue;
-                        }
-                    },
+                    Some(Ok(())) => {
+                        let mut status = lock(&self.status);
+                        status.needs_enrollment = false;
+                        status.awaiting_account = false;
+                    }
+                    Some(Err(error)) if usable => {
+                        (host.log)(&format!(
+                            "[relay] enrolling every surface failed, serving what is enrolled: {error:#}"
+                        ));
+                        self.converge();
+                    }
+                    Some(Err(error)) if format!("{error:#}").contains(EXPOSURE_TAKEN) => {
+                        (host.log)(&format!("[relay] {EXPOSURE_TAKEN}: waiting for RealTimeX"));
+                        self.set_status("error", Some(EXPOSURE_TAKEN.into()));
+                        drop(host);
+                        self.changed.notified().await;
+                        continue;
+                    }
+                    Some(Err(error)) => {
+                        (host.log)(&format!("[relay] enrollment failed: {error:#}"));
+                        self.set_status("error", Some(format!("{error:#}")));
+                        drop(host);
+                        self.wait(Duration::from_secs(backoff(attempt))).await;
+                        attempt += 1;
+                        continue;
+                    }
                 }
             }
             let Some(connection) = self.connection(&host) else {
@@ -904,6 +958,14 @@ impl Relay {
         Ok(id)
     }
 
+    /// Enroll with the current account; None without one. Holds remote work open throughout, so
+    /// a release for an instance waits for it, and none starts during one.
+    async fn enroll_now(&self, host: &Host) -> Option<Result<()>> {
+        let _remote = self.remote.read().await;
+        let account = self.account().await?;
+        Some(self.enroll(host, &account).await)
+    }
+
     /// Enroll (or refresh) this computer's exposure with every surface Link carries; a lost
     /// credential is recovered first. A surface the Marketplace doesn't support yet is left out.
     async fn enroll(&self, host: &Host, account: &Account) -> Result<()> {
@@ -995,6 +1057,18 @@ impl Relay {
             // Only the service asking for the credential this install lost means recovering;
             // any other conflict (an idempotency clash, a retired install) is an error.
             Err(failure) if failure.status == 409 && credential_required(&failure) => {
+                // While a RealTimeX owns this Link, its exposure is moved on purpose (its adopt,
+                // into another instance): taking it back here would fight that instance for it.
+                // Once released (uninstalled), an adopted exposure is Link's alone and heals itself.
+                if self.adopted_id().is_some() && crate::owner::present(&host.store) {
+                    return Err(EnrollFailure::Other(anyhow!(EXPOSURE_TAKEN)));
+                }
+                // Work a transition overtook (a release, a switch) never takes the exposure back:
+                // the recovery rotates the credential at the Marketplace, which dropping its
+                // result here couldn't undo.
+                if self.overtaken(fence) {
+                    return Err(EnrollFailure::Other(anyhow!(STALE)));
+                }
                 if !self.may_recover() {
                     return Err(EnrollFailure::Other(anyhow!(
                         "this exposure was taken back {MAX_RECOVERIES} times within an hour; \
@@ -1105,10 +1179,10 @@ impl Relay {
         if !Self::wanted(&host) || self.complete() {
             return None;
         }
-        let Some(account) = self.account().await else {
+        let Some(enrolled) = self.enroll_now(&host).await else {
             return Some(false);
         };
-        match self.enroll(&host, &account).await {
+        match enrolled {
             Ok(()) => {
                 let mut status = lock(&self.status);
                 status.needs_enrollment = false;
@@ -1175,6 +1249,7 @@ impl Relay {
     ) -> Result<Value, crate::error::ApiError> {
         use crate::error::ApiError;
         let _one = self.adopting.lock().await;
+        let _remote = self.remote.read().await;
         let host = self
             .host
             .upgrade()
@@ -1394,6 +1469,7 @@ impl Relay {
         let relay = self.clone();
         let fence = self.fence(exposure_subject(&host.store));
         tokio::spawn(async move {
+            let _remote = relay.remote.read().await;
             let Some(account) = relay.account().await else {
                 return;
             };
@@ -2586,6 +2662,24 @@ struct ApiFailure {
     message: String,
     /// The answer's body, for a typed refusal ({ code, surface }).
     body: Value,
+}
+
+/// What is kept of the current exposure: its record, credential, adoption, install ID and account.
+const EXPOSURE_KEYS: [&str; 5] = [
+    keys::EXPOSURE,
+    keys::CREDENTIAL,
+    keys::ADOPTED,
+    keys::INSTALL_ID,
+    keys::SUBJECT,
+];
+
+/// Why the current exposure is dropped (`drop_current`).
+#[derive(Clone, Copy)]
+enum Dropped {
+    /// RealTimeX switched accounts: the previous account's links are offline (a notice).
+    Switched,
+    /// RealTimeX released this Link: the adopted exposure lives in another instance now.
+    Released,
 }
 
 enum EnrollFailure {
@@ -3781,6 +3875,339 @@ mod tests {
         // RealTimeX's next handover leaves the connection to enroll every surface.
         relay.take_handover(&token("u1"), None).await.unwrap();
         assert!(relay.restart.load(Ordering::SeqCst));
+    }
+
+    /// A Marketplace holding RealTimeX's exposure rtxExposure, whose credential is `current`'s:
+    /// an update must present it, a recovery rotates it.
+    fn adopted_marketplace(
+        current: Arc<Mutex<String>>,
+    ) -> impl Fn(&str, &str, &str, &Value, usize) -> (u16, Value) + Send + Sync + 'static {
+        move |method, path, _, body, before| {
+            let mut current = current.lock().unwrap();
+            match (method, path) {
+                ("POST", "/v1/relay-exposures/rtxExposure/recover") => {
+                    *current = format!("recovered-{before}");
+                    (200, view("rtxExposure", &SURFACES, &current))
+                }
+                ("POST", "/v1/relay-exposures")
+                    if body["connectorCredential"].as_str() == Some(current.as_str()) =>
+                {
+                    (200, view("rtxExposure", &SURFACES, &current))
+                }
+                ("POST", "/v1/relay-exposures") => (
+                    409,
+                    json!({ "message": "Existing installs must present their connectorCredential; use recovery if lost" }),
+                ),
+                _ => (404, json!({ "message": "unexpected" })),
+            }
+        }
+    }
+
+    /// signed_in_host, after RealTimeX's exposure rtxExposure was adopted with credential `c1`.
+    fn adopted_host(dir: &std::path::Path, base: &str) -> Arc<Host> {
+        let host = signed_in_host(dir, base);
+        host.relay
+            .save(
+                &host,
+                &view("rtxExposure", &SURFACES, "c1"),
+                &host.relay.fence(Some("u1".into())),
+            )
+            .unwrap();
+        host.store
+            .set(keys::INSTALL_ID, &json!("rtx-install"))
+            .unwrap();
+        host.store
+            .set(
+                keys::ADOPTED,
+                &json!({ "exposureId": "rtxExposure", "from": "linkOwn", "at": "2026-10-26T00:00:00Z", "seen": true }),
+            )
+            .unwrap();
+        // As an earlier release would have left it, had it kept the ID.
+        host.store
+            .set(keys::FORMER_IDS, &json!(["linkOwn", "rtxExposure"]))
+            .unwrap();
+        assert_eq!(host.relay.adopted_id().as_deref(), Some("rtxExposure"));
+        host
+    }
+
+    fn recoveries(seen: &Seen) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p, _, _)| p.ends_with("/recover"))
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_adopted_exposure_another_instance_took_is_never_taken_back() {
+        // Another instance (a dev RealTimeX's Link) adopted rtxExposure: its recovery rotated the
+        // credential to c2.
+        let current = Arc::new(Mutex::new("c2".to_string()));
+        let (base, seen) = marketplace(adopted_marketplace(current.clone())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = adopted_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        let account = relay.account().await.unwrap();
+        for _ in 0..4 {
+            let error = relay.enroll(&host, &account).await.unwrap_err();
+            assert!(format!("{error:#}").contains(EXPOSURE_TAKEN), "{error:#}");
+        }
+        // No recovery, so the other instance's credential still holds: no flip-flop.
+        assert_eq!(recoveries(&seen), 0);
+        assert_eq!(*current.lock().unwrap(), "c2");
+        relay.set_status("error", Some(EXPOSURE_TAKEN.into()));
+        let exposure = relay.exposure();
+        assert_eq!(exposure["state"], "error");
+        assert_eq!(exposure["error"]["code"], "exposure-taken");
+        // The exposure itself stays, for the owning RealTimeX's next adopt.
+        assert_eq!(relay.exposure_id().as_deref(), Some("rtxExposure"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uninstall_release_keeps_the_app_id_and_heals_it_alone() {
+        let current = Arc::new(Mutex::new("c1".to_string()));
+        let (base, seen) = marketplace(adopted_marketplace(current.clone())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = adopted_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        // RealTimeX is uninstalled: only the owner record goes.
+        assert_eq!(
+            host.release_by_realtimex("rtx-install", false)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!crate::owner::present(&host.store));
+        assert_eq!(relay.exposure_id().as_deref(), Some("rtxExposure"));
+        assert_eq!(host.store.get(keys::INSTALL_ID), Some(json!("rtx-install")));
+        assert!(host.store.get(keys::CREDENTIAL).is_some());
+        let account = relay.account().await.unwrap();
+        // The exposure is Link's alone now: a lost credential is recovered as Link's own is.
+        *current.lock().unwrap() = "c2".into();
+        relay.enroll(&host, &account).await.unwrap();
+        assert_eq!(recoveries(&seen), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_for_an_instance_drops_the_adopted_exposure_and_can_be_retried() {
+        let current = Arc::new(Mutex::new("c1".to_string()));
+        let (base, seen) = marketplace(adopted_marketplace(current)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = adopted_host(dir.path(), &base);
+        let relay = host.relay.clone();
+
+        // Another install can't release it.
+        let other = host
+            .release_by_realtimex("rtx-other", true)
+            .await
+            .unwrap_err();
+        assert_eq!(other.code.as_deref(), Some("adopted-other"));
+        assert_eq!(relay.exposure_id().as_deref(), Some("rtxExposure"));
+
+        // A crash after the exposure went, before the owner record did: RealTimeX retries.
+        assert_eq!(
+            relay.release_adopted().unwrap().as_deref(),
+            Some("rtxExposure")
+        );
+        assert!(crate::owner::present(&host.store));
+        assert_eq!(
+            host.release_by_realtimex("rtx-install", true)
+                .await
+                .unwrap(),
+            None
+        );
+
+        assert_eq!(relay.exposure_id(), None);
+        assert_eq!(host.store.get(keys::INSTALL_ID), None);
+        assert_eq!(host.store.get(keys::ADOPTED), None);
+        assert_eq!(host.store.get(keys::CREDENTIAL), None);
+        // Not a switch of accounts (no notice), and not a former App ID of this Link: it lives
+        // in the other instance now.
+        assert_eq!(host.store.get(keys::SWITCHED), None);
+        assert!(!host.former_app_ids().contains(&"rtxExposure".to_string()));
+        assert!(host.former_app_ids().contains(&"linkOwn".to_string()));
+        // Signed out for RealTimeX, and RealTimeX no longer owns it.
+        assert!(relay.account().await.is_none());
+        assert!(!crate::owner::present(&host.store));
+        assert_eq!(recoveries(&seen), 0);
+
+        // Released already: nothing to release.
+        let again = host
+            .release_by_realtimex("rtx-install", false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (again.status, again.code.as_deref()),
+            (409, Some("adopted-other"))
+        );
+        // Adopting with nobody owning Link is still "signed-out".
+        let adopt = relay
+            .adopt(Some("rtxExposure"), "rtx-install", "u1")
+            .await
+            .unwrap_err();
+        assert_eq!(adopt.code.as_deref(), Some("signed-out"));
+
+        // The next RealTimeX takes it over, and the released exposure stays gone.
+        assert!(crate::owner::claim(&host.store, "rtx-next", crate::util::now_ms()).unwrap());
+        assert!(!host.former_app_ids().contains(&"rtxExposure".to_string()));
+    }
+
+    /// A Marketplace for adopted_host whose registrations wait at `gate`, then answer that the
+    /// credential is wanted (another instance rotated it); a recovery would rotate it again.
+    fn held_marketplace(
+        gate: Arc<Gate>,
+    ) -> impl Fn(&str, &str, &str, &Value, usize) -> (u16, Value) + Send + Sync + 'static {
+        move |method, path, _, _, _| match (method, path) {
+            ("POST", "/v1/relay-exposures") => {
+                gate.hold();
+                (
+                    409,
+                    json!({ "message": "Existing installs must present their connectorCredential; use recovery if lost" }),
+                )
+            }
+            ("POST", "/v1/relay-exposures/rtxExposure/recover") => {
+                (200, view("rtxExposure", &SURFACES, "recovered"))
+            }
+            _ => (404, json!({ "message": "unexpected" })),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_waits_for_the_enrollment_in_flight_and_nothing_recovers_after_it() {
+        within_a_minute(async {
+            let gate = Arc::new(Gate::default());
+            let _released = Released(gate.clone());
+            let (base, seen) = marketplace(held_marketplace(gate.clone())).await;
+            let dir = tempfile::tempdir().unwrap();
+            let host = adopted_host(dir.path(), &base);
+            let relay = host.relay.clone();
+            let enrolling = {
+                let (relay, host) = (relay.clone(), host.clone());
+                tokio::spawn(async move { relay.enroll_now(&host).await })
+            };
+            gate.arrived().await;
+            let releasing = {
+                let host = host.clone();
+                tokio::spawn(async move { host.release_by_realtimex("rtx-install", true).await })
+            };
+            // The release waits for the registration in flight; nothing is dropped yet.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!releasing.is_finished());
+            assert_eq!(relay.exposure_id().as_deref(), Some("rtxExposure"));
+            // Its answer: the other instance has the credential. Still owned, so not taken back.
+            gate.release();
+            let late = enrolling.await.unwrap().unwrap().unwrap_err();
+            assert!(format!("{late:#}").contains(EXPOSURE_TAKEN), "{late:#}");
+            assert_eq!(
+                releasing.await.unwrap().unwrap().as_deref(),
+                Some("rtxExposure")
+            );
+            // Signed out: nothing enrolls or recovers after the release.
+            assert!(relay.enroll_now(&host).await.is_none());
+            assert_eq!(recoveries(&seen), 0);
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_work_with_the_marketplace_starts_while_a_release_is_under_way() {
+        within_a_minute(async {
+            let current = Arc::new(Mutex::new("c1".to_string()));
+            let (base, seen) = marketplace(adopted_marketplace(current.clone())).await;
+            let dir = tempfile::tempdir().unwrap();
+            let host = adopted_host(dir.path(), &base);
+            let relay = host.relay.clone();
+            // The release has dropped nothing yet, and the token is still there.
+            let quiet = relay.hold_remote_work().await;
+            let enrolling = {
+                let (relay, host) = (relay.clone(), host.clone());
+                tokio::spawn(async move { relay.enroll_now(&host).await })
+            };
+            let adopting = {
+                let relay = relay.clone();
+                tokio::spawn(
+                    async move { relay.adopt(Some("rtxExposure"), "rtx-install", "u1").await },
+                )
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!enrolling.is_finished() && !adopting.is_finished());
+            assert!(seen.lock().unwrap().is_empty());
+            // The release's drop and sign-out, then the work waiting finds no token.
+            assert_eq!(
+                relay.release_adopted().unwrap().as_deref(),
+                Some("rtxExposure")
+            );
+            host.signin.sign_out_for_realtimex().await.unwrap();
+            drop(quiet);
+            assert!(enrolling.await.unwrap().is_none());
+            let adopt = adopting.await.unwrap().unwrap_err();
+            assert_eq!(adopt.code.as_deref(), Some("signed-out"));
+            assert!(seen.lock().unwrap().is_empty());
+            // The other instance's credential holds.
+            assert_eq!(*current.lock().unwrap(), "c1");
+            assert_eq!(relay.exposure_id(), None);
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registration_a_transition_overtook_never_recovers() {
+        within_a_minute(async {
+            let gate = Arc::new(Gate::default());
+            let _released = Released(gate.clone());
+            let (base, seen) = marketplace(held_marketplace(gate.clone())).await;
+            let dir = tempfile::tempdir().unwrap();
+            let host = adopted_host(dir.path(), &base);
+            let relay = host.relay.clone();
+            let account = relay.account().await.unwrap();
+            let pending = {
+                let (relay, host) = (relay.clone(), host.clone());
+                tokio::spawn(async move { relay.enroll(&host, &account).await })
+            };
+            gate.arrived().await;
+            // While it waits: RealTimeX switches accounts, and the adopted exposure is dropped,
+            // so the guard for an owned adoption no longer applies.
+            relay.take_handover(&token("u2"), None).await.unwrap();
+            assert_eq!(relay.adopted_id(), None);
+            gate.release();
+            let late = pending.await.unwrap().unwrap_err();
+            assert!(format!("{late:#}").contains(STALE), "{late:#}");
+            assert_eq!(recoveries(&seen), 0);
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_finishes_what_an_interrupted_one_left() {
+        let current = Arc::new(Mutex::new("c1".to_string()));
+        let (base, _seen) = marketplace(adopted_marketplace(current)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = adopted_host(dir.path(), &base);
+        let relay = host.relay.clone();
+        // As a release that stopped part-way before 0.2.1 left it: the exposure gone, its
+        // credential, adoption and install ID still there.
+        host.store.remove(keys::EXPOSURE).unwrap();
+        assert!(host.store.get(keys::CREDENTIAL).is_some());
+        assert_eq!(
+            host.release_by_realtimex("rtx-install", true)
+                .await
+                .unwrap(),
+            None
+        );
+        for key in [
+            keys::EXPOSURE,
+            keys::CREDENTIAL,
+            keys::ADOPTED,
+            keys::INSTALL_ID,
+            keys::SUBJECT,
+        ] {
+            assert_eq!(host.store.get(key), None, "{key}");
+        }
+        // The next owner's handover starts clean: a new install ID, not the moved one.
+        assert!(crate::owner::claim(&host.store, "rtx-next", crate::util::now_ms()).unwrap());
+        relay.take_handover(&token("u1"), None).await.unwrap();
+        assert_ne!(Relay::install_id(&host).unwrap(), "rtx-install");
     }
 
     #[tokio::test(flavor = "multi_thread")]

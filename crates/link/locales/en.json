@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Check for updates",
   "tray.updateTo": "Update to RealTimeX Link {version}…",
   "tray.quit": "Quit until next login",
+  "tray.quitPlain": "Quit",
+  "tray.quitRestartNote": "RealTimeX will start Link again",
   "tray.starting": "RealTimeX Link is starting…",
   "tray.off": "Remote control is off",
   "tray.on": "Remote control is on",
@@ -179,11 +181,15 @@
   "link.off": "Off",
   "link.keepRunning": "Keep RealTimeX Link running",
   "link.onDescription": "Starts at login and keeps this computer reachable, even when RealTimeX is closed.",
+  "link.onDescriptionNoLogin": "Keeps this computer reachable. RealTimeX starts it, and it doesn't start at login.",
   "link.offDescription": "Published artifacts, webhooks, the mobile app and remote control can't reach this computer. It won't start at login.",
+  "link.offDescriptionNoLogin": "Published artifacts, webhooks, the mobile app and remote control can't reach this computer.",
   "link.turnedOn": "RealTimeX Link is on. It starts at login.",
+  "link.turnedOnNoLogin": "RealTimeX Link is on.",
   "link.turnedOff": "RealTimeX Link is off.",
   "confirm.turnOffLink.title": "Turn off RealTimeX Link?",
   "confirm.turnOffLink.message": "Published artifacts go offline, webhooks aren't received, the mobile app and other desktops can't reach this computer, and no one can connect for remote control. It won't start at login until you turn it on again.",
+  "confirm.turnOffLink.messageNoLogin": "Published artifacts go offline, webhooks aren't received, the mobile app and other desktops can't reach this computer, and no one can connect for remote control.",
   "confirm.turnOffLink.action": "Turn off",
   "moved.title": "This computer now has one App ID",
   "moved.message": "RealTimeX Link now shares everything from this computer under RealTimeX's App ID, {appId}. Published links and webhook URLs don't change. Computers that used {old} move over by themselves.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} delivery kept for RealTimeX",
   "shared.deliveriesKept.other": "{count} deliveries kept for RealTimeX",
   "shared.waiting.one": "{count} waiting",
-  "shared.waiting.other": "{count} waiting"
+  "shared.waiting.other": "{count} waiting",
+  "instance.unnamed": "unnamed"
 }

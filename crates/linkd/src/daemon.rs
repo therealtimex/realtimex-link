@@ -51,6 +51,8 @@ pub struct Options {
     pub data_dir: PathBuf,
     pub version: String,
     pub port: u16,
+    /// `--label`: None keeps the folder's stored label, Some("") clears it (instance.rs).
+    pub label: Option<String>,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
     /// The desktop helper; tests pass one without rtx-control.
     pub backend: Option<Arc<Backend>>,
@@ -71,6 +73,14 @@ pub async fn start(options: Options) -> Result<Daemon> {
     let lock = InstanceLock::acquire(&options.data_dir)?;
     make_data_private(&options.data_dir)?;
     crate::paths::remember(&options.data_dir);
+    let standard = crate::paths::is_standard();
+    let label = crate::instance::settle(
+        &options.data_dir,
+        options.label.as_deref(),
+        standard,
+        &*options.log,
+    );
+    crate::instance::remember(label.clone());
     let store = Arc::new(Store::open(&options.data_dir)?);
     let secrets = SecretBox::new(&options.data_dir);
     let backend = options.backend.clone().unwrap_or_else(Backend::new);
@@ -104,7 +114,7 @@ pub async fn start(options: Options) -> Result<Daemon> {
     let discovery = options.data_dir.join(DISCOVERY_FILE);
     files::write_atomically(
         &discovery,
-        &json!({ "pid": std::process::id(), "port": port, "protocol": PROTOCOL, "version": options.version, "startedAt": started_at }).to_string(),
+        &json!({ "pid": std::process::id(), "port": port, "protocol": PROTOCOL, "version": options.version, "startedAt": started_at, "label": label, "default": standard }).to_string(),
     )?;
     Ok(Daemon {
         port,

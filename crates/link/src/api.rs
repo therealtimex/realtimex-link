@@ -3,8 +3,10 @@
 //! names must prove it holds the token (POST /v1/hello) before the token is sent to it: a daemon
 //! that died leaves its port to whoever takes it next, another user's process too.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,8 +19,45 @@ const PROTOCOL: u64 = 1;
 const HELLO_CONTEXT: &str = "linkd-hello";
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where the daemon keeps its state: the same folder as rtx-linkd's paths.rs.
+/// The folder of the Link instance this process belongs to (rtx-linkd's instance.rs), decided once:
+/// `--data-dir`, else RTX_LINK_DATA_DIR, else the default instance's. Every process this one
+/// starts gets it again (`instance_args`), so a dev RealTimeX's tray never opens the default
+/// instance's window or starts its daemon.
 pub fn data_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        arg_value("--data-dir")
+            .filter(|dir| !dir.is_empty())
+            .map_or_else(default_data_dir, PathBuf::from)
+    })
+    .clone()
+}
+
+/// `--label`, given to the daemon only when this process starts it: a running daemon keeps the
+/// label it has, and the window shows that one (GET /v1/status's instance).
+fn label() -> Option<String> {
+    arg_value("--label")
+}
+
+/// What a process this one starts needs to belong to the same instance.
+pub fn instance_args() -> Vec<OsString> {
+    let mut args = vec![OsString::from("--data-dir"), data_dir().into_os_string()];
+    if let Some(label) = label() {
+        args.extend([OsString::from("--label"), OsString::from(label)]);
+    }
+    args
+}
+
+fn arg_value(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// Where the default daemon keeps its state: the same folder as rtx-linkd's paths.rs.
+fn default_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("RTX_LINK_DATA_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
     }
@@ -107,8 +146,7 @@ impl Api {
         let binary = daemon_binary().ok_or_else(|| anyhow!(t("errors.daemonMissing")))?;
         let mut command = Command::new(binary);
         command
-            .arg("--data-dir")
-            .arg(&dir)
+            .args(instance_args())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

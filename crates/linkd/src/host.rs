@@ -215,8 +215,13 @@ impl Host {
 
     pub fn identity(&self) -> Value {
         // Controllers mark only "dev" (a development build); the daemon is an installed app.
-        let mut identity =
-            json!({ "appId": self.app_id(), "machine": machine_name(), "channel": "app" });
+        // label: which Link instance on that computer (instance.rs), null for the default one.
+        let mut identity = json!({
+            "appId": self.app_id(),
+            "machine": machine_name(),
+            "channel": "app",
+            "label": crate::instance::label(),
+        });
         let former = self.former_app_ids();
         if !former.is_empty() {
             identity["formerAppIds"] = json!(former);
@@ -835,6 +840,50 @@ impl Host {
         crate::autostart::opted_out(&self.store)
     }
 
+    /// The owning RealTimeX lets this Link go (POST /v1/account/release). Link is its own again
+    /// and offers its own sign-in and sign-out (§6.2).
+    /// - Uninstalled (`moves` false): only the owner record goes; Link keeps its App ID, its
+    ///   exposure and its sign-in, and keeps serving.
+    /// - A dev RealTimeX moving to a Link instance of its own (`moves`, instance.rs): the exposure
+    ///   adopted from it goes too (that instance adopts it next, and this one must never take it
+    ///   back), and Link signs out for RealTimeX (no token: nothing to recover or enroll until the
+    ///   next handover). In that order, the owner record last, so a crash part-way leaves a
+    ///   release RealTimeX can retry; and with no work with the Marketplace in flight or starting
+    ///   until the token is gone, so nothing enrolls or recovers what moved.
+    ///
+    /// Answers the dropped exposure's ID. 409 adopted-other from anyone but the owner, and when
+    /// no RealTimeX owns Link.
+    pub async fn release_by_realtimex(
+        &self,
+        install_id: &str,
+        moves: bool,
+    ) -> Result<Option<String>, ApiError> {
+        if !crate::owner::present(&self.store) {
+            return Err(ApiError::coded(
+                409,
+                "adopted-other",
+                "RealTimeX Link isn't owned by this RealTimeX",
+            ));
+        }
+        crate::owner::check(&self.store, install_id)?;
+        let mut dropped = None;
+        if moves {
+            let _quiet = self.relay.hold_remote_work().await;
+            dropped = self.relay.release_adopted().map_err(ApiError::internal)?;
+            self.signin
+                .sign_out_for_realtimex()
+                .await
+                .map_err(|error| ApiError::new(500, error.to_string()))?;
+        }
+        crate::owner::release(&self.store)?;
+        (self.log)(if moves {
+            "[sign-in] RealTimeX released RealTimeX Link for an instance of its own"
+        } else {
+            "[sign-in] RealTimeX released RealTimeX Link"
+        });
+        Ok(dropped)
+    }
+
     /// Light, dark or system (the OS's, the default): RealTimeX's theme, which it posts on start
     /// and when it changes (POST /v1/appearance), so Link's window looks like RealTimeX's.
     pub fn appearance(&self) -> &'static str {
@@ -865,7 +914,11 @@ impl Host {
         self.reconcile().await;
         self.follow_hosting_at_login();
         self.relay.start();
-        self.updater.start();
+        // Only the computer's Link updates itself (instance.rs): the others run whatever binary is
+        // installed, which the default instance's update replaces for all of them.
+        if crate::paths::is_standard() {
+            self.updater.start();
+        }
         // Whether RealTimeX is still here to own Link (§6.3 A3): checked when needed (here, when
         // the window opens, before a sign-out), never on a timer.
         if crate::owner::check_presence(&self.store) {

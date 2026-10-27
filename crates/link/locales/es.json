@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Buscar actualizaciones",
   "tray.updateTo": "Actualizar a RealTimeX Link {version}…",
   "tray.quit": "Salir hasta el próximo inicio de sesión",
+  "tray.quitPlain": "Salir",
+  "tray.quitRestartNote": "RealTimeX volverá a iniciar Link",
   "tray.starting": "RealTimeX Link se está iniciando…",
   "tray.off": "El control remoto está desactivado",
   "tray.on": "El control remoto está activado",
@@ -179,11 +181,15 @@
   "link.off": "Desactivado",
   "link.keepRunning": "Mantener RealTimeX Link en ejecución",
   "link.onDescription": "Se inicia al iniciar sesión y mantiene este equipo accesible, incluso con RealTimeX cerrado.",
+  "link.onDescriptionNoLogin": "Mantiene este equipo accesible. RealTimeX lo inicia y no se inicia al iniciar sesión.",
   "link.offDescription": "Los artefactos publicados, los webhooks, la app móvil y el control remoto no pueden llegar a este equipo. RealTimeX Link no se iniciará al iniciar sesión.",
+  "link.offDescriptionNoLogin": "Los artefactos publicados, los webhooks, la app móvil y el control remoto no pueden llegar a este equipo.",
   "link.turnedOn": "RealTimeX Link está activado. Se inicia al iniciar sesión.",
+  "link.turnedOnNoLogin": "RealTimeX Link está activado.",
   "link.turnedOff": "RealTimeX Link está desactivado.",
   "confirm.turnOffLink.title": "¿Desactivar RealTimeX Link?",
   "confirm.turnOffLink.message": "Los artefactos publicados quedan sin conexión, los webhooks no se reciben, la app móvil y otros equipos no pueden llegar a este equipo, y nadie puede conectarse para el control remoto. No se iniciará al iniciar sesión hasta que lo vuelvas a activar.",
+  "confirm.turnOffLink.messageNoLogin": "Los artefactos publicados quedan sin conexión, los webhooks no se reciben, la app móvil y otros equipos no pueden llegar a este equipo, y nadie puede conectarse para el control remoto.",
   "confirm.turnOffLink.action": "Desactivar",
   "moved.title": "Este equipo ahora tiene un solo ID de la app",
   "moved.message": "RealTimeX Link ahora comparte todo lo de este equipo con el ID de la app de RealTimeX, {appId}. Los enlaces publicados y las URL de webhooks no cambian. Los equipos que usaban {old} se pasan solos.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} entrega guardada para RealTimeX",
   "shared.deliveriesKept.other": "{count} entregas guardadas para RealTimeX",
   "shared.waiting.one": "{count} en espera",
-  "shared.waiting.other": "{count} en espera"
+  "shared.waiting.other": "{count} en espera",
+  "instance.unnamed": "sin nombre"
 }

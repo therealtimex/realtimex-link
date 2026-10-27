@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Sprawdź aktualizacje",
   "tray.updateTo": "Zaktualizuj do RealTimeX Link {version}…",
   "tray.quit": "Zakończ do następnego logowania",
+  "tray.quitPlain": "Zakończ",
+  "tray.quitRestartNote": "RealTimeX ponownie uruchomi Link",
   "tray.starting": "RealTimeX Link się uruchamia…",
   "tray.off": "Zdalne sterowanie jest wyłączone",
   "tray.on": "Zdalne sterowanie jest włączone",
@@ -179,11 +181,15 @@
   "link.off": "Wyłączone",
   "link.keepRunning": "Utrzymuj działanie RealTimeX Link",
   "link.onDescription": "Uruchamia się po zalogowaniu i utrzymuje ten komputer w zasięgu, nawet gdy RealTimeX jest zamknięty.",
+  "link.onDescriptionNoLogin": "Utrzymuje ten komputer w zasięgu. Uruchamia go RealTimeX i nie uruchamia się po zalogowaniu.",
   "link.offDescription": "Opublikowane artefakty, webhooki, aplikacja mobilna i zdalne sterowanie nie mogą dotrzeć do tego komputera. RealTimeX Link nie uruchomi się po zalogowaniu.",
+  "link.offDescriptionNoLogin": "Opublikowane artefakty, webhooki, aplikacja mobilna i zdalne sterowanie nie mogą dotrzeć do tego komputera.",
   "link.turnedOn": "RealTimeX Link jest włączony. Uruchamia się po zalogowaniu.",
+  "link.turnedOnNoLogin": "RealTimeX Link jest włączony.",
   "link.turnedOff": "RealTimeX Link jest wyłączony.",
   "confirm.turnOffLink.title": "Wyłączyć RealTimeX Link?",
   "confirm.turnOffLink.message": "Opublikowane artefakty przechodzą w tryb offline, webhooki nie są odbierane, aplikacja mobilna i inne komputery nie mogą dotrzeć do tego komputera i nikt nie może połączyć się do zdalnego sterowania. Nie uruchomi się po zalogowaniu, dopóki go znowu nie włączysz.",
+  "confirm.turnOffLink.messageNoLogin": "Opublikowane artefakty przechodzą w tryb offline, webhooki nie są odbierane, aplikacja mobilna i inne komputery nie mogą dotrzeć do tego komputera i nikt nie może połączyć się do zdalnego sterowania.",
   "confirm.turnOffLink.action": "Wyłącz",
   "moved.title": "Ten komputer ma teraz jeden App ID",
   "moved.message": "RealTimeX Link udostępnia teraz wszystko z tego komputera pod App ID RealTimeX, {appId}. Opublikowane linki i adresy URL webhooków się nie zmieniają. Komputery, które używały {old}, przejdą na nowy same.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} dostawa przechowana dla RealTimeX",
   "shared.deliveriesKept.other": "Dostawy przechowane dla RealTimeX: {count}",
   "shared.waiting.one": "{count} oczekuje",
-  "shared.waiting.other": "Oczekujące: {count}"
+  "shared.waiting.other": "Oczekujące: {count}",
+  "instance.unnamed": "bez nazwy"
 }

@@ -157,6 +157,8 @@
   "tray.checkUpdates": "检查更新",
   "tray.updateTo": "更新到 RealTimeX Link {version}…",
   "tray.quit": "退出，直到下次登录",
+  "tray.quitPlain": "退出",
+  "tray.quitRestartNote": "RealTimeX 会再次启动 Link",
   "tray.starting": "RealTimeX Link 正在启动…",
   "tray.off": "远程控制已关闭",
   "tray.on": "远程控制已开启",
@@ -179,11 +181,15 @@
   "link.off": "已关闭",
   "link.keepRunning": "保持 RealTimeX Link 运行",
   "link.onDescription": "登录时启动，即使 RealTimeX 已关闭，也能让这台电脑保持可访问。",
+  "link.onDescriptionNoLogin": "让这台电脑保持可访问。由 RealTimeX 启动，不会在登录时启动。",
   "link.offDescription": "已发布的制品、Webhooks、移动应用和远程控制都无法访问这台电脑。RealTimeX Link 不会在登录时启动。",
+  "link.offDescriptionNoLogin": "已发布的制品、Webhooks、移动应用和远程控制都无法访问这台电脑。",
   "link.turnedOn": "RealTimeX Link 已开启，会在登录时启动。",
+  "link.turnedOnNoLogin": "RealTimeX Link 已开启。",
   "link.turnedOff": "RealTimeX Link 已关闭。",
   "confirm.turnOffLink.title": "要关闭 RealTimeX Link 吗？",
   "confirm.turnOffLink.message": "已发布的制品将离线，Webhooks 将无法接收，移动应用和其他电脑将无法访问这台电脑，也没有人能连接进行远程控制。在你重新开启之前，它不会在登录时启动。",
+  "confirm.turnOffLink.messageNoLogin": "已发布的制品将离线，Webhooks 将无法接收，移动应用和其他电脑将无法访问这台电脑，也没有人能连接进行远程控制。",
   "confirm.turnOffLink.action": "关闭",
   "moved.title": "这台电脑现在只有一个 App ID",
   "moved.message": "RealTimeX Link 现在以 RealTimeX 的 App ID {appId} 共享这台电脑上的所有内容。已发布的链接和 Webhook URL 不会改变。使用 {old} 的电脑会自动迁移过来。",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "已为 RealTimeX 保留 {count} 次投递",
   "shared.deliveriesKept.other": "已为 RealTimeX 保留 {count} 次投递",
   "shared.waiting.one": "{count} 个等待中",
-  "shared.waiting.other": "{count} 个等待中"
+  "shared.waiting.other": "{count} 个等待中",
+  "instance.unnamed": "未命名"
 }

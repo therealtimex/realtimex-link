@@ -157,6 +157,8 @@
   "tray.checkUpdates": "アップデートを確認",
   "tray.updateTo": "RealTimeX Link {version} にアップデート…",
   "tray.quit": "次回のログインまで終了",
+  "tray.quitPlain": "終了",
+  "tray.quitRestartNote": "RealTimeX が Link を再び起動します",
   "tray.starting": "RealTimeX Link を起動しています…",
   "tray.off": "リモート操作はオフです",
   "tray.on": "リモート操作はオンです",
@@ -179,11 +181,15 @@
   "link.off": "オフ",
   "link.keepRunning": "RealTimeX Link を実行し続ける",
   "link.onDescription": "ログイン時に起動し、RealTimeX が閉じていてもこのコンピューターに接続できる状態を保ちます。",
+  "link.onDescriptionNoLogin": "このコンピューターに接続できる状態を保ちます。RealTimeX が起動し、ログイン時には起動しません。",
   "link.offDescription": "公開済みアーティファクト、Webhook、モバイルアプリ、リモート操作はこのコンピューターに接続できません。RealTimeX Link はログイン時に起動しません。",
+  "link.offDescriptionNoLogin": "公開済みアーティファクト、Webhook、モバイルアプリ、リモート操作はこのコンピューターに接続できません。",
   "link.turnedOn": "RealTimeX Link はオンです。ログイン時に起動します。",
+  "link.turnedOnNoLogin": "RealTimeX Link はオンです。",
   "link.turnedOff": "RealTimeX Link はオフです。",
   "confirm.turnOffLink.title": "RealTimeX Link をオフにしますか？",
   "confirm.turnOffLink.message": "公開済みアーティファクトはオフラインになり、Webhook は受信されず、モバイルアプリやほかのデスクトップはこのコンピューターに接続できなくなり、リモート操作で接続することもできなくなります。もう一度オンにするまで、ログイン時に起動しません。",
+  "confirm.turnOffLink.messageNoLogin": "公開済みアーティファクトはオフラインになり、Webhook は受信されず、モバイルアプリやほかのデスクトップはこのコンピューターに接続できなくなり、リモート操作で接続することもできなくなります。",
   "confirm.turnOffLink.action": "オフにする",
   "moved.title": "このコンピューターの App ID は 1 つになりました",
   "moved.message": "RealTimeX Link は、このコンピューターのすべてを RealTimeX の App ID（{appId}）で共有するようになりました。公開済みのリンクや Webhook の URL は変わりません。{old} を使っていたコンピューターは自動的に移行します。",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "RealTimeX のために {count} 件の配信を保持中",
   "shared.deliveriesKept.other": "RealTimeX のために {count} 件の配信を保持中",
   "shared.waiting.one": "{count} 件待機中",
-  "shared.waiting.other": "{count} 件待機中"
+  "shared.waiting.other": "{count} 件待機中",
+  "instance.unnamed": "名前なし"
 }

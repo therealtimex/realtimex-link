@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Otsi uuendusi",
   "tray.updateTo": "Uuenda versioonile RealTimeX Link {version}…",
   "tray.quit": "Välju kuni järgmise sisselogimiseni",
+  "tray.quitPlain": "Välju",
+  "tray.quitRestartNote": "RealTimeX käivitab Linki uuesti",
   "tray.starting": "RealTimeX Link käivitub…",
   "tray.off": "Kaugjuhtimine on välja lülitatud",
   "tray.on": "Kaugjuhtimine on sisse lülitatud",
@@ -179,11 +181,15 @@
   "link.off": "Väljas",
   "link.keepRunning": "Hoia RealTimeX Link töös",
   "link.onDescription": "Käivitub sisselogimisel ja hoiab selle arvuti kättesaadavana ka siis, kui RealTimeX on suletud.",
+  "link.onDescriptionNoLogin": "Hoiab selle arvuti kättesaadavana. RealTimeX käivitab selle ja see ei käivitu sisselogimisel.",
   "link.offDescription": "Avaldatud artefaktid, veebihaagid, mobiilirakendus ja kaugjuhtimine ei jõua selle arvutini. RealTimeX Link ei käivitu sisselogimisel.",
+  "link.offDescriptionNoLogin": "Avaldatud artefaktid, veebihaagid, mobiilirakendus ja kaugjuhtimine ei jõua selle arvutini.",
   "link.turnedOn": "RealTimeX Link on sisse lülitatud. See käivitub sisselogimisel.",
+  "link.turnedOnNoLogin": "RealTimeX Link on sisse lülitatud.",
   "link.turnedOff": "RealTimeX Link on välja lülitatud.",
   "confirm.turnOffLink.title": "Kas lülitada RealTimeX Link välja?",
   "confirm.turnOffLink.message": "Avaldatud artefaktid lähevad võrguühenduseta olekusse, veebihaake ei võeta vastu, mobiilirakendus ja teised arvutid ei jõua selle arvutini ning keegi ei saa kaugjuhtimiseks ühendust luua. See ei käivitu sisselogimisel enne, kui selle uuesti sisse lülitad.",
+  "confirm.turnOffLink.messageNoLogin": "Avaldatud artefaktid lähevad võrguühenduseta olekusse, veebihaake ei võeta vastu, mobiilirakendus ja teised arvutid ei jõua selle arvutini ning keegi ei saa kaugjuhtimiseks ühendust luua.",
   "confirm.turnOffLink.action": "Lülita välja",
   "moved.title": "Sellel arvutil on nüüd üks rakenduse ID",
   "moved.message": "RealTimeX Link jagab nüüd kõike sellest arvutist RealTimeXi rakenduse ID {appId} all. Avaldatud lingid ja veebihaakide URL-id ei muutu. Arvutid, mis kasutasid ID-d {old}, lähevad ise üle.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} tarne hoitud RealTimeXi jaoks",
   "shared.deliveriesKept.other": "{count} tarnet hoitud RealTimeXi jaoks",
   "shared.waiting.one": "{count} ootel",
-  "shared.waiting.other": "{count} ootel"
+  "shared.waiting.other": "{count} ootel",
+  "instance.unnamed": "nimeta"
 }

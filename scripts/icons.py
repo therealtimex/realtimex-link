@@ -17,9 +17,14 @@ tray icon: the Windows icon without its navy square.
                            (the app icon in colour without its navy square, 32 px) and the macOS
                            menu bar template (the same shape in black on transparent with the
                            badge's chain cut out, 44 px: 22 pt at 2x)
+  crates/link/icons/*-other.rgba  the two tray icons of another Link instance (one a RealTimeX
+                           runs with a data folder of its own): a dot at the top left, opposite
+                           the badge, with a transparent gap around it
 
 Renders the SVGs with Chrome (headless) and scales with Pillow. Run it after changing an SVG:
   python3 scripts/icons.py
+Only the other instance's tray icons, from the tray icons already in crates/link/icons:
+  python3 scripts/icons.py other
 """
 import os
 import shutil
@@ -27,7 +32,7 @@ import subprocess
 import sys
 import tempfile
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS = os.path.join(ROOT, "assets")
@@ -164,7 +169,47 @@ def write_rgba(image, size, name, resample=Image.LANCZOS, inner=None):
         handle.write(resized.tobytes())
 
 
+# Another instance's tray icons (the Link 0.2.1 UX contract, §3): the dot's centre, radius and gap
+# in px of the icon, and its colour (black in the macOS template, violet elsewhere).
+OTHER = {
+    "tray-template-44": ((10.5, 10.5), 6, 2, (0, 0, 0, 255)),
+    "tray-32": ((6, 6), 5, 1.5, (139, 92, 246, 255)),
+}
+# Drawn this many times larger, then scaled down, for smooth edges.
+SUPERSAMPLE = 8
+
+
+def with_dot(image, center, radius, gap, fill):
+    """The icon with the dot: the icon cleared within radius + gap of the centre, then the dot."""
+    size = image.width
+    big = image.resize((size * SUPERSAMPLE,) * 2, Image.LANCZOS)
+    x, y = center[0] * SUPERSAMPLE, center[1] * SUPERSAMPLE
+
+    def disc(r):
+        r *= SUPERSAMPLE
+        return [x - r, y - r, x + r, y + r]
+
+    hole = Image.new("L", big.size, 0)
+    ImageDraw.Draw(hole).ellipse(disc(radius + gap), fill=255)
+    big.putalpha(Image.composite(Image.new("L", big.size, 0), big.getchannel("A"), hole))
+    ImageDraw.Draw(big).ellipse(disc(radius), fill=fill)
+    return big.resize((size, size), Image.LANCZOS)
+
+
+def write_other():
+    for name, (center, radius, gap, fill) in OTHER.items():
+        size = int(name.rsplit("-", 1)[1])
+        with open(os.path.join(RGBA_DIR, f"{name}.rgba"), "rb") as handle:
+            image = Image.frombytes("RGBA", (size, size), handle.read())
+        with open(os.path.join(RGBA_DIR, f"{name}-other.rgba"), "wb") as handle:
+            handle.write(with_dot(image, center, radius, gap, fill).tobytes())
+
+
 def main():
+    if sys.argv[1:] == ["other"]:
+        write_other()
+        print("other instance's tray icons written to crates/link/icons/")
+        return
     with tempfile.TemporaryDirectory() as tmp:
         masters = {
             platform: (compose(platform, BADGE_SHARE, tmp), compose(platform, SMALL_BADGE_SHARE, tmp))
@@ -200,6 +245,7 @@ def main():
     # own tray icon is (frontend/assets/tray-icon.png shown at 16 pt), so the two side by side
     # are the same size and weight.
     write_rgba(template(tray), 44, "tray-template-44.rgba", Image.BOX, inner=32)
+    write_other()
     print("icons written to assets/ and crates/link/icons/")
 
 

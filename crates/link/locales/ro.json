@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Căutați actualizări",
   "tray.updateTo": "Actualizați la RealTimeX Link {version}…",
   "tray.quit": "Ieșire până la următoarea conectare",
+  "tray.quitPlain": "Ieșire",
+  "tray.quitRestartNote": "RealTimeX va porni Link din nou",
   "tray.starting": "RealTimeX Link pornește…",
   "tray.off": "Controlul la distanță este dezactivat",
   "tray.on": "Controlul la distanță este activat",
@@ -179,11 +181,15 @@
   "link.off": "Dezactivat",
   "link.keepRunning": "Mențineți RealTimeX Link pornit",
   "link.onDescription": "Pornește la conectare și menține acest computer accesibil, chiar și când RealTimeX este închis.",
+  "link.onDescriptionNoLogin": "Menține acest computer accesibil. RealTimeX îl pornește și nu pornește la conectare.",
   "link.offDescription": "Artefactele publicate, webhookurile, aplicația mobilă și controlul la distanță nu pot ajunge la acest computer. RealTimeX Link nu va porni la conectare.",
+  "link.offDescriptionNoLogin": "Artefactele publicate, webhookurile, aplicația mobilă și controlul la distanță nu pot ajunge la acest computer.",
   "link.turnedOn": "RealTimeX Link este activat. Pornește la conectare.",
+  "link.turnedOnNoLogin": "RealTimeX Link este activat.",
   "link.turnedOff": "RealTimeX Link este dezactivat.",
   "confirm.turnOffLink.title": "Dezactivați RealTimeX Link?",
   "confirm.turnOffLink.message": "Artefactele publicate devin offline, webhookurile nu sunt primite, aplicația mobilă și alte computere nu pot ajunge la acest computer și nimeni nu se poate conecta pentru control la distanță. Nu va porni la conectare până nu îl activați din nou.",
+  "confirm.turnOffLink.messageNoLogin": "Artefactele publicate devin offline, webhookurile nu sunt primite, aplicația mobilă și alte computere nu pot ajunge la acest computer și nimeni nu se poate conecta pentru control la distanță.",
   "confirm.turnOffLink.action": "Dezactivează",
   "moved.title": "Acest computer are acum un singur App ID",
   "moved.message": "RealTimeX Link partajează acum totul de pe acest computer sub App ID-ul RealTimeX, {appId}. Linkurile publicate și URL-urile webhookurilor nu se schimbă. Computerele care foloseau {old} trec singure pe cel nou.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} livrare păstrată pentru RealTimeX",
   "shared.deliveriesKept.other": "Livrări păstrate pentru RealTimeX: {count}",
   "shared.waiting.one": "{count} în așteptare",
-  "shared.waiting.other": "În așteptare: {count}"
+  "shared.waiting.other": "În așteptare: {count}",
+  "instance.unnamed": "fără nume"
 }

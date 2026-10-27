@@ -103,7 +103,7 @@ const PRIMARY_HOVER: Color32 = Color32::from_rgba_premultiplied(49, 172, 225, 23
 pub const CONTROL_RADIUS: u8 = 6;
 pub const CARD_RADIUS: u8 = 8;
 /// Buttons are h-10 in RealTimeX; a little lower here, where they sit in rows inside cards.
-const CONTROL_HEIGHT: f32 = 32.0;
+pub const CONTROL_HEIGHT: f32 = 32.0;
 pub const PRIMARY_HEIGHT: f32 = 36.0;
 
 /// Plus Jakarta Sans, then the Cyrillic subset, ahead of egui's own fonts (its icons and emoji);

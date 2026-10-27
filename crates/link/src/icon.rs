@@ -12,12 +12,13 @@ use eframe::egui;
 use crate::app::{lock, poll_loop, Snapshot};
 use crate::tray::{Actions, Tray};
 
-/// Start the window process (it keeps one window open at a time itself).
+/// Start the window process of this instance (it keeps one window open at a time itself).
 pub fn open_window() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let child = Command::new(exe)
+        .args(crate::api::instance_args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

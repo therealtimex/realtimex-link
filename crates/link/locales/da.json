@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Søg efter opdateringer",
   "tray.updateTo": "Opdater til RealTimeX Link {version}…",
   "tray.quit": "Afslut indtil næste login",
+  "tray.quitPlain": "Afslut",
+  "tray.quitRestartNote": "RealTimeX starter Link igen",
   "tray.starting": "RealTimeX Link starter…",
   "tray.off": "Fjernstyring er slået fra",
   "tray.on": "Fjernstyring er slået til",
@@ -179,11 +181,15 @@
   "link.off": "Fra",
   "link.keepRunning": "Hold RealTimeX Link kørende",
   "link.onDescription": "Starter ved login og holder denne computer tilgængelig, også når RealTimeX er lukket.",
+  "link.onDescriptionNoLogin": "Holder denne computer tilgængelig. RealTimeX starter det, og det starter ikke ved login.",
   "link.offDescription": "Publicerede artefakter, webhooks, mobilappen og fjernstyring kan ikke nå denne computer. RealTimeX Link starter ikke ved login.",
+  "link.offDescriptionNoLogin": "Publicerede artefakter, webhooks, mobilappen og fjernstyring kan ikke nå denne computer.",
   "link.turnedOn": "RealTimeX Link er slået til. Det starter ved login.",
+  "link.turnedOnNoLogin": "RealTimeX Link er slået til.",
   "link.turnedOff": "RealTimeX Link er slået fra.",
   "confirm.turnOffLink.title": "Slå RealTimeX Link fra?",
   "confirm.turnOffLink.message": "Publicerede artefakter går offline, webhooks modtages ikke, mobilappen og andre computere kan ikke nå denne computer, og ingen kan forbinde til fjernstyring. Det starter ikke ved login, før du slår det til igen.",
+  "confirm.turnOffLink.messageNoLogin": "Publicerede artefakter går offline, webhooks modtages ikke, mobilappen og andre computere kan ikke nå denne computer, og ingen kan forbinde til fjernstyring.",
   "confirm.turnOffLink.action": "Slå fra",
   "moved.title": "Denne computer har nu ét App-ID",
   "moved.message": "RealTimeX Link deler nu alt fra denne computer under RealTimeX' App-ID, {appId}. Publicerede links og webhook-URL'er ændres ikke. Computere, der brugte {old}, flytter selv over.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} leverance gemt til RealTimeX",
   "shared.deliveriesKept.other": "{count} leverancer gemt til RealTimeX",
   "shared.waiting.one": "{count} venter",
-  "shared.waiting.other": "{count} venter"
+  "shared.waiting.other": "{count} venter",
+  "instance.unnamed": "uden navn"
 }

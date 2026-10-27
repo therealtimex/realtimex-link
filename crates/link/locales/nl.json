@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Controleren op updates",
   "tray.updateTo": "Bijwerken naar RealTimeX Link {version}…",
   "tray.quit": "Afsluiten tot de volgende aanmelding",
+  "tray.quitPlain": "Afsluiten",
+  "tray.quitRestartNote": "RealTimeX start Link weer",
   "tray.starting": "RealTimeX Link wordt gestart…",
   "tray.off": "Bediening op afstand staat uit",
   "tray.on": "Bediening op afstand staat aan",
@@ -179,11 +181,15 @@
   "link.off": "Uit",
   "link.keepRunning": "RealTimeX Link actief houden",
   "link.onDescription": "Start bij het aanmelden en houdt deze computer bereikbaar, ook als RealTimeX gesloten is.",
+  "link.onDescriptionNoLogin": "Houdt deze computer bereikbaar. RealTimeX start het; het start niet bij het aanmelden.",
   "link.offDescription": "Gepubliceerde artefacten, webhooks, de mobiele app en bediening op afstand kunnen deze computer niet bereiken. RealTimeX Link start niet bij het aanmelden.",
+  "link.offDescriptionNoLogin": "Gepubliceerde artefacten, webhooks, de mobiele app en bediening op afstand kunnen deze computer niet bereiken.",
   "link.turnedOn": "RealTimeX Link staat aan. Het start bij het aanmelden.",
+  "link.turnedOnNoLogin": "RealTimeX Link staat aan.",
   "link.turnedOff": "RealTimeX Link staat uit.",
   "confirm.turnOffLink.title": "RealTimeX Link uitzetten?",
   "confirm.turnOffLink.message": "Gepubliceerde artefacten gaan offline, webhooks worden niet ontvangen, de mobiele app en andere desktops kunnen deze computer niet bereiken en niemand kan verbinding maken voor bediening op afstand. Het start pas weer bij het aanmelden als je het weer aanzet.",
+  "confirm.turnOffLink.messageNoLogin": "Gepubliceerde artefacten gaan offline, webhooks worden niet ontvangen, de mobiele app en andere desktops kunnen deze computer niet bereiken en niemand kan verbinding maken voor bediening op afstand.",
   "confirm.turnOffLink.action": "Uitzetten",
   "moved.title": "Deze computer heeft nu één App ID",
   "moved.message": "RealTimeX Link deelt nu alles van deze computer onder de App ID van RealTimeX, {appId}. Gepubliceerde links en webhook-URL's veranderen niet. Computers die {old} gebruikten stappen vanzelf over.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} levering bewaard voor RealTimeX",
   "shared.deliveriesKept.other": "{count} leveringen bewaard voor RealTimeX",
   "shared.waiting.one": "{count} wachtend",
-  "shared.waiting.other": "{count} wachtend"
+  "shared.waiting.other": "{count} wachtend",
+  "instance.unnamed": "zonder naam"
 }

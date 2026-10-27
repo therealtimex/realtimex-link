@@ -3,7 +3,9 @@
 //! Link, and Quit,
 //! which stops hosting (closing the window does not). How the window opens and text is copied is
 //! up to the process that shows the icon (Actions): the window's own on macOS and Windows, a
-//! separate window process on Linux (icon.rs); copying is clipboard.rs's on both.
+//! separate window process on Linux (icon.rs); copying is clipboard.rs's on both. Another Link
+//! instance (instance.rs) has a dot on its icon, its name as the menu's first line and tooltip, and
+//! no Update or Open RealTimeX: those would act on this computer's Link and RealTimeX.
 
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -16,6 +18,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use crate::app::{act, lock, start_update, Shared};
 use crate::desktop;
 use crate::i18n::{t, tf};
+use crate::instance::Instance;
 
 /// What the icon's menu does for the process showing it.
 pub struct Actions {
@@ -46,7 +49,10 @@ impl Actions {
 }
 
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    menu: Menu,
+    /// Another instance's name, the menu's first line (Linux desktops often show no tooltip).
+    name: MenuItem,
     status: MenuItem,
     toggle: MenuItem,
     update: MenuItem,
@@ -54,6 +60,10 @@ pub struct Tray {
     open: MenuItem,
     realtimex: MenuItem,
     quit: MenuItem,
+    /// "RealTimeX will start Link again", under Quit when it will.
+    quit_note: MenuItem,
+    /// The instance, Quit's case and the language the menu was laid out for.
+    layout: std::cell::RefCell<Option<(Instance, Quit, &'static str)>>,
     last: std::cell::RefCell<(String, String, String)>,
     /// Whether the items that need Link running are enabled now.
     enabled: std::cell::Cell<Option<bool>>,
@@ -72,16 +82,85 @@ fn realtimex_label() -> String {
 
 /// The menu bar / tray icon, the app icon without its navy square (made by scripts/icons.py): on
 /// macOS a template (black on transparent, the badge's chain cut out, 44 px: 22 pt at 2x) the
-/// system tints for the light and dark menu bar; elsewhere in colour at 32 px.
-fn icon() -> Icon {
+/// system tints for the light and dark menu bar; elsewhere in colour at 32 px. Another instance's
+/// ("-other") has a dot at the top left, black in the template, violet elsewhere.
+fn icon(default: bool) -> Icon {
     #[cfg(target_os = "macos")]
-    let (rgba, size) = (
-        include_bytes!("../icons/tray-template-44.rgba").to_vec(),
-        44,
-    );
+    let (rgba, size): (&[u8], u32) = if default {
+        (include_bytes!("../icons/tray-template-44.rgba"), 44)
+    } else {
+        (include_bytes!("../icons/tray-template-44-other.rgba"), 44)
+    };
     #[cfg(not(target_os = "macos"))]
-    let (rgba, size) = (include_bytes!("../icons/tray-32.rgba").to_vec(), 32);
-    Icon::from_rgba(rgba, size, size).expect("icon")
+    let (rgba, size): (&[u8], u32) = if default {
+        (include_bytes!("../icons/tray-32.rgba"), 32)
+    } else {
+        (include_bytes!("../icons/tray-32-other.rgba"), 32)
+    };
+    Icon::from_rgba(rgba.to_vec(), size, size).expect("icon")
+}
+
+/// What Quit says (the Link 0.2.1 UX contract, §4): the first case that holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quit {
+    /// RealTimeX owns Link and Keep running is on: it starts Link again ("Quit", and a note).
+    Restarted,
+    /// Link starts at login: "Quit until next login".
+    UntilLogin,
+    /// "Quit".
+    Plain,
+}
+
+/// From GET /v1/status: realtimexPresent, running (Keep running) and autostartEnabled (false on
+/// another instance). None yet: plain.
+fn quit_case(status: Option<&Value>) -> Quit {
+    let flag = |name: &str| status.and_then(|s| s.get(name)).and_then(Value::as_bool) == Some(true);
+    if flag("realtimexPresent") && flag("running") {
+        Quit::Restarted
+    } else if flag("autostartEnabled") {
+        Quit::UntilLogin
+    } else {
+        Quit::Plain
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    Name,
+    Status,
+    Separator,
+    Copy,
+    Toggle,
+    Open,
+    Realtimex,
+    Update,
+    Quit,
+    QuitNote,
+}
+
+/// The menu, top to bottom: another instance's begins with its name and has no Open RealTimeX or
+/// Update; the note under Quit only when RealTimeX starts Link again.
+fn entries(default: bool, quit: Quit) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    if !default {
+        entries.push(Entry::Name);
+    }
+    entries.extend([
+        Entry::Status,
+        Entry::Separator,
+        Entry::Copy,
+        Entry::Toggle,
+        Entry::Separator,
+        Entry::Open,
+    ]);
+    if default {
+        entries.extend([Entry::Realtimex, Entry::Update]);
+    }
+    entries.extend([Entry::Separator, Entry::Quit]);
+    if quit == Quit::Restarted {
+        entries.push(Entry::QuitNote);
+    }
+    entries
 }
 
 impl Tray {
@@ -97,28 +176,20 @@ impl Tray {
         let open = MenuItem::new(t("tray.open"), true, None);
         let update = MenuItem::new(t("tray.checkUpdates"), true, None);
         let realtimex = MenuItem::new(realtimex_label(), true, None);
-        let quit = MenuItem::new(t("tray.quit"), true, None);
+        let quit = MenuItem::new(t("tray.quitPlain"), true, None);
+        let name = MenuItem::new("", false, None);
+        let quit_note = MenuItem::new(t("tray.quitRestartNote"), false, None);
+        // Filled by lay_out, below.
         let menu = Menu::new();
-        menu.append_items(&[
-            &status,
-            &PredefinedMenuItem::separator(),
-            &copy,
-            &toggle,
-            &PredefinedMenuItem::separator(),
-            &open,
-            &realtimex,
-            &update,
-            &PredefinedMenuItem::separator(),
-            &quit,
-        ])?;
+        let instance = crate::instance::current();
         let builder = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("RealTimeX Link");
+            .with_menu(Box::new(menu.clone()))
+            .with_tooltip(instance.name());
         // macOS tints a template icon for the light and dark menu bar.
         #[cfg(target_os = "macos")]
-        let builder = builder.with_icon_templated(icon());
+        let builder = builder.with_icon_templated(icon(instance.default));
         #[cfg(not(target_os = "macos"))]
-        let builder = builder.with_icon(icon());
+        let builder = builder.with_icon(icon(instance.default));
         let icon = builder.build()?;
 
         let ids = (
@@ -199,8 +270,10 @@ impl Tray {
             }
             ctx.request_repaint();
         }));
-        Ok(Self {
-            _icon: icon,
+        let tray = Self {
+            icon,
+            menu,
+            name,
             status,
             toggle,
             update,
@@ -208,14 +281,59 @@ impl Tray {
             open,
             realtimex,
             quit,
+            quit_note,
+            layout: Default::default(),
             last: Default::default(),
             enabled: std::cell::Cell::new(None),
             language: std::cell::Cell::new(crate::i18n::current().code),
-        })
+        };
+        tray.lay_out(None);
+        Ok(tray)
+    }
+
+    /// The menu's items, Quit's wording, the tooltip and the icon, for the instance (as last
+    /// read) and Quit's case: again only when one of them or the language changed.
+    fn lay_out(&self, status: Option<&Value>) {
+        let instance = crate::instance::current();
+        let quit = quit_case(status);
+        let layout = (instance.clone(), quit, crate::i18n::current().code);
+        let previous = self.layout.replace(Some(layout.clone()));
+        if previous.as_ref() == Some(&layout) {
+            return;
+        }
+        if previous.as_ref().map(|(instance, ..)| instance) != Some(&instance) {
+            let _ = self.icon.set_tooltip(Some(instance.name()));
+            #[cfg(target_os = "macos")]
+            let _ = self.icon.set_icon_templated(Some(icon(instance.default)));
+            #[cfg(not(target_os = "macos"))]
+            let _ = self.icon.set_icon(Some(icon(instance.default)));
+        }
+        self.name.set_text(instance.short_name());
+        self.quit.set_text(t(if quit == Quit::UntilLogin {
+            "tray.quit"
+        } else {
+            "tray.quitPlain"
+        }));
+        self.quit_note.set_text(t("tray.quitRestartNote"));
+        while self.menu.remove_at(0).is_some() {}
+        for entry in entries(instance.default, quit) {
+            let _ = match entry {
+                Entry::Name => self.menu.append(&self.name),
+                Entry::Status => self.menu.append(&self.status),
+                Entry::Separator => self.menu.append(&PredefinedMenuItem::separator()),
+                Entry::Copy => self.menu.append(&self.copy),
+                Entry::Toggle => self.menu.append(&self.toggle),
+                Entry::Open => self.menu.append(&self.open),
+                Entry::Realtimex => self.menu.append(&self.realtimex),
+                Entry::Update => self.menu.append(&self.update),
+                Entry::Quit => self.menu.append(&self.quit),
+                Entry::QuitNote => self.menu.append(&self.quit_note),
+            };
+        }
     }
 
     /// The status line, the switch's and the update item's labels, from the latest state; every
-    /// label when the language changed. `status` is GET /v1/status: with "Keep RealTimeX Link
+    /// label when the language changed, and the layout when the instance or Quit's case did. `status` is GET /v1/status: with "Keep RealTimeX Link
     /// running" off, the status says so and copying and remote control are unavailable (turning
     /// Link on is the switch at the top of the window).
     pub fn update(&self, overview: Option<&Value>, update: Option<&Value>, status: Option<&Value>) {
@@ -232,8 +350,8 @@ impl Tray {
             self.copy.set_text(t("tray.copy"));
             self.open.set_text(t("tray.open"));
             self.realtimex.set_text(realtimex_label());
-            self.quit.set_text(t("tray.quit"));
         }
+        self.lay_out(status);
         let on = overview.and_then(|o| o.get("allowIncoming")) == Some(&Value::Bool(true));
         let holder = overview
             .and_then(|o| o.get("session"))
@@ -269,5 +387,72 @@ impl Tray {
             self.toggle.set_text(&toggle);
             last.1 = toggle;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_says_what_happens_next() {
+        let case = |status: Value| quit_case(Some(&status));
+        // RealTimeX starts Link again: that wins over the login item.
+        assert_eq!(
+            case(json!({ "realtimexPresent": true, "running": true, "autostartEnabled": true })),
+            Quit::Restarted
+        );
+        assert_eq!(
+            case(json!({ "realtimexPresent": true, "running": false, "autostartEnabled": true })),
+            Quit::UntilLogin
+        );
+        assert_eq!(
+            case(json!({ "realtimexPresent": false, "running": true, "autostartEnabled": true })),
+            Quit::UntilLogin
+        );
+        // Another instance never starts at login.
+        assert_eq!(
+            case(json!({ "realtimexPresent": false, "running": true, "autostartEnabled": false })),
+            Quit::Plain
+        );
+        // An older daemon, or none read yet.
+        assert_eq!(case(json!({ "running": true })), Quit::Plain);
+        assert_eq!(quit_case(None), Quit::Plain);
+    }
+
+    #[test]
+    fn another_instance_is_named_and_leaves_this_computers_link_alone() {
+        use Entry as E;
+        assert_eq!(
+            entries(true, Quit::UntilLogin),
+            [
+                E::Status,
+                E::Separator,
+                E::Copy,
+                E::Toggle,
+                E::Separator,
+                E::Open,
+                E::Realtimex,
+                E::Update,
+                E::Separator,
+                E::Quit
+            ]
+        );
+        assert_eq!(
+            entries(false, Quit::Restarted),
+            [
+                E::Name,
+                E::Status,
+                E::Separator,
+                E::Copy,
+                E::Toggle,
+                E::Separator,
+                E::Open,
+                E::Separator,
+                E::Quit,
+                E::QuitNote
+            ]
+        );
+        assert_eq!(entries(true, Quit::Plain).last(), Some(&E::Quit));
     }
 }

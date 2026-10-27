@@ -58,10 +58,11 @@ fn rows(items: &Value, open: bool, waiting: u64) -> Vec<Row> {
                 ),
                 badge: up(),
             },
-            // Taken live, or kept by Link while RealTimeX is closed.
+            // Taken live, or kept by Link while RealTimeX is closed. Deliveries still waiting show
+            // whatever the origin says: a stale origin (RealTimeX crashed) must not hide them.
             "webhooks" => {
                 let endpoints = counted("shared.endpoints", count(item));
-                if open || waiting == 0 {
+                if waiting == 0 {
                     Row {
                         name: t("shared.webhooks"),
                         detail: format!("{endpoints} · {}", t("shared.webhooksKept")),
@@ -154,7 +155,7 @@ impl LinkApp {
                                 ctx,
                                 "/v1/running",
                                 json!({ "on": true }),
-                                &t("link.turnedOn"),
+                                &t(&keep_running_copy("link.turnedOn")),
                             );
                         } else {
                             self.confirm = Some(Confirm::TurnOffLink);
@@ -164,11 +165,11 @@ impl LinkApp {
             });
             caption(
                 ui,
-                t(if on {
+                t(&keep_running_copy(if on {
                     "link.onDescription"
                 } else {
                     "link.offDescription"
-                }),
+                })),
             );
         });
     }
@@ -337,9 +338,14 @@ mod tests {
             { "kind": "messaging", "count": 2, "names": ["Office Mac", "Studio PC"] },
             { "kind": "later", "count": 1 },
         ]);
-        let open = rows(&items, true, 4);
+        let open = rows(&items, true, 0);
         assert_eq!(open.len(), 4);
         assert!(open.iter().all(|row| row.badge.1 == Tone::Success));
+        // Deliveries waiting while an origin is registered still show.
+        assert_eq!(
+            rows(&items, true, 4)[1].badge,
+            ("4 waiting".to_string(), Tone::Info)
+        );
         assert!(open[2].detail.contains("support.example.com"));
         assert_eq!(open[3].detail, "Office Mac, Studio PC");
         // RealTimeX closed: artifacts stay up (Link serves them), webhooks wait for it, the

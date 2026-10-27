@@ -51,7 +51,9 @@ pub fn remember(dir: &Path) {
 }
 
 /// This computer's Link: the standard folder, not a copy with a folder of its own (development,
-/// tests). Only it changes things outside its folder, such as starting at login.
+/// tests, another RealTimeX's instance: instance.rs). Only it changes things outside its folder,
+/// such as starting at login or updating itself. An explicit `--data-dir` that names the standard
+/// folder (RealTimeX passes one on Linux and Windows) is the standard folder.
 pub fn is_standard() -> bool {
     let standard = PathBuf::from(default_data_dir_for(
         std::env::consts::OS,
@@ -62,11 +64,29 @@ pub fn is_standard() -> bool {
         },
         &home_dir(),
     ));
-    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
+    DATA_DIR
+        .get()
+        .is_some_and(|dir| same_folder(dir, &standard, std::env::consts::OS))
+}
+
+/// Whether `a` and `b` are the same folder: compared resolved (links followed) when both exist,
+/// else as written without trailing separators. macOS and Windows file systems ignore case, so the
+/// compare does too there (RealTimeX may spell "Application Support" or "AppData" differently).
+pub fn same_folder(a: &Path, b: &Path, platform: &str) -> bool {
+    let (a, b) = match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => (a.to_path_buf(), b.to_path_buf()),
     };
-    DATA_DIR.get().is_some_and(|dir| same(dir, &standard))
+    let text = |path: &Path| {
+        let text = path.to_string_lossy();
+        let text = text.trim_end_matches(['/', '\\']);
+        if platform == "macos" || platform == "windows" {
+            text.to_lowercase()
+        } else {
+            text.to_string()
+        }
+    };
+    text(&a) == text(&b)
 }
 
 /// Where RealTimeX Link is installed, as RealTimeX looks for it (server/utils/remoteHost/
@@ -182,6 +202,46 @@ mod tests {
             let linked = dir.path().join("linked");
             std::os::unix::fs::symlink(&real, &linked).unwrap();
             assert!(is_install_dir(&linked, &[real.display().to_string()]));
+        }
+    }
+
+    #[test]
+    fn the_default_folder_however_it_is_spelled() {
+        let mac = "/Users/me/Library/Application Support/RealTimeX Link";
+        assert!(same_folder(
+            Path::new(mac),
+            Path::new(&format!("{mac}/")),
+            "macos"
+        ));
+        assert!(same_folder(
+            Path::new("/Users/me/Library/application support/RealTimeX Link"),
+            Path::new(mac),
+            "macos"
+        ));
+        assert!(!same_folder(
+            Path::new("/home/me/.config/Realtimex-Link"),
+            Path::new("/home/me/.config/realtimex-link"),
+            "linux"
+        ));
+        assert!(same_folder(
+            Path::new("C:\\Users\\me\\appdata\\roaming\\RealTimeX Link\\"),
+            Path::new("C:\\Users\\me\\AppData\\Roaming\\RealTimeX Link"),
+            "windows"
+        ));
+        assert!(!same_folder(
+            Path::new("/nowhere/a"),
+            Path::new("/nowhere/b"),
+            "linux"
+        ));
+        // A link to the default folder is the default folder.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        {
+            let linked = dir.path().join("linked");
+            std::os::unix::fs::symlink(&real, &linked).unwrap();
+            assert!(same_folder(&linked, &real, "linux"));
         }
     }
 

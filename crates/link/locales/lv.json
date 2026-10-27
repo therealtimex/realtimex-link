@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Pārbaudīt atjauninājumus",
   "tray.updateTo": "Atjaunināt uz RealTimeX Link {version}…",
   "tray.quit": "Iziet līdz nākamajai pieteikšanās reizei",
+  "tray.quitPlain": "Iziet",
+  "tray.quitRestartNote": "RealTimeX atkal palaidīs Link",
   "tray.starting": "RealTimeX Link startē…",
   "tray.off": "Attālā vadība ir izslēgta",
   "tray.on": "Attālā vadība ir ieslēgta",
@@ -179,11 +181,15 @@
   "link.off": "Izslēgts",
   "link.keepRunning": "Uzturēt RealTimeX Link darbībā",
   "link.onDescription": "Palaižas pieteikšanās laikā un uztur šo datoru sasniedzamu pat tad, ja RealTimeX ir aizvērts.",
+  "link.onDescriptionNoLogin": "Uztur šo datoru sasniedzamu. To palaiž RealTimeX, un tas netiek palaists pieteikšanās laikā.",
   "link.offDescription": "Publicētie artefakti, tīmekļa aizķeres, mobilā lietotne un attālā vadība nevar sasniegt šo datoru. RealTimeX Link netiks palaists pieteikšanās laikā.",
+  "link.offDescriptionNoLogin": "Publicētie artefakti, tīmekļa aizķeres, mobilā lietotne un attālā vadība nevar sasniegt šo datoru.",
   "link.turnedOn": "RealTimeX Link ir ieslēgts. Tas tiek palaists pieteikšanās laikā.",
+  "link.turnedOnNoLogin": "RealTimeX Link ir ieslēgts.",
   "link.turnedOff": "RealTimeX Link ir izslēgts.",
   "confirm.turnOffLink.title": "Izslēgt RealTimeX Link?",
   "confirm.turnOffLink.message": "Publicētie artefakti pāriet bezsaistē, tīmekļa aizķeres netiek saņemtas, mobilā lietotne un citi datori nevar sasniegt šo datoru, un neviens nevar pievienoties attālajai vadībai. Tas netiks palaists pieteikšanās laikā, līdz to atkal ieslēgsiet.",
+  "confirm.turnOffLink.messageNoLogin": "Publicētie artefakti pāriet bezsaistē, tīmekļa aizķeres netiek saņemtas, mobilā lietotne un citi datori nevar sasniegt šo datoru, un neviens nevar pievienoties attālajai vadībai.",
   "confirm.turnOffLink.action": "Izslēgt",
   "moved.title": "Šim datoram tagad ir viens App ID",
   "moved.message": "RealTimeX Link tagad kopīgo visu no šī datora ar RealTimeX App ID {appId}. Publicētās saites un tīmekļa aizķeru URL nemainās. Datori, kas izmantoja {old}, pāriet paši.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} piegāde saglabāta RealTimeX",
   "shared.deliveriesKept.other": "RealTimeX saglabātās piegādes: {count}",
   "shared.waiting.one": "{count} gaida",
-  "shared.waiting.other": "Gaida: {count}"
+  "shared.waiting.other": "Gaida: {count}",
+  "instance.unnamed": "bez nosaukuma"
 }

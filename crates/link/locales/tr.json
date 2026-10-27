@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Güncellemeleri denetle",
   "tray.updateTo": "RealTimeX Link {version} sürümüne güncelle…",
   "tray.quit": "Bir sonraki oturum açmaya kadar çık",
+  "tray.quitPlain": "Çık",
+  "tray.quitRestartNote": "RealTimeX, Link'i yeniden başlatacak",
   "tray.starting": "RealTimeX Link başlatılıyor…",
   "tray.off": "Uzaktan kontrol kapalı",
   "tray.on": "Uzaktan kontrol açık",
@@ -179,11 +181,15 @@
   "link.off": "Kapalı",
   "link.keepRunning": "RealTimeX Link'i çalışır durumda tut",
   "link.onDescription": "Oturum açıldığında başlar ve RealTimeX kapalıyken bile bu bilgisayarı erişilebilir tutar.",
+  "link.onDescriptionNoLogin": "Bu bilgisayarı erişilebilir tutar. RealTimeX başlatır; oturum açıldığında başlamaz.",
   "link.offDescription": "Yayımlanan artefaktlar, web kancaları, mobil uygulama ve uzaktan kontrol bu bilgisayara ulaşamaz. RealTimeX Link oturum açıldığında başlamaz.",
+  "link.offDescriptionNoLogin": "Yayımlanan artefaktlar, web kancaları, mobil uygulama ve uzaktan kontrol bu bilgisayara ulaşamaz.",
   "link.turnedOn": "RealTimeX Link açık. Oturum açıldığında başlar.",
+  "link.turnedOnNoLogin": "RealTimeX Link açık.",
   "link.turnedOff": "RealTimeX Link kapalı.",
   "confirm.turnOffLink.title": "RealTimeX Link kapatılsın mı?",
   "confirm.turnOffLink.message": "Yayımlanan artefaktlar çevrimdışı olur, web kancaları alınmaz, mobil uygulama ve diğer bilgisayarlar bu bilgisayara ulaşamaz ve kimse uzaktan kontrol için bağlanamaz. Yeniden açana kadar oturum açıldığında başlamaz.",
+  "confirm.turnOffLink.messageNoLogin": "Yayımlanan artefaktlar çevrimdışı olur, web kancaları alınmaz, mobil uygulama ve diğer bilgisayarlar bu bilgisayara ulaşamaz ve kimse uzaktan kontrol için bağlanamaz.",
   "confirm.turnOffLink.action": "Kapat",
   "moved.title": "Bu bilgisayarın artık tek bir App ID'si var",
   "moved.message": "RealTimeX Link artık bu bilgisayardaki her şeyi RealTimeX'in App ID'si {appId} altında paylaşıyor. Yayımlanan bağlantılar ve web kancası URL'leri değişmez. {old} kullanan bilgisayarlar kendiliğinden geçer.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "RealTimeX için {count} teslimat saklanıyor",
   "shared.deliveriesKept.other": "RealTimeX için {count} teslimat saklanıyor",
   "shared.waiting.one": "{count} bekliyor",
-  "shared.waiting.other": "{count} bekliyor"
+  "shared.waiting.other": "{count} bekliyor",
+  "instance.unnamed": "adsız"
 }

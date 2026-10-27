@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Rechercher des mises à jour",
   "tray.updateTo": "Mettre à jour vers RealTimeX Link {version}…",
   "tray.quit": "Quitter jusqu'à la prochaine connexion",
+  "tray.quitPlain": "Quitter",
+  "tray.quitRestartNote": "RealTimeX relancera Link",
   "tray.starting": "RealTimeX Link démarre…",
   "tray.off": "Le contrôle à distance est désactivé",
   "tray.on": "Le contrôle à distance est activé",
@@ -179,11 +181,15 @@
   "link.off": "Désactivé",
   "link.keepRunning": "Garder RealTimeX Link en marche",
   "link.onDescription": "Démarre à l'ouverture de session et garde cet ordinateur joignable, même quand RealTimeX est fermé.",
+  "link.onDescriptionNoLogin": "Garde cet ordinateur joignable. RealTimeX le démarre ; il ne démarre pas à l'ouverture de session.",
   "link.offDescription": "Les artefacts publiés, les webhooks, l'application mobile et le contrôle à distance ne peuvent pas joindre cet ordinateur. RealTimeX Link ne démarrera pas à l'ouverture de session.",
+  "link.offDescriptionNoLogin": "Les artefacts publiés, les webhooks, l'application mobile et le contrôle à distance ne peuvent pas joindre cet ordinateur.",
   "link.turnedOn": "RealTimeX Link est activé. Il démarre à l'ouverture de session.",
+  "link.turnedOnNoLogin": "RealTimeX Link est activé.",
   "link.turnedOff": "RealTimeX Link est désactivé.",
   "confirm.turnOffLink.title": "Désactiver RealTimeX Link ?",
   "confirm.turnOffLink.message": "Les artefacts publiés passent hors ligne, les webhooks ne sont plus reçus, l'application mobile et les autres postes ne peuvent plus joindre cet ordinateur, et personne ne peut s'y connecter pour le contrôle à distance. RealTimeX Link ne démarrera plus à l'ouverture de session tant que vous ne le réactivez pas.",
+  "confirm.turnOffLink.messageNoLogin": "Les artefacts publiés passent hors ligne, les webhooks ne sont plus reçus, l'application mobile et les autres postes ne peuvent plus joindre cet ordinateur, et personne ne peut s'y connecter pour le contrôle à distance.",
   "confirm.turnOffLink.action": "Désactiver",
   "moved.title": "Cet ordinateur n'a plus qu'un seul ID d'app",
   "moved.message": "RealTimeX Link partage désormais tout ce qui vient de cet ordinateur sous l'ID d'app de RealTimeX, {appId}. Les liens publiés et les URL de webhook ne changent pas. Les ordinateurs qui utilisaient {old} basculent d'eux-mêmes.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} livraison conservée pour RealTimeX",
   "shared.deliveriesKept.other": "{count} livraisons conservées pour RealTimeX",
   "shared.waiting.one": "{count} en attente",
-  "shared.waiting.other": "{count} en attente"
+  "shared.waiting.other": "{count} en attente",
+  "instance.unnamed": "sans nom"
 }

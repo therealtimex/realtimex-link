@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Kiểm tra cập nhật",
   "tray.updateTo": "Cập nhật lên RealTimeX Link {version}…",
   "tray.quit": "Thoát đến lần đăng nhập tiếp theo",
+  "tray.quitPlain": "Thoát",
+  "tray.quitRestartNote": "RealTimeX sẽ khởi động lại Link",
   "tray.starting": "RealTimeX Link đang khởi động…",
   "tray.off": "Điều khiển từ xa đang tắt",
   "tray.on": "Điều khiển từ xa đang bật",
@@ -179,11 +181,15 @@
   "link.off": "Tắt",
   "link.keepRunning": "Giữ RealTimeX Link luôn chạy",
   "link.onDescription": "Khởi động khi đăng nhập và giữ máy tính này luôn truy cập được, kể cả khi RealTimeX đã đóng.",
+  "link.onDescriptionNoLogin": "Giữ máy tính này luôn truy cập được. RealTimeX khởi động nó và nó không khởi động khi đăng nhập.",
   "link.offDescription": "Tạo phẩm đã xuất bản, webhook, ứng dụng di động và điều khiển từ xa không thể kết nối tới máy tính này. RealTimeX Link sẽ không khởi động khi đăng nhập.",
+  "link.offDescriptionNoLogin": "Tạo phẩm đã xuất bản, webhook, ứng dụng di động và điều khiển từ xa không thể kết nối tới máy tính này.",
   "link.turnedOn": "RealTimeX Link đang bật. Nó khởi động khi đăng nhập.",
+  "link.turnedOnNoLogin": "RealTimeX Link đang bật.",
   "link.turnedOff": "RealTimeX Link đã tắt.",
   "confirm.turnOffLink.title": "Tắt RealTimeX Link?",
   "confirm.turnOffLink.message": "Tạo phẩm đã xuất bản sẽ ngoại tuyến, webhook không được nhận, ứng dụng di động và các máy tính khác không thể kết nối tới máy tính này, và không ai có thể kết nối để điều khiển từ xa. Nó sẽ không khởi động khi đăng nhập cho đến khi bạn bật lại.",
+  "confirm.turnOffLink.messageNoLogin": "Tạo phẩm đã xuất bản sẽ ngoại tuyến, webhook không được nhận, ứng dụng di động và các máy tính khác không thể kết nối tới máy tính này, và không ai có thể kết nối để điều khiển từ xa.",
   "confirm.turnOffLink.action": "Tắt",
   "moved.title": "Máy tính này giờ chỉ có một App ID",
   "moved.message": "RealTimeX Link giờ chia sẻ mọi thứ từ máy tính này dưới App ID của RealTimeX, {appId}. Các liên kết đã xuất bản và URL webhook không thay đổi. Các máy tính từng dùng {old} sẽ tự chuyển sang.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} lần giao nhận được giữ lại cho RealTimeX",
   "shared.deliveriesKept.other": "{count} lần giao nhận được giữ lại cho RealTimeX",
   "shared.waiting.one": "{count} đang chờ",
-  "shared.waiting.other": "{count} đang chờ"
+  "shared.waiting.other": "{count} đang chờ",
+  "instance.unnamed": "không tên"
 }

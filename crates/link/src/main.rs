@@ -17,6 +17,7 @@ mod dock;
 mod i18n;
 #[cfg(target_os = "linux")]
 mod icon;
+mod instance;
 mod theme;
 mod tray;
 
@@ -33,6 +34,10 @@ fn main() -> eframe::Result {
     // it shows its window and this one exits. Without the daemon (or an older one), it goes on.
     let _ = app::ROLE.set("window");
     if let Ok(api) = api::Api::ensure() {
+        // Which instance this is, for the title and the macOS process name (before the window).
+        if let Ok(status) = api.get("/v1/status") {
+            instance::remember(&status);
+        }
         let answer = api.post(
             "/v1/window/open",
             serde_json::json!({ "pid": std::process::id(), "role": "window" }),
@@ -44,14 +49,18 @@ fn main() -> eframe::Result {
         #[cfg(target_os = "linux")]
         if answer.is_ok_and(|answer| answer["tray"] == false) {
             if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).arg("--background").spawn();
+                let _ = std::process::Command::new(exe)
+                    .arg("--background")
+                    .args(api::instance_args())
+                    .spawn();
             }
         }
     }
     dock::set_open(!background);
-    dock::name_process();
+    let instance = instance::current();
+    dock::name_process(&instance.short_name());
     let viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("RealTimeX Link")
+        .with_title(instance.name())
         // The Wayland app_id and the X11 WM_CLASS: the menu entry's name (realtimex-link.desktop,
         // StartupWMClass), so the dock shows the window under Link's own icon.
         .with_app_id("realtimex-link")

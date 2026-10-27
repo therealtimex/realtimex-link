@@ -157,6 +157,8 @@
   "tray.checkUpdates": "Controlla aggiornamenti",
   "tray.updateTo": "Aggiorna a RealTimeX Link {version}…",
   "tray.quit": "Esci fino al prossimo accesso",
+  "tray.quitPlain": "Esci",
+  "tray.quitRestartNote": "RealTimeX riavvierà Link",
   "tray.starting": "RealTimeX Link si sta avviando…",
   "tray.off": "Il controllo remoto è disattivato",
   "tray.on": "Il controllo remoto è attivo",
@@ -179,11 +181,15 @@
   "link.off": "Disattivato",
   "link.keepRunning": "Mantieni RealTimeX Link in esecuzione",
   "link.onDescription": "Si avvia all'accesso e mantiene raggiungibile questo computer, anche quando RealTimeX è chiuso.",
+  "link.onDescriptionNoLogin": "Mantiene raggiungibile questo computer. Lo avvia RealTimeX e non si avvia all'accesso.",
   "link.offDescription": "Artefatti pubblicati, webhook, app mobile e controllo remoto non possono raggiungere questo computer. RealTimeX Link non si avvierà all'accesso.",
+  "link.offDescriptionNoLogin": "Artefatti pubblicati, webhook, app mobile e controllo remoto non possono raggiungere questo computer.",
   "link.turnedOn": "RealTimeX Link è attivo. Si avvia all'accesso.",
+  "link.turnedOnNoLogin": "RealTimeX Link è attivo.",
   "link.turnedOff": "RealTimeX Link è disattivato.",
   "confirm.turnOffLink.title": "Disattivare RealTimeX Link?",
   "confirm.turnOffLink.message": "Gli artefatti pubblicati vanno offline, i webhook non vengono ricevuti, l'app mobile e gli altri desktop non possono raggiungere questo computer e nessuno può connettersi per il controllo remoto. Non si avvierà all'accesso finché non lo riattivi.",
+  "confirm.turnOffLink.messageNoLogin": "Gli artefatti pubblicati vanno offline, i webhook non vengono ricevuti, l'app mobile e gli altri desktop non possono raggiungere questo computer e nessuno può connettersi per il controllo remoto.",
   "confirm.turnOffLink.action": "Disattiva",
   "moved.title": "Questo computer ora ha un solo App ID",
   "moved.message": "RealTimeX Link ora condivide tutto ciò che proviene da questo computer con l'App ID di RealTimeX, {appId}. I link pubblicati e gli URL dei webhook non cambiano. I computer che usavano {old} passano al nuovo da soli.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "{count} consegna conservata per RealTimeX",
   "shared.deliveriesKept.other": "{count} consegne conservate per RealTimeX",
   "shared.waiting.one": "{count} in attesa",
-  "shared.waiting.other": "{count} in attesa"
+  "shared.waiting.other": "{count} in attesa",
+  "instance.unnamed": "senza nome"
 }

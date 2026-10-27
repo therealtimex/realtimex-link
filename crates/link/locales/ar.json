@@ -157,6 +157,8 @@
   "tray.checkUpdates": "التحقق من وجود تحديثات",
   "tray.updateTo": "التحديث إلى RealTimeX Link {version}…",
   "tray.quit": "إنهاء حتى تسجيل الدخول التالي",
+  "tray.quitPlain": "إنهاء",
+  "tray.quitRestartNote": "سيشغّل RealTimeX تطبيق Link مرة أخرى",
   "tray.starting": "جارٍ بدء RealTimeX Link…",
   "tray.off": "التحكم عن بُعد متوقف",
   "tray.on": "التحكم عن بُعد يعمل",
@@ -179,11 +181,15 @@
   "link.off": "متوقف",
   "link.keepRunning": "إبقاء RealTimeX Link قيد التشغيل",
   "link.onDescription": "يبدأ عند تسجيل الدخول ويُبقي هذا الحاسوب قابلًا للوصول، حتى عندما يكون RealTimeX مغلقًا.",
+  "link.onDescriptionNoLogin": "يُبقي هذا الحاسوب قابلًا للوصول. يشغّله RealTimeX، ولا يبدأ عند تسجيل الدخول.",
   "link.offDescription": "لا يمكن للمخرجات المنشورة وخطافات الويب وتطبيق الجوال والتحكم عن بُعد الوصول إلى هذا الحاسوب. لن يبدأ RealTimeX Link عند تسجيل الدخول.",
+  "link.offDescriptionNoLogin": "لا يمكن للمخرجات المنشورة وخطافات الويب وتطبيق الجوال والتحكم عن بُعد الوصول إلى هذا الحاسوب.",
   "link.turnedOn": "RealTimeX Link يعمل. يبدأ عند تسجيل الدخول.",
+  "link.turnedOnNoLogin": "RealTimeX Link يعمل.",
   "link.turnedOff": "RealTimeX Link متوقف.",
   "confirm.turnOffLink.title": "إيقاف RealTimeX Link؟",
   "confirm.turnOffLink.message": "تصبح المخرجات المنشورة غير متصلة، ولا تُستقبل خطافات الويب، ولا يمكن لتطبيق الجوال وأجهزة سطح المكتب الأخرى الوصول إلى هذا الحاسوب، ولا يمكن لأحد الاتصال للتحكم عن بُعد. لن يبدأ عند تسجيل الدخول حتى تشغّله مرة أخرى.",
+  "confirm.turnOffLink.messageNoLogin": "تصبح المخرجات المنشورة غير متصلة، ولا تُستقبل خطافات الويب، ولا يمكن لتطبيق الجوال وأجهزة سطح المكتب الأخرى الوصول إلى هذا الحاسوب، ولا يمكن لأحد الاتصال للتحكم عن بُعد.",
   "confirm.turnOffLink.action": "إيقاف",
   "moved.title": "أصبح لهذا الحاسوب الآن معرّف تطبيق واحد",
   "moved.message": "يشارك RealTimeX Link الآن كل شيء من هذا الحاسوب تحت معرّف تطبيق RealTimeX، {appId}. لا تتغير الروابط المنشورة وعناوين URL لخطافات الويب. تنتقل الحواسيب التي استخدمت {old} تلقائيًا.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "عمليات التسليم المحفوظة لـ RealTimeX: {count}",
   "shared.deliveriesKept.other": "عمليات التسليم المحفوظة لـ RealTimeX: {count}",
   "shared.waiting.one": "قيد الانتظار: {count}",
-  "shared.waiting.other": "قيد الانتظار: {count}"
+  "shared.waiting.other": "قيد الانتظار: {count}",
+  "instance.unnamed": "بلا اسم"
 }

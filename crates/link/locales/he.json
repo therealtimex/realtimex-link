@@ -157,6 +157,8 @@
   "tray.checkUpdates": "בדוק אם יש עדכונים",
   "tray.updateTo": "עדכן ל-RealTimeX Link {version}…",
   "tray.quit": "צא עד הכניסה הבאה",
+  "tray.quitPlain": "יציאה",
+  "tray.quitRestartNote": "RealTimeX יפעיל את Link שוב",
   "tray.starting": "RealTimeX Link מופעל…",
   "tray.off": "השליטה מרחוק כבויה",
   "tray.on": "השליטה מרחוק פועלת",
@@ -179,11 +181,15 @@
   "link.off": "כבוי",
   "link.keepRunning": "השאר את RealTimeX Link פועל",
   "link.onDescription": "מופעל בכניסה למערכת ושומר על המחשב הזה נגיש, גם כש-RealTimeX סגור.",
+  "link.onDescriptionNoLogin": "שומר על המחשב הזה נגיש. RealTimeX מפעיל אותו, והוא לא מופעל בכניסה למערכת.",
   "link.offDescription": "ארטיפקטים שפורסמו, Webhooks, אפליקציית הנייד והשליטה מרחוק לא יכולים להגיע למחשב הזה. RealTimeX Link לא יופעל בכניסה למערכת.",
+  "link.offDescriptionNoLogin": "ארטיפקטים שפורסמו, Webhooks, אפליקציית הנייד והשליטה מרחוק לא יכולים להגיע למחשב הזה.",
   "link.turnedOn": "RealTimeX Link פועל. הוא מופעל בכניסה למערכת.",
+  "link.turnedOnNoLogin": "RealTimeX Link פועל.",
   "link.turnedOff": "RealTimeX Link כבוי.",
   "confirm.turnOffLink.title": "לכבות את RealTimeX Link?",
   "confirm.turnOffLink.message": "ארטיפקטים שפורסמו עוברים למצב לא מקוון, Webhooks לא מתקבלים, אפליקציית הנייד ומחשבים שולחניים אחרים לא יכולים להגיע למחשב הזה, ואף אחד לא יכול להתחבר לשליטה מרחוק. הוא לא יופעל בכניסה למערכת עד שתפעיל אותו שוב.",
+  "confirm.turnOffLink.messageNoLogin": "ארטיפקטים שפורסמו עוברים למצב לא מקוון, Webhooks לא מתקבלים, אפליקציית הנייד ומחשבים שולחניים אחרים לא יכולים להגיע למחשב הזה, ואף אחד לא יכול להתחבר לשליטה מרחוק.",
   "confirm.turnOffLink.action": "כבה",
   "moved.title": "למחשב הזה יש עכשיו App ID אחד",
   "moved.message": "RealTimeX Link משתף עכשיו את כל מה שבמחשב הזה תחת ה-App ID של RealTimeX, {appId}. קישורים שפורסמו וכתובות URL של Webhooks לא משתנים. מחשבים שהשתמשו ב-{old} עוברים מעצמם.",
@@ -231,5 +237,6 @@
   "shared.deliveriesKept.one": "משלוח {count} נשמר עבור RealTimeX",
   "shared.deliveriesKept.other": "{count} משלוחים נשמרו עבור RealTimeX",
   "shared.waiting.one": "{count} ממתין",
-  "shared.waiting.other": "{count} ממתינים"
+  "shared.waiting.other": "{count} ממתינים",
+  "instance.unnamed": "ללא שם"
 }
