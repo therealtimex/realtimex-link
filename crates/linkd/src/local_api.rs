@@ -299,10 +299,11 @@ fn end_process(pid: u32) {
 #[cfg(not(unix))]
 fn end_process(_pid: u32) {}
 
-/// RealTimeX Link's window and icon, one of each at a time: { pid, role } (role "window", the
-/// default, or "tray") makes this rtx-link the running one for its role, unless another is alive;
-/// then a window is asked to show itself (showWindow in /v1/status goes up) and this one is told
-/// to exit. { owner: true }: keep going. `tray`: whether an icon runs.
+/// RealTimeX Link's window and icon, one of each at a time: { pid, role, background } (role
+/// "window", the default, or "tray") makes this rtx-link the running one for its role, unless
+/// another is alive; then a window is asked to show itself (showWindow in /v1/status goes up),
+/// unless this one started in the background (at login, by RealTimeX), and this one is told to
+/// exit. { owner: true }: keep going. `tray`: whether an icon runs.
 async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let pid = body
         .get("pid")
@@ -314,27 +315,33 @@ async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answe
         Some("tray") => "tray",
         Some(_) => return Err(ApiError::bad_request("role is window or tray")),
     };
+    let background = body.get("background").and_then(Value::as_bool) == Some(true);
     let mut roles = state.window.lock().unwrap_or_else(|p| p.into_inner());
-    let running = |roles: &std::collections::HashMap<String, u32>, role: &str| {
-        roles
-            .get(role)
-            .copied()
-            .filter(|pid| crate::lock::alive(*pid))
-    };
-    let owner = match running(&roles, role) {
-        Some(other) if other != pid => {
-            if role == "window" {
-                state.show_window.fetch_add(1, Ordering::Relaxed);
-            }
-            false
-        }
+    let (owner, show) = claim(&mut roles, role, pid, background, crate::lock::alive);
+    if show {
+        state.show_window.fetch_add(1, Ordering::Relaxed);
+    }
+    let tray = roles.get("tray").copied().is_some_and(crate::lock::alive);
+    Ok(Json(json!({ "owner": owner, "tray": tray })))
+}
+
+/// open_window's choice: whether `pid` is now the running one for `role` (none alive, or itself),
+/// and whether the running window is asked to show itself (a window opened while another runs,
+/// not one started in the background).
+fn claim(
+    roles: &mut std::collections::HashMap<String, u32>,
+    role: &str,
+    pid: u32,
+    background: bool,
+    alive: impl Fn(u32) -> bool,
+) -> (bool, bool) {
+    match roles.get(role).copied().filter(|other| alive(*other)) {
+        Some(other) if other != pid => (false, role == "window" && !background),
         _ => {
             roles.insert(role.to_string(), pid);
-            true
+            (true, false)
         }
-    };
-    let tray = running(&roles, "tray").is_some();
-    Ok(Json(json!({ "owner": owner, "tray": tray })))
+    }
 }
 
 /// "Keep RealTimeX Link running": { on }.
@@ -876,6 +883,26 @@ mod tests {
         let bogus = moves_to_instance(&json!({ "movesTo": "bogus" })).unwrap_err();
         assert_eq!(bogus.status, 400);
         assert!(moves_to_instance(&json!({ "movesTo": true })).is_err());
+    }
+
+    #[test]
+    fn a_background_start_never_shows_the_running_window() {
+        let mut roles = std::collections::HashMap::new();
+        let alive = |pid: u32| pid != 9;
+        // The first window runs; it again (a restarted daemon) stays the one.
+        assert_eq!(claim(&mut roles, "window", 1, true, alive), (true, false));
+        assert_eq!(claim(&mut roles, "window", 1, false, alive), (true, false));
+        // Another one opened shows the running window and exits; one started in the background
+        // (the login item, RealTimeX) only exits.
+        assert_eq!(claim(&mut roles, "window", 2, false, alive), (false, true));
+        assert_eq!(claim(&mut roles, "window", 3, true, alive), (false, false));
+        // Linux's icon: another one only exits.
+        assert_eq!(claim(&mut roles, "tray", 4, true, alive), (true, false));
+        assert_eq!(claim(&mut roles, "tray", 5, false, alive), (false, false));
+        // A running one that is gone is replaced.
+        roles.insert("window".into(), 9);
+        assert_eq!(claim(&mut roles, "window", 6, true, alive), (true, false));
+        assert_eq!(roles["window"], 6);
     }
 
     #[test]

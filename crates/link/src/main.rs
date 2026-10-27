@@ -40,7 +40,9 @@ fn main() -> eframe::Result {
         }
         let answer = api.post(
             "/v1/window/open",
-            serde_json::json!({ "pid": std::process::id(), "role": "window" }),
+            // In the background (login, RealTimeX) it only exits when Link already runs: the
+            // running window stays as it is.
+            serde_json::json!({ "pid": std::process::id(), "role": "window", "background": background }),
         );
         if answer.as_ref().is_ok_and(|answer| answer["owner"] == false) {
             return Ok(());
@@ -76,10 +78,23 @@ fn main() -> eframe::Result {
         .with_fullsize_content_view(true)
         .with_titlebar_shown(false)
         .with_title_shown(false);
-    let options = eframe::NativeOptions {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
+    // macOS: winit activates the app at launch, in front of the app in use (its default), and
+    // makes an unbundled one a Dock app. In the background (login, RealTimeX) Link stays a menu
+    // bar app in the back: the app in use keeps the keyboard (realtimex-ai-app#2836 QA).
+    #[cfg(target_os = "macos")]
+    if background {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        options.event_loop_builder = Some(Box::new(|builder| {
+            builder
+                .with_activation_policy(ActivationPolicy::Accessory)
+                .with_activate_ignoring_other_apps(false);
+        }));
+    }
     eframe::run_native(
         "RealTimeX Link",
         options,

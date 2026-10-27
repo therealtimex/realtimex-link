@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-control"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3832,14 +3832,14 @@ dependencies = [
 
 [[package]]
 name = "rtx-glibc-compat"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "rtx-link"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3849,6 +3849,7 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "raw-window-handle",
  "ring",
  "rtx-glibc-compat",
  "serde",
@@ -3856,13 +3857,14 @@ dependencies = [
  "skrifa",
  "tray-icon",
  "ureq",
+ "windows-sys 0.61.2",
  "winit",
  "winresource",
 ]
 
 [[package]]
 name = "rtx-linkd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3899,7 +3901,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-screens"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "block2 0.6.2",

@@ -35,13 +35,19 @@ tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] 
 # font reader (same version), mapped from disk rather than copied.
 skrifa = "0.44.0"
 memmap2 = "0.9.12"
+# The window's native handle, to keep a --background start's window off the screen (dock.rs, veil).
+raw-window-handle = "0.6.2"
 
 # macOS: in the Dock only while the window is open (dock.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "objc2-core-foundation"] }
 # The process name, which winit's app menu uses (dock.rs).
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+
+# Windows: a --background start's window cloaked until it is opened (dock.rs, veil).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
 
 # The .exe's icon, version information and manifest (build.rs, crates/windows_resources.rs).
 [target.'cfg(windows)'.build-dependencies]

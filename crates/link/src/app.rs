@@ -158,12 +158,13 @@ pub fn save_setting(
 /// the icon on its own (icon.rs).
 pub static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
-/// Register with the daemon as ROLE; false when another process already holds that role.
+/// Register with the daemon as ROLE again (it restarted); false when another process already
+/// holds that role. That one is not asked to show its window ("background").
 pub fn register(api: &Api) -> bool {
     let role = ROLE.get().copied().unwrap_or("window");
     let answer = api.post(
         "/v1/window/open",
-        json!({ "pid": std::process::id(), "role": role }),
+        json!({ "pid": std::process::id(), "role": role, "background": true }),
     );
     !answer.is_ok_and(|answer| answer["owner"] == false)
 }
@@ -411,6 +412,7 @@ impl LinkApp {
             .ok()
         };
         theme::apply(&cc.egui_ctx);
+        crate::dock::veil(cc);
         Self {
             icon: header_icon(&cc.egui_ctx),
             tray,
@@ -686,7 +688,7 @@ impl eframe::App for LinkApp {
             }
             std::process::exit(0);
         }
-        crate::dock::apply();
+        crate::dock::apply(ctx);
         let focused = ctx.input(|i| i.viewport().focused) == Some(true);
         if focused && !std::mem::replace(&mut self.focused, focused) {
             lock(&self.shared).check_presence = true;
@@ -1248,40 +1250,32 @@ impl LinkApp {
             _ => ("ready", Tone::Success, "tailscale"),
         };
         card(ui, |ui| {
-            // The switch and its label sit beside the title, or on a line of their own when the
-            // window is too narrow for both (the minimum width, longer languages).
+            // One row: the title, its badge, and the switch on the right, whose label ("Allow
+            // remote control") is its tooltip and screen-reader name (the title already says it).
+            // When the badge doesn't fit beside them (a long state in a longer language), it goes
+            // whole to a line of its own under them (realtimex-link 0.2.2 UX contract, item 5).
             let allow_label = t("host.allowRemoteControl");
+            let badge_text = t(&format!("host.state.{label}"));
             let mut changed = false;
-            let mut switch = |ui: &mut egui::Ui, allow: &mut bool| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    changed |= toggle(ui, allow, &allow_label).changed();
-                    ui.label(allow_label.as_str());
-                });
-            };
             let mut beside = true;
             ui.horizontal(|ui| {
                 ui.label(semibold(t("host.title")).size(15.0));
-                badge(ui, &t(&format!("host.state.{label}")), tone);
-                let needed = egui::WidgetText::from(allow_label.as_str())
-                    .into_galley(
-                        ui,
-                        Some(egui::TextWrapMode::Extend),
-                        f32::INFINITY,
-                        egui::TextStyle::Body,
-                    )
-                    .size()
-                    .x
-                    + 2.2 * ui.spacing().interact_size.y
-                    // Between the label and the switch: the cursor already stands past the
-                    // spacing after the badge.
-                    + ui.spacing().item_spacing.x;
+                let spacing = ui.spacing().item_spacing.x;
+                let needed =
+                    badge_width(ui, &badge_text) + spacing + 2.2 * ui.spacing().interact_size.y;
+                // The cursor already stands past the spacing after the title.
                 beside = ui.available_width() >= needed;
                 if beside {
-                    switch(ui, &mut allow);
+                    badge(ui, &badge_text, tone);
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    changed |= toggle(ui, &mut allow, &allow_label)
+                        .on_hover_text(allow_label.as_str())
+                        .changed();
+                });
             });
             if !beside {
-                ui.horizontal(|ui| switch(ui, &mut allow));
+                badge(ui, &badge_text, tone);
             }
             if changed {
                 if allow {
