@@ -349,8 +349,10 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// A path as compared: Windows' and macOS' usual volumes ignore case, and on Windows a handle's
-/// path is verbatim (`\\?\C:\…`) where RealTimeX sends `C:\…`.
+/// A path as compared with a restricted folder: Windows' and macOS' usual volumes ignore case, and
+/// on Windows a handle's path is verbatim (`\\?\C:\…`) where RealTimeX sends `C:\…`. Only ever
+/// to deny: on a case-sensitive volume it can take two folders for one, which is safe for a
+/// denial and never for an allowance (`open` decides containment on exact handle paths).
 fn comparable(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if cfg!(windows) {
@@ -367,12 +369,13 @@ fn comparable(path: &Path) -> PathBuf {
     }
 }
 
-fn inside(path: &Path, root: &Path) -> bool {
+/// Whether `path` may be inside `root`, case aside (see `comparable`).
+fn maybe_inside(path: &Path, root: &Path) -> bool {
     comparable(path).starts_with(comparable(root))
 }
 
 fn overlap(a: &Path, b: &Path) -> bool {
-    inside(a, b) || inside(b, a)
+    maybe_inside(a, b) || maybe_inside(b, a)
 }
 
 /// Every form a path has now: as given, canonical, and its handle's own path. One that no longer
@@ -487,7 +490,9 @@ fn open(root: &Path, segments: &[String], restricted: &[PathBuf]) -> Option<(Fil
         return None;
     }
     let opened = opened_path(&file)?;
-    (inside(&opened, &real_root) && !restricted.iter().any(|r| inside(&opened, r)))
+    // Inside: both paths come from the system's handles in the same form, so they compare
+    // exactly, the way the volume tells its folders apart.
+    (opened.starts_with(&real_root) && !restricted.iter().any(|r| maybe_inside(&opened, r)))
         .then_some((file, opened))
 }
 
@@ -1105,6 +1110,27 @@ mod tests {
                 "{path}"
             );
         }
+        assert_eq!(get(&store, &format!("/ar/{SITE}"), &[]).status, 200);
+    }
+
+    /// A sibling folder that differs only in case (a case-sensitive volume: Linux, or a
+    /// case-sensitive APFS one) is outside the root, even with nothing restricted.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_a_folder_that_differs_only_in_case_is_not_found() {
+        let root = site();
+        let other = root.path().join("Site");
+        if std::fs::create_dir(&other).is_err() {
+            // A case-insensitive volume: "Site" is "site", there is no second folder.
+            return;
+        }
+        std::fs::write(other.join("private.txt"), "private").unwrap();
+        std::os::unix::fs::symlink("../Site/private.txt", root.path().join("site/leak.txt"))
+            .unwrap();
+        let (_data, store) = store_with(root.path(), one_site("site"));
+        let answer = get(&store, &format!("/ar/{SITE}/leak.txt"), &[]);
+        assert_eq!(answer.status, 404);
+        assert_eq!(answer.body, Body::Bytes(NOT_FOUND.as_bytes().to_vec()));
         assert_eq!(get(&store, &format!("/ar/{SITE}"), &[]).status, 200);
     }
 
