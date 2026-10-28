@@ -63,6 +63,9 @@ const VK_V: u16 = 0x56;
 /// wait for it (typing would take this long per batch): the control loop restores it when due
 /// (`restore_due`), and a paste before then moves it on.
 const RESTORE_CLIPBOARD_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
+/// Putting it back is tried this many times, RESTORE_CLIPBOARD_AFTER apart, while another app
+/// holds the clipboard open.
+const RESTORE_CLIPBOARD_TRIES: u8 = 5;
 
 /// Nothing to grant on Windows.
 pub fn control_permissions() -> (Option<bool>, Option<bool>) {
@@ -88,8 +91,8 @@ pub struct Input {
     /// The clipboard sequence number right after this helper's own last write (a paste, or
     /// putting back what was there): not a copy to send to the viewer (#2682).
     own_seq: Option<u32>,
-    /// The last paste's text to put back, and when.
-    restore: Option<(clipboard::Saved, std::time::Instant)>,
+    /// The last paste's text to put back, when, and how many tries are left.
+    restore: Option<(clipboard::Saved, std::time::Instant, u8)>,
 }
 
 impl Input {
@@ -223,28 +226,42 @@ impl Input {
     /// Windows Terminal and most others accept). The previous text comes back later
     /// (`restore_clipboard`).
     pub fn paste_text(&mut self, text: &str, terminal: bool) -> Result<()> {
-        let pending = self.restore.take().map(|(saved, _)| saved);
+        let pending = self.restore.take().map(|(saved, _, _)| saved);
         let saved = clipboard::put_text(&mut self.clipboard, text, pending)?;
         self.note_own_write();
         let sent = press_paste(terminal);
         if saved.previous.is_some() {
-            self.restore = Some((saved, std::time::Instant::now() + RESTORE_CLIPBOARD_AFTER));
+            self.restore = Some((
+                saved,
+                std::time::Instant::now() + RESTORE_CLIPBOARD_AFTER,
+                RESTORE_CLIPBOARD_TRIES,
+            ));
         }
         sent
     }
 
     /// When the last paste's previous text is due back.
     pub fn restore_due(&self) -> Option<std::time::Instant> {
-        self.restore.as_ref().map(|(_, due)| *due)
+        self.restore.as_ref().map(|(_, due, _)| *due)
     }
 
     /// Put the last paste's previous text back now. Kept as it is when newer content arrived
-    /// meanwhile.
+    /// meanwhile; tried again a little later when the clipboard can't be opened.
     pub fn restore_clipboard(&mut self) {
-        if let Some((saved, _)) = self.restore.take() {
-            if clipboard::restore(&mut self.clipboard, &saved).unwrap_or(false) {
-                self.note_own_write();
+        let Some((saved, _, tries)) = self.restore.take() else {
+            return;
+        };
+        match clipboard::restore(&mut self.clipboard, &saved) {
+            Ok(true) => self.note_own_write(),
+            Ok(false) => {}
+            Err(_) if tries > 1 => {
+                self.restore = Some((
+                    saved,
+                    std::time::Instant::now() + RESTORE_CLIPBOARD_AFTER,
+                    tries - 1,
+                ));
             }
+            Err(_) => {}
         }
     }
 
@@ -298,7 +315,7 @@ impl Drop for Input {
     /// The session ends: the last paste's previous text still comes back, once the app had its
     /// time to read the paste.
     fn drop(&mut self) {
-        if let Some(due) = self.restore_due() {
+        while let Some(due) = self.restore_due() {
             std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
             self.restore_clipboard();
         }
@@ -511,10 +528,6 @@ impl Clipboard for WinClipboard {
             }
         }
         Ok(())
-    }
-
-    fn sequence(&mut self) -> u32 {
-        unsafe { GetClipboardSequenceNumber() }
     }
 
     fn owned(&mut self) -> bool {
