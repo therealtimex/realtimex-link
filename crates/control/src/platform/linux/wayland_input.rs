@@ -482,6 +482,14 @@ impl WaylandInput {
         Ok(())
     }
 
+    /// A physical key by its evdev code (Mutter's NotifyKeyboardKeycode): the session's keymap
+    /// and input method decide what it types.
+    pub fn key(&mut self, evdev: u16, pressed: bool) -> Result<()> {
+        self.session
+            .call::<_, _, ()>("NotifyKeyboardKeycode", &(u32::from(evdev), pressed))?;
+        Ok(())
+    }
+
     pub fn keysym(&mut self, keysym: u32, pressed: bool) -> Result<()> {
         self.session
             .call::<_, _, ()>("NotifyKeyboardKeysym", &(keysym, pressed))?;

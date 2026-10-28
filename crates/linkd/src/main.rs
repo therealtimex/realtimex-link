@@ -12,6 +12,10 @@ mod autostart;
 mod backend;
 mod clients;
 mod clipboard_share;
+// rtx-control's physical key table (data only), to check a batch's codes before it runs.
+#[path = "../../control/src/codes.rs"]
+#[allow(dead_code)]
+mod codes;
 mod daemon;
 mod dib;
 mod error;

@@ -6,13 +6,16 @@
 //! between. Pastes in a row (typing) bring it back once, after the last one: each one passes the
 //! text the first one took off to the next.
 //!
-//! How "unchanged" is decided: Windows' clipboard sequence number changes with every new
-//! content. The paste reads it while it still holds the clipboard lock, right after its own
-//! write, so the saved number can only be its own. Windows may count that write once more when
-//! the clipboard closes, so `restore` (again under the lock) accepts exactly the saved number,
-//! or the saved number + 1 while the paste's window still owns the clipboard. Any other writer
-//! empties the clipboard first, which makes it the owner; so a newer content always fails both
-//! checks and is kept.
+//! How "unchanged" is decided, under the clipboard lock: the sequence number is still the one read
+//! right after the paste closed the clipboard, the paste's own window still owns it, and it still
+//! holds the pasted text. One write moves the number by several (emptying, the text, and the
+//! formats Windows synthesizes from it when the clipboard closes: 806 → 811 on Windows 11 in
+//! Link 0.2.4 QA, where 0.2.3 saved the number before closing and accepted only one more, so
+//! the old text never came back). Reading it after the close counts all of those as the
+//! paste's own. Any later write moves it again, including one that keeps the owner and the
+//! text (another app may SetClipboardData without EmptyClipboard, review of !6), so newer
+//! content is kept. Owner and text also cover a write in the moment between closing and
+//! reading the number, unless it keeps both.
 
 use anyhow::Result;
 
@@ -25,17 +28,20 @@ pub trait Clipboard {
     fn text(&mut self) -> Option<String>;
     /// Empty it (taking ownership) and put this text on it.
     fn replace(&mut self, text: &str) -> Result<()>;
-    /// Windows' clipboard sequence number, which changes with every new content.
-    fn sequence(&mut self) -> u32;
     /// Whether the paste's own window owns the clipboard (the last one to empty it).
     fn owned(&mut self) -> bool;
+    /// Windows' clipboard sequence number, which changes with every write; it can be read
+    /// without opening the clipboard.
+    fn sequence(&mut self) -> u32;
 }
 
 /// What a paste took off the clipboard, to put back with [`restore`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct Saved {
     pub previous: Option<String>,
-    /// The sequence number of the paste's own write, read under the same lock.
+    /// The text the paste put on, to recognise it later.
+    pub pasted: String,
+    /// The sequence number right after the paste closed the clipboard.
     pub sequence: u32,
 }
 
@@ -60,10 +66,12 @@ pub fn put_text(
         clipboard.close();
         return Err(error);
     }
-    // Before closing: once the lock is gone another writer could get in first.
-    let sequence = clipboard.sequence();
     clipboard.close();
-    Ok(Saved { previous, sequence })
+    Ok(Saved {
+        previous,
+        pasted: text.to_string(),
+        sequence: clipboard.sequence(),
+    })
 }
 
 /// Put the previous text back if the clipboard still holds the paste's text (see the module
@@ -87,8 +95,9 @@ pub fn restore(clipboard: &mut impl Clipboard, saved: &Saved) -> Result<bool> {
 
 /// Whether the open clipboard still holds the paste's own write (see the module comment).
 fn unchanged(clipboard: &mut impl Clipboard, saved: &Saved) -> bool {
-    let current = clipboard.sequence();
-    current == saved.sequence || (current == saved.sequence.wrapping_add(1) && clipboard.owned())
+    clipboard.sequence() == saved.sequence
+        && clipboard.owned()
+        && clipboard.text().as_deref() == Some(saved.pasted.as_str())
 }
 
 #[cfg(test)]
@@ -106,12 +115,15 @@ mod tests {
         ours: bool,
         /// Content changed during this open, not counted yet (with `bump_on_close`).
         dirty: bool,
-        /// Count a write when the clipboard closes instead of when it is written.
-        bump_on_close: bool,
+        /// Count a write when the clipboard closes instead of when it is written, this many
+        /// times (Windows adds formats synthesized from the text then).
+        bump_on_close: u32,
         /// Writing this text fails after emptying, as Windows can.
         fail_writes_of: Option<String>,
         /// Another app writes this as soon as the clipboard is first closed.
         written_after_first_close: Option<String>,
+        /// Opening fails this many times (another app holds the clipboard).
+        busy_opens: u32,
         log: Vec<String>,
     }
 
@@ -130,11 +142,22 @@ mod tests {
             self.sequence += 1;
             self.ours = false;
         }
+
+        /// Another app setting data without emptying first: the owner stays the same.
+        fn written_without_emptying(&mut self, text: &str) {
+            self.content = Some(text.into());
+            self.sequence += 1;
+        }
     }
 
     impl Clipboard for Fake {
         fn open(&mut self) -> Result<()> {
             assert!(!self.open, "opened twice");
+            if self.busy_opens > 0 {
+                self.busy_opens -= 1;
+                self.log.push("busy".into());
+                bail!("could not open the clipboard");
+            }
             self.open = true;
             self.log.push("open".into());
             Ok(())
@@ -144,7 +167,7 @@ mod tests {
             self.open = false;
             self.log.push("close".into());
             if std::mem::take(&mut self.dirty) {
-                self.sequence += 1;
+                self.sequence += self.bump_on_close;
             }
             if let Some(newer) = self.written_after_first_close.take() {
                 self.written_by_someone_else(&newer);
@@ -165,22 +188,21 @@ mod tests {
                 bail!("SetClipboardData failed");
             }
             self.content = Some(text.into());
-            if self.bump_on_close {
+            if self.bump_on_close > 0 {
                 self.dirty = true;
             } else {
                 self.sequence += 1;
             }
             Ok(())
         }
-        fn sequence(&mut self) -> u32 {
-            assert!(self.open, "sequence read without the lock");
-            self.log.push("sequence".into());
-            self.sequence
-        }
         fn owned(&mut self) -> bool {
             assert!(self.open);
             self.log.push("owned".into());
             self.ours
+        }
+        fn sequence(&mut self) -> u32 {
+            self.log.push("sequence".into());
+            self.sequence
         }
     }
 
@@ -190,36 +212,92 @@ mod tests {
         let saved = put_text(&mut clipboard, "pasted", None).unwrap();
         assert_eq!(clipboard.content.as_deref(), Some("pasted"));
         assert_eq!(saved.previous.as_deref(), Some("before"));
-        // The number is read while the lock is still held.
+        // The number is read once the clipboard is closed, with every count of the write in.
         assert_eq!(
             clipboard.log,
-            ["open", "text", "replace pasted", "sequence", "close"]
+            ["open", "text", "replace pasted", "close", "sequence"]
         );
 
         clipboard.log.clear();
         assert!(restore(&mut clipboard, &saved).unwrap());
         assert_eq!(clipboard.content.as_deref(), Some("before"));
+        // Checked under the lock: the same number, still the owner, still the pasted text.
         assert_eq!(
             clipboard.log,
-            ["open", "sequence", "replace before", "close"]
+            [
+                "open",
+                "sequence",
+                "owned",
+                "text",
+                "replace before",
+                "close"
+            ]
         );
     }
 
+    /// Link 0.2.4 QA (Windows 11): the paste's own write moved the sequence number by 5, and
+    /// 0.2.3's check (the saved number or one more) left the pasted text on for good.
     #[test]
-    fn restores_when_windows_counts_the_write_at_close() {
-        let mut clipboard = Fake {
-            bump_on_close: true,
-            ..Fake::holding("before")
-        };
+    fn restores_however_much_windows_counts_the_write() {
+        for bump_on_close in [1, 2, 5] {
+            let mut clipboard = Fake {
+                bump_on_close,
+                ..Fake::holding("before")
+            };
+            let start = clipboard.sequence;
+            let saved = put_text(&mut clipboard, "pasted", None).unwrap();
+            assert_eq!(saved.sequence, start + 1 + bump_on_close);
+            assert!(restore(&mut clipboard, &saved).unwrap(), "{bump_on_close}");
+            assert_eq!(clipboard.content.as_deref(), Some("before"));
+        }
+    }
+
+    /// Another app copying the same text is a newer copy: it is kept.
+    #[test]
+    fn keeps_the_same_text_copied_by_another_app() {
+        let mut clipboard = Fake::holding("before");
         let saved = put_text(&mut clipboard, "pasted", None).unwrap();
-        assert_eq!(clipboard.sequence, saved.sequence + 1);
+        clipboard.written_by_someone_else("pasted");
+        assert!(!restore(&mut clipboard, &saved).unwrap());
+        assert_eq!(clipboard.content.as_deref(), Some("pasted"));
+    }
+
+    /// Review of !6: a write without EmptyClipboard keeps the paste's window the owner and may
+    /// keep its text; the sequence number still tells it apart, and it is kept.
+    #[test]
+    fn keeps_a_write_that_kept_the_owner_and_the_text() {
+        for bump_on_close in [0, 5] {
+            let mut clipboard = Fake {
+                bump_on_close,
+                ..Fake::holding("before")
+            };
+            let saved = put_text(&mut clipboard, "pasted", None).unwrap();
+            clipboard.written_without_emptying("pasted");
+            assert!(clipboard.ours);
+            assert!(!restore(&mut clipboard, &saved).unwrap());
+            assert_eq!(clipboard.content.as_deref(), Some("pasted"));
+            assert!(!clipboard.open);
+        }
+    }
+
+    /// Another app holding the clipboard: restoring fails without changing anything, and a
+    /// later try (the control loop's retry) puts the text back.
+    #[test]
+    fn a_busy_clipboard_is_restored_on_a_later_try() {
+        let mut clipboard = Fake::holding("before");
+        let saved = put_text(&mut clipboard, "pasted", None).unwrap();
+        clipboard.busy_opens = 2;
+        assert!(restore(&mut clipboard, &saved).is_err());
+        assert!(restore(&mut clipboard, &saved).is_err());
+        assert_eq!(clipboard.content.as_deref(), Some("pasted"));
+        assert!(!clipboard.open);
         assert!(restore(&mut clipboard, &saved).unwrap());
         assert_eq!(clipboard.content.as_deref(), Some("before"));
     }
 
     #[test]
     fn keeps_what_another_app_wrote_the_moment_the_paste_closed_the_clipboard() {
-        for bump_on_close in [false, true] {
+        for bump_on_close in [0, 5] {
             let mut clipboard = Fake {
                 bump_on_close,
                 written_after_first_close: Some("newer".into()),
@@ -258,7 +336,7 @@ mod tests {
 
     #[test]
     fn pastes_in_a_row_bring_back_what_was_there_before_the_first() {
-        for bump_on_close in [false, true] {
+        for bump_on_close in [0, 5] {
             let mut clipboard = Fake {
                 bump_on_close,
                 ..Fake::holding("before")

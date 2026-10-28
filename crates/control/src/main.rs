@@ -6,6 +6,9 @@
 // The glibc 2.34 floor on Linux (no code to call).
 use rtx_glibc_compat as _;
 
+// Each platform reads its own column of the key table.
+#[allow(dead_code)]
+mod codes;
 mod control;
 #[cfg(all(windows, target_env = "msvc"))]
 mod crt_shim;
@@ -18,8 +21,9 @@ mod platform;
 use clap::Parser;
 
 /// The JSON-lines protocol `control.rs` speaks. The host checks it before spawning, so an
-/// executable from another release says "incompatible" instead of misreading requests.
-const PROTOCOL: u32 = 1;
+/// executable from another release says "incompatible" instead of misreading requests. 2: the
+/// physical `key` op (realtimex-link#7).
+const PROTOCOL: u32 = 2;
 /// The exit code when screen capture stalled for good ([`control::CaptureStalled`]). rtx-linkd
 /// knows it (`CONTROL_EXIT_CAPTURE_STALLED` in its backend.rs) and starts a new rtx-control with
 /// the next request. 75 is EX_TEMPFAIL: try again later.

@@ -1,6 +1,7 @@
 //! Remote Control keys and pointer positions in Windows terms, without calling Windows: the
 //! virtual-key codes for [`Key`]s and SendInput's normalised absolute coordinates.
 
+use crate::codes::PhysicalKey;
 use crate::keys::Key;
 
 /// A virtual-key code, and whether it is an extended key (sent with KEYEVENTF_EXTENDEDKEY, so
@@ -74,6 +75,36 @@ pub fn unshifted_scan(scan: i16) -> Option<Vk> {
     })
 }
 
+/// How SendInput presses a physical key (#2909): by scancode, so the layout and input method
+/// decide what it types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Press {
+    Scancode {
+        scan: u16,
+        extended: bool,
+    },
+    /// Pause (E1 1D 45) has no scancode SendInput takes, and NumLock's 45 is Pause's tail:
+    /// both go by virtual key.
+    Vk(Vk),
+}
+
+pub fn physical_press(key: &PhysicalKey) -> Press {
+    match key.code {
+        "Pause" => Press::Vk(Vk {
+            code: 0x13,
+            extended: false,
+        }),
+        "NumLock" => Press::Vk(Vk {
+            code: 0x90,
+            extended: true,
+        }),
+        _ => Press::Scancode {
+            scan: key.windows & 0xff,
+            extended: key.windows >> 8 == 0xe0,
+        },
+    }
+}
+
 /// The virtual desktop (all monitors): origin and size in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Desktop {
@@ -123,6 +154,48 @@ mod tests {
         // '?' on US: VK_OEM_2 with Shift.
         assert_eq!(unshifted_scan(0x01bf), None);
         assert_eq!(unshifted_scan(-1), None);
+    }
+
+    #[test]
+    fn physical_keys_go_by_scancode_with_the_extended_flag() {
+        use crate::codes::{physical_key, KEYS};
+        let press = |code| physical_press(physical_key(code).unwrap());
+        assert_eq!(
+            press("KeyA"),
+            Press::Scancode {
+                scan: 0x1e,
+                extended: false
+            }
+        );
+        assert_eq!(
+            press("ArrowUp"),
+            Press::Scancode {
+                scan: 0x48,
+                extended: true
+            }
+        );
+        // Numpad 8 and ArrowUp share 0x48; only the flag tells them apart.
+        assert_eq!(
+            press("Numpad8"),
+            Press::Scancode {
+                scan: 0x48,
+                extended: false
+            }
+        );
+        assert_eq!(
+            press("MetaLeft"),
+            Press::Scancode {
+                scan: 0x5b,
+                extended: true
+            }
+        );
+        assert_eq!(press("Pause"), Press::Vk(vk(0x13).unwrap()));
+        assert_eq!(press("NumLock"), Press::Vk(extended(0x90).unwrap()));
+        for key in KEYS {
+            if let Press::Scancode { scan, .. } = physical_press(key) {
+                assert!(scan != 0, "{}", key.code);
+            }
+        }
     }
 
     #[test]

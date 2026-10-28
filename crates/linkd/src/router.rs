@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
@@ -23,10 +23,11 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::actions::run_actions;
+use crate::actions::{is_physical_key, run_actions};
 use crate::backend::Backend;
 use crate::clients::Authenticated;
 use crate::clipboard_share::{self, ClipboardShare, Pulled, POLL_MS};
+use crate::codes::physical_key;
 use crate::error::{ApiError, ApiResult};
 use crate::file_browse;
 use crate::host::Host;
@@ -69,7 +70,11 @@ const PEER_ACCESS_CHECK: Duration = Duration::from_secs(10);
 const MAX_PEER_MESSAGE_LENGTH: usize = 64 * 1024;
 const PEER_REQUESTS_PER_SECOND: usize = 20;
 /// Pointer moves of a person's Control (#2736): their own budget, so moving never delays a click.
+/// Batches of physical keys share it (#2909): fast typing sends about 20 small requests a second.
 const PEER_MOVES_PER_SECOND: usize = 60;
+/// A live view that holds a key and sends no action this long gets its keys released (#2909):
+/// longer than any real hold, it catches a viewer that hangs while its DataChannel stays up.
+const HELD_KEY_WATCHDOG: Duration = Duration::from_secs(30);
 const TRANSFER_ACCESS_CHECK_MS: i64 = 2000;
 /// An agent's transfers (POST /transfer) go after this long without a request.
 const HTTP_TRANSFER_IDLE_MS: i64 = 10 * 60 * 1000;
@@ -112,6 +117,11 @@ struct Peer {
     address: String,
     closed: AtomicBool,
     held: Mutex<HashSet<String>>,
+    /// Physical keys this view holds, in the order they went down (#2909).
+    held_keys: Mutex<Vec<String>>,
+    /// When its last batch of actions arrived, for the held-key watchdog.
+    last_action: Mutex<Instant>,
+    watchdog: AtomicBool,
     running: tokio::sync::RwLock<()>,
     requests: Mutex<Vec<i64>>,
     moves: Mutex<Vec<i64>>,
@@ -760,9 +770,11 @@ async fn perform_actions(
     client: &Authenticated,
     actions: Option<&Value>,
     quiet: bool,
+    live_view: bool,
 ) -> ApiResult<Value> {
-    let performed = run_actions(&shared.backend, actions).await?;
-    // A person's pointer moves are not news for the other live views, nor for the log.
+    let performed = run_actions(&shared.backend, actions, live_view).await?;
+    // A person's pointer moves and keystrokes are not news for the other live views, nor for
+    // the log.
     if quiet {
         return Ok(json!({ "performed": performed }));
     }
@@ -771,9 +783,10 @@ async fn perform_actions(
         .cloned()
         .unwrap_or_default();
     let shown = list.iter().rev().find(|a| {
-        a.get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|t| !t.is_empty() && t != "wait")
+        !is_physical_key(a)
+            && a.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.is_empty() && t != "wait")
     });
     if let Some(action) = shown {
         let size = lock(&shared.shot_sizes).get(client.id()).copied();
@@ -802,7 +815,7 @@ async fn actions(
     Body64(body): Body64,
 ) -> Response {
     let signed = signed_with!(shared, headers, peer, "control");
-    match perform_actions(&shared, &signed.client, body.get("actions"), false).await {
+    match perform_actions(&shared, &signed.client, body.get("actions"), false, false).await {
         Ok(result) => Json(result).into_response(),
         Err(error) => error.into_response(),
     }
@@ -1064,17 +1077,100 @@ fn close_peer(shared: &Arc<Shared>, session: u64) {
     let backend = shared.backend.clone();
     tokio::spawn(async move {
         let _all_done = peer.running.write().await;
+        release_keys(&backend, &peer).await;
         let held: Vec<String> = lock(&peer.held).drain().collect();
         if !held.is_empty() {
             let ups: Vec<Value> = held
                 .iter()
                 .map(|button| json!({ "type": "up", "button": button }))
                 .collect();
-            let _ = run_actions(&backend, Some(&Value::Array(ups))).await;
+            let _ = run_actions(&backend, Some(&Value::Array(ups)), false).await;
         }
         let _ = backend
             .call("peer_close", json!({ "session": session }))
             .await;
+    });
+}
+
+/// Let go of every physical key this view holds, the last pressed first (#2909). The caller makes
+/// sure none of its actions are still running.
+async fn release_keys(backend: &Arc<Backend>, peer: &Peer) {
+    let held: Vec<String> = std::mem::take(&mut *lock(&peer.held_keys));
+    for up in release_actions(&held) {
+        // One up each: an up that fails doesn't keep the others down (rtx-control keeps the
+        // failed one held and lets go of it when its session ends), and no batch limit applies.
+        let _ = run_actions(backend, Some(&Value::Array(vec![up])), true).await;
+    }
+}
+
+/// The ups for these held keys, the last pressed first.
+fn release_actions(held: &[String]) -> Vec<Value> {
+    held.iter()
+        .rev()
+        .map(|code| json!({ "type": "key", "code": code, "down": false }))
+        .collect()
+}
+
+/// The physical key actions Link presses: a code with a key here, and a boolean `down`.
+fn key_transitions(actions: &[Value]) -> impl Iterator<Item = (&str, bool)> {
+    actions
+        .iter()
+        .filter(|a| is_physical_key(a))
+        .filter_map(|action| {
+            let code = action.get("code").and_then(Value::as_str)?;
+            let down = action.get("down").and_then(Value::as_bool)?;
+            physical_key(code).map(|_| (code, down))
+        })
+}
+
+/// Before a batch runs: every key it may press is held, and none it lets go of is forgotten
+/// yet. If the batch fails or stops part way, its downs and the keys held before it are all
+/// released (review of !6).
+fn hold_downs(held: &mut Vec<String>, actions: &[Value]) {
+    for (code, down) in key_transitions(actions) {
+        if down && !held.iter().any(|held| held == code) {
+            held.push(code.to_string());
+        }
+    }
+}
+
+/// After the whole batch ran: the keys it let go of are no longer held.
+fn settle_held(held: &mut Vec<String>, actions: &[Value]) {
+    for (code, down) in key_transitions(actions) {
+        if !down {
+            held.retain(|held| held != code);
+        } else if !held.iter().any(|held| held == code) {
+            held.push(code.to_string());
+        }
+    }
+}
+
+/// While the view holds a key: release its keys once no action came for HELD_KEY_WATCHDOG.
+fn watch_held_keys(shared: &Arc<Shared>, peer: &Arc<Peer>) {
+    if lock(&peer.held_keys).is_empty() || peer.watchdog.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let backend = shared.backend.clone();
+    let peer = peer.clone();
+    tokio::spawn(async move {
+        while !peer.closed.load(Ordering::SeqCst) {
+            let due = *lock(&peer.last_action) + HELD_KEY_WATCHDOG;
+            tokio::time::sleep_until(due.into()).await;
+            if !lock(&peer.held_keys).is_empty()
+                && lock(&peer.last_action).elapsed() >= HELD_KEY_WATCHDOG
+            {
+                let _idle = peer.running.write().await;
+                release_keys(&backend, &peer).await;
+            }
+            if lock(&peer.held_keys).is_empty() {
+                peer.watchdog.store(false, Ordering::SeqCst);
+                // A key pressed just now found this watch still running: go on watching it.
+                if lock(&peer.held_keys).is_empty() || peer.watchdog.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+            }
+        }
+        peer.watchdog.store(false, Ordering::SeqCst);
     });
 }
 
@@ -1110,6 +1206,13 @@ pub async fn revalidate_peers(shared: &Arc<Shared>, matches: impl Fn(&str) -> bo
         match peer_client(shared, &peer, "view") {
             None => close_peer(shared, session),
             Some(current) if !current.may("control") => {
+                // Control taken back: its held keys go up once its running actions are done.
+                let backend = shared.backend.clone();
+                let held = peer.clone();
+                tokio::spawn(async move {
+                    let _idle = held.running.write().await;
+                    release_keys(&backend, &held).await;
+                });
                 let key = session.to_string();
                 shared.clipboard.close_session(&key);
                 shared.transfers.close_session(&key);
@@ -1199,7 +1302,7 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
             return;
         }
         reply(
-            json!({ "ok": true, "os": platform_name(), "features": ["transfers", "paste-files"] }),
+            json!({ "ok": true, "os": platform_name(), "features": ["transfers", "paste-files", "physical-keys"] }),
         );
         return;
     }
@@ -1209,13 +1312,15 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
     }
     let now = now_ms();
     let list = message.get("actions").and_then(Value::as_array);
-    let moves_only = list.is_some_and(|l| {
-        !l.is_empty()
-            && l.iter()
-                .all(|a| a.get("type").and_then(Value::as_str) == Some("move"))
-    });
+    fn is_move(action: &Value) -> bool {
+        action.get("type").and_then(Value::as_str) == Some("move")
+    }
+    let all = |test: fn(&Value) -> bool| list.is_some_and(|l| !l.is_empty() && l.iter().all(test));
+    let moves_only = all(is_move);
+    // Typing (#2909): physical keys and moves only, a person's own Control, not an agent's.
+    let light = all(|a| is_move(a) || is_physical_key(a));
     {
-        let (budget, limit) = if moves_only {
+        let (budget, limit) = if light {
             (&peer.moves, PEER_MOVES_PER_SECOND)
         } else {
             (&peer.requests, PEER_REQUESTS_PER_SECOND)
@@ -1244,7 +1349,11 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
         close_peer(&shared, session);
         return;
     };
+    *lock(&peer.last_action) = Instant::now();
     if !client.may("control") {
+        // A refused batch releases its keys (#2909): the viewer forgets its own without ups.
+        let _idle = peer.running.write().await;
+        release_keys(&shared.backend, &peer).await;
         reply(
             json!({ "ok": false, "status": 403, "code": "view-only", "error": "This client is not allowed to control" }),
         );
@@ -1268,8 +1377,24 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
             _ => {}
         }
     }
-    let _running = peer.running.read().await;
-    match perform_actions(&shared, &client, message.get("actions"), moves_only).await {
+    let running = peer.running.read().await;
+    // Closed while it waited: close_peer releases what the view held, and nothing more runs.
+    if peer.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    let actions = list.map_or(&[][..], Vec::as_slice);
+    hold_downs(&mut lock(&peer.held_keys), actions);
+    let performed = perform_actions(&shared, &client, message.get("actions"), light, true).await;
+    match &performed {
+        Ok(_) => settle_held(&mut lock(&peer.held_keys), actions),
+        // A failed batch (input-blocked, screen-locked, an error part way, a refused action)
+        // releases every key the view holds: it can't know which of its actions ran, so it
+        // forgets its own (#2909).
+        Err(_) => release_keys(&shared.backend, &peer).await,
+    }
+    drop(running);
+    watch_held_keys(&shared, &peer);
+    match performed {
         Ok(result) => reply(ok_with(result)),
         Err(error) => {
             let (problem, _) = screen_problem(&error.message);
@@ -1331,6 +1456,9 @@ async fn peer_offer(
         address: signed.address.clone(),
         closed: AtomicBool::new(false),
         held: Mutex::new(HashSet::new()),
+        held_keys: Mutex::new(Vec::new()),
+        last_action: Mutex::new(Instant::now()),
+        watchdog: AtomicBool::new(false),
         running: tokio::sync::RwLock::new(()),
         requests: Mutex::new(Vec::new()),
         moves: Mutex::new(Vec::new()),
@@ -1465,7 +1593,7 @@ async fn run_transfer(
                     click["width"] = point["width"].clone();
                     click["height"] = point.get("height").cloned().unwrap_or(Value::Null);
                 }
-                perform_actions(shared, client, Some(&json!([click])), false).await?;
+                perform_actions(shared, client, Some(&json!([click])), false, false).await?;
             }
             let paths: Vec<String> = group
                 .paths
@@ -1685,6 +1813,90 @@ async fn stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(code: &str, down: bool) -> Value {
+        json!({ "type": "key", "code": code, "down": down })
+    }
+
+    fn codes(held: &[String]) -> Vec<&str> {
+        held.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn held_keys_follow_a_batch_that_ran() {
+        let mut held = Vec::new();
+        let batch = [
+            key("ShiftLeft", true),
+            key("KeyA", true),
+            json!({ "type": "move", "x": 1, "y": 2 }),
+            // A repeat keeps its place; an up for a key not held changes nothing.
+            json!({ "type": "key", "code": "KeyA", "down": true, "repeat": true }),
+            key("KeyB", false),
+            json!({ "type": "key", "keys": "ctrl+l" }),
+            key("ControlLeft", true),
+            key("KeyA", false),
+        ];
+        hold_downs(&mut held, &batch);
+        assert_eq!(codes(&held), ["ShiftLeft", "KeyA", "ControlLeft"]);
+        settle_held(&mut held, &batch);
+        assert_eq!(codes(&held), ["ShiftLeft", "ControlLeft"]);
+        let up = [key("ShiftLeft", false)];
+        hold_downs(&mut held, &up);
+        settle_held(&mut held, &up);
+        assert_eq!(codes(&held), ["ControlLeft"]);
+    }
+
+    /// Review of !6: a down that ran before a later action failed is still released.
+    #[test]
+    fn a_batch_that_fails_part_way_releases_what_it_pressed() {
+        let mut held = Vec::new();
+        let batch = [
+            key("ShiftLeft", true),
+            json!({ "type": "move", "x": 1, "y": 2 }),
+            key("ShiftLeft", false),
+        ];
+        hold_downs(&mut held, &batch);
+        // The move failed: no settle_held. What release_keys sends:
+        assert_eq!(release_actions(&held), vec![key("ShiftLeft", false)]);
+    }
+
+    /// Review of !6: a refused batch's up for a held key doesn't forget it.
+    #[test]
+    fn a_refused_batch_keeps_the_keys_held_before_it() {
+        let mut held = vec!["ShiftLeft".to_string()];
+        let batch = [json!({ "type": "zap" }), key("ShiftLeft", false)];
+        assert!(crate::actions::plan_actions(Some(&Value::Array(batch.to_vec())), true).is_err());
+        hold_downs(&mut held, &batch);
+        assert_eq!(release_actions(&held), vec![key("ShiftLeft", false)]);
+    }
+
+    /// Review of !6: codes Link skips are not tracked, and more keys than a batch takes are all
+    /// released.
+    #[test]
+    fn only_keys_link_presses_are_held_and_all_of_them_are_released() {
+        let mut held = Vec::new();
+        let mut unknown: Vec<Value> = (0..50).map(|n| key(&format!("Lang{n}"), true)).collect();
+        unknown.push(key("ShiftLeft", true));
+        hold_downs(&mut held, &unknown);
+        settle_held(&mut held, &unknown);
+        assert_eq!(codes(&held), ["ShiftLeft"]);
+
+        let all: Vec<Value> = crate::codes::KEYS
+            .iter()
+            .map(|k| key(k.code, true))
+            .collect();
+        assert!(all.len() > crate::actions::MAX_ACTIONS);
+        let mut held = Vec::new();
+        hold_downs(&mut held, &all);
+        let ups = release_actions(&held);
+        assert_eq!(ups.len(), crate::codes::KEYS.len());
+        assert_eq!(ups[0], key("NumpadEqual", false));
+        // Each up goes alone, so every one is a valid batch.
+        for up in ups {
+            let one = crate::actions::plan_actions(Some(&json!([up])), true).unwrap();
+            assert_eq!(one[0].len(), 1);
+        }
+    }
 
     #[test]
     fn a_locked_screen_is_said_so() {

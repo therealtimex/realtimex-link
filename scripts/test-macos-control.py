@@ -92,7 +92,7 @@ def main():
     report = json.loads(check_run.stdout.splitlines()[0])
     check("--check reports rtx-control protocol 1 with input",
           check_run.returncode == 0 and report.get("tool") == "rtx-control"
-          and report.get("protocol") == 1 and report.get("input") is True, json.dumps(report))
+          and report.get("protocol") == 2 and report.get("input") is True, json.dumps(report))
 
     control = Control([binary])
     ready = control.wait(lambda v: v.get("ready") is True)

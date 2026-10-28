@@ -58,6 +58,11 @@ Run rustup target add $Target
 Run cargo build --release --locked --target $Target -p rtx-linkd
 Run cargo build --release --locked --target $Target -p rtx-link
 Run cargo build --release --locked --target $Target -p rtx-control
+# The Windows key mapping and clipboard unit tests (scancodes, #2909; paste restore), when CI
+# asks for them.
+if ($env:LINK_TEST_KEYS -eq '1') {
+  Run cargo test --release --locked --target $Target -p rtx-control '--' platform::windows::keymap platform::windows::clipboard codes::
+}
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 $built = Join-Path $targetDir "$Target\release"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

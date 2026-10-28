@@ -23,11 +23,11 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-    VIRTUAL_KEY,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, GetSystemMetrics, PostMessageW,
@@ -39,9 +39,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use rtx_screens::win as screens;
 
 use self::clipboard::Clipboard;
-use self::keymap::{named_vk, normalise, unshifted_scan, Desktop, Vk};
+use self::keymap::{named_vk, normalise, physical_press, unshifted_scan, Desktop, Press, Vk};
+use crate::codes::PhysicalKey;
 use crate::keys::{from_keysym, Key};
-use crate::platform::{Button, InputError, Shot};
+use crate::platform::{Button, InputError, PasteGap, Shot};
 
 mod clipboard;
 mod keymap;
@@ -62,6 +63,9 @@ const VK_V: u16 = 0x56;
 /// wait for it (typing would take this long per batch): the control loop restores it when due
 /// (`restore_due`), and a paste before then moves it on.
 const RESTORE_CLIPBOARD_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
+/// Putting it back is tried this many times, RESTORE_CLIPBOARD_AFTER apart, while another app
+/// holds the clipboard open.
+const RESTORE_CLIPBOARD_TRIES: u8 = 5;
 
 /// Nothing to grant on Windows.
 pub fn control_permissions() -> (Option<bool>, Option<bool>) {
@@ -87,8 +91,9 @@ pub struct Input {
     /// The clipboard sequence number right after this helper's own last write (a paste, or
     /// putting back what was there): not a copy to send to the viewer (#2682).
     own_seq: Option<u32>,
-    /// The last paste's text to put back, and when.
-    restore: Option<(clipboard::Saved, std::time::Instant)>,
+    /// The last paste's text to put back, when, and how many tries are left.
+    restore: Option<(clipboard::Saved, std::time::Instant, u8)>,
+    gap: PasteGap,
 }
 
 impl Input {
@@ -104,6 +109,7 @@ impl Input {
             clipboard: WinClipboard::new()?,
             own_seq: None,
             restore: None,
+            gap: PasteGap::default(),
         })
     }
 
@@ -172,6 +178,40 @@ impl Input {
         send(&events)
     }
 
+    /// A physical key (#2909), by scancode: this computer's layout and input method decide what
+    /// it types. Windows doesn't repeat injected keys, so a repeat is simply another down.
+    pub fn key(&mut self, key: &'static PhysicalKey, pressed: bool, _repeat: bool) -> Result<()> {
+        let up = if pressed {
+            KEYBD_EVENT_FLAGS(0)
+        } else {
+            KEYEVENTF_KEYUP
+        };
+        let event = match physical_press(key) {
+            Press::Scancode { scan, extended } => {
+                let flags = up | KEYEVENTF_SCANCODE;
+                keyboard(
+                    0,
+                    scan,
+                    if extended {
+                        flags | KEYEVENTF_EXTENDEDKEY
+                    } else {
+                        flags
+                    },
+                )
+            }
+            Press::Vk(vk) => keyboard(
+                vk.code,
+                0,
+                if vk.extended {
+                    up | KEYEVENTF_EXTENDEDKEY
+                } else {
+                    up
+                },
+            ),
+        };
+        send(&[event])
+    }
+
     /// Wheel steps; positive scrolls down/right (Windows' vertical wheel points the other way).
     pub fn scroll(&mut self, dx: i32, dy: i32) -> Result<()> {
         let mut events = Vec::new();
@@ -188,28 +228,44 @@ impl Input {
     /// Windows Terminal and most others accept). The previous text comes back later
     /// (`restore_clipboard`).
     pub fn paste_text(&mut self, text: &str, terminal: bool) -> Result<()> {
-        let pending = self.restore.take().map(|(saved, _)| saved);
+        self.gap.wait();
+        let pending = self.restore.take().map(|(saved, _, _)| saved);
         let saved = clipboard::put_text(&mut self.clipboard, text, pending)?;
         self.note_own_write();
         let sent = press_paste(terminal);
+        self.gap.pasted();
         if saved.previous.is_some() {
-            self.restore = Some((saved, std::time::Instant::now() + RESTORE_CLIPBOARD_AFTER));
+            self.restore = Some((
+                saved,
+                std::time::Instant::now() + RESTORE_CLIPBOARD_AFTER,
+                RESTORE_CLIPBOARD_TRIES,
+            ));
         }
         sent
     }
 
     /// When the last paste's previous text is due back.
     pub fn restore_due(&self) -> Option<std::time::Instant> {
-        self.restore.as_ref().map(|(_, due)| *due)
+        self.restore.as_ref().map(|(_, due, _)| *due)
     }
 
     /// Put the last paste's previous text back now. Kept as it is when newer content arrived
-    /// meanwhile.
+    /// meanwhile; tried again a little later when the clipboard can't be opened.
     pub fn restore_clipboard(&mut self) {
-        if let Some((saved, _)) = self.restore.take() {
-            if clipboard::restore(&mut self.clipboard, &saved).unwrap_or(false) {
-                self.note_own_write();
+        let Some((saved, _, tries)) = self.restore.take() else {
+            return;
+        };
+        match clipboard::restore(&mut self.clipboard, &saved) {
+            Ok(true) => self.note_own_write(),
+            Ok(false) => {}
+            Err(_) if tries > 1 => {
+                self.restore = Some((
+                    saved,
+                    std::time::Instant::now() + RESTORE_CLIPBOARD_AFTER,
+                    tries - 1,
+                ));
             }
+            Err(_) => {}
         }
     }
 
@@ -235,13 +291,16 @@ impl Input {
     /// Ctrl+V: a folder copies them in, an app such as RealTimeX attaches them.
     pub fn paste_files(&mut self, paths: &[String]) -> Result<()> {
         // They stay on the clipboard, as after a local paste.
+        self.gap.wait();
         self.restore = None;
         self.clipboard.open()?;
         let put = self.clipboard.replace_files(paths);
         self.clipboard.close();
         put?;
         self.note_own_write();
-        press_paste(false)
+        let sent = press_paste(false);
+        self.gap.pasted();
+        sent
     }
 
     /// Put a PNG on the clipboard (the registered "PNG" format) with the same picture as a
@@ -249,13 +308,16 @@ impl Input {
     /// image from CF_DIB; PNG alone pasted nothing in RealTimeX (#2747). It stays on the
     /// clipboard, as after a local paste.
     pub fn paste_image(&mut self, png: &[u8], dib: Option<&[u8]>) -> Result<()> {
+        self.gap.wait();
         self.restore = None;
         self.clipboard.open()?;
         let put = self.clipboard.replace_png(png, dib);
         self.clipboard.close();
         put?;
         self.note_own_write();
-        press_paste(false)
+        let sent = press_paste(false);
+        self.gap.pasted();
+        sent
     }
 }
 
@@ -263,7 +325,7 @@ impl Drop for Input {
     /// The session ends: the last paste's previous text still comes back, once the app had its
     /// time to read the paste.
     fn drop(&mut self) {
-        if let Some(due) = self.restore_due() {
+        while let Some(due) = self.restore_due() {
             std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
             self.restore_clipboard();
         }
@@ -478,12 +540,12 @@ impl Clipboard for WinClipboard {
         Ok(())
     }
 
-    fn sequence(&mut self) -> u32 {
-        unsafe { GetClipboardSequenceNumber() }
-    }
-
     fn owned(&mut self) -> bool {
         unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == self.owner)
+    }
+
+    fn sequence(&mut self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
     }
 }
 

@@ -40,6 +40,64 @@ pub enum ClipboardContent {
     Files(Vec<String>),
 }
 
+/// How long a paste's text stays on the clipboard before the next paste may replace it: the target
+/// app reads the clipboard only when it handles the paste key, after the keys were sent. Without
+/// it, several pastes in one batch all pasted the last text (Windows QA of Link 0.2.4: "one two
+/// three" came out "three three three"; a 30 ms gap was already enough). A single paste
+/// doesn't wait.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub const PASTE_GAP: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Keeps pastes in a row PASTE_GAP apart (macOS and Windows; X11 and Wayland wait themselves).
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[derive(Default)]
+pub struct PasteGap {
+    last: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+impl PasteGap {
+    /// Before writing the clipboard: wait until the last paste had its time.
+    pub fn wait(&mut self) {
+        let left = self.left(std::time::Instant::now());
+        if !left.is_zero() {
+            std::thread::sleep(left);
+        }
+    }
+
+    /// After pressing the paste keys.
+    pub fn pasted(&mut self) {
+        self.last = Some(std::time::Instant::now());
+    }
+
+    fn left(&self, now: std::time::Instant) -> std::time::Duration {
+        self.last.map_or(std::time::Duration::ZERO, |last| {
+            PASTE_GAP.saturating_sub(now.saturating_duration_since(last))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_a_paste_right_after_another_waits() {
+        let mut gap = PasteGap::default();
+        let start = Instant::now();
+        assert_eq!(gap.left(start), Duration::ZERO);
+        gap.last = Some(start);
+        assert_eq!(gap.left(start), PASTE_GAP);
+        assert_eq!(
+            gap.left(start + Duration::from_millis(100)),
+            Duration::from_millis(50)
+        );
+        assert_eq!(gap.left(start + PASTE_GAP), Duration::ZERO);
+        assert_eq!(gap.left(start + Duration::from_secs(5)), Duration::ZERO);
+    }
+}
+
 pub use rtx_screens::{capture_display, capture_display_frame, init_window_server, Frame, Shot};
 // Numbers live-view frames (#2683): the Wayland capture here, and peer.rs's tests.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]

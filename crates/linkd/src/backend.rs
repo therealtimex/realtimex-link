@@ -29,7 +29,7 @@ const IN_USE_WINDOW: Duration = Duration::from_secs(60);
 /// A live view's own bookkeeping; not use by itself.
 const BOOKKEEPING_OPS: [&str; 2] = ["peer_close", "peer_send"];
 /// The JSON-lines protocol this daemon speaks with rtx-control.
-pub const CONTROL_PROTOCOL: u64 = 1;
+pub const CONTROL_PROTOCOL: u64 = 2;
 /// rtx-control's exit code when a ScreenCaptureKit request it gave up on never answered, which
 /// leaves its screenshots and live view refused until it ends (crates/control/src/main.rs,
 /// EXIT_CAPTURE_STALLED). Nothing to do but start a new one, which the next request does.
