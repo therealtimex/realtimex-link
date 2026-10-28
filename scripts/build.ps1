@@ -60,7 +60,7 @@ Run cargo build --release --locked --target $Target -p rtx-link
 Run cargo build --release --locked --target $Target -p rtx-control
 # The Windows key mapping's unit tests (physical keys by scancode, #2909), when CI asks for them.
 if ($env:LINK_TEST_KEYS -eq '1') {
-  Run cargo test --release --locked --target $Target -p rtx-control -- platform::windows::keymap codes::
+  Run cargo test --release --locked --target $Target -p rtx-control '--' platform::windows::keymap codes::
 }
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 $built = Join-Path $targetDir "$Target\release"
