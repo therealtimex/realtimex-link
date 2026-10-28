@@ -533,6 +533,10 @@ impl Clipboard for WinClipboard {
     fn owned(&mut self) -> bool {
         unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == self.owner)
     }
+
+    fn sequence(&mut self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
 }
 
 impl WinClipboard {
