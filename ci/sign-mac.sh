@@ -8,7 +8,7 @@
 # script comes from there, not from this checkout, which is main's when signing again).
 # Environment (CI variables, the ones RealTimeX's electron-builder signs with): CSC_NAME (the
 # Developer ID Application identity in the runner's keychain), KEYCHAIN and KEYCHAIN_PASSWORD
-# (optional: unlocked when set, and locked again at the end; a failed unlock is only a warning),
+# (optional: unlocked when set and left unlocked; a failed unlock is only a warning),
 # APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID (every signature must carry this Team ID).
 set -euo pipefail
 VERSION="$1"
@@ -34,29 +34,27 @@ esac
 
 WORK="$(mktemp -d)"
 NOTARY_KEYCHAIN="$WORK/notary.keychain-db"
-UNLOCKED=""
-# Whatever happens: the release keychain locked again (if this unlocked it), the throwaway notary
-# keychain deleted, the work folder gone.
+# Whatever happens: the throwaway notary keychain deleted, the work folder gone. The release
+# keychain is never locked again: on the runners it is the login keychain of the signed-in session,
+# which the session's own apps and the next job's git checkout (osxkeychain) use, and a locked one
+# stops them at a password prompt nobody answers.
 cleanup() {
-  if [ -n "$UNLOCKED" ]; then security lock-keychain "$UNLOCKED" || true; fi
   if [ -f "$NOTARY_KEYCHAIN" ]; then security delete-keychain "$NOTARY_KEYCHAIN" || true; fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
+# Unlock first: show-keychain-info fails on a locked keychain ("User interaction is not allowed").
 # A failed unlock is not fatal: the runner's Aqua session may have the keychain unlocked already
-# (KEYCHAIN_PASSWORD fits one runner, not every one), so codesign decides. UNLOCKED is set only
-# when this script's unlock worked, so cleanup never locks a keychain the session had unlocked.
+# (KEYCHAIN_PASSWORD fits one runner, not every one), so codesign decides.
 KEYCHAIN_ARGS=()
 if [ -n "${KEYCHAIN:-}" ]; then
+  if ! security unlock-keychain -p "${KEYCHAIN_PASSWORD:-}" "$KEYCHAIN"; then
+    echo "WARNING: couldn't unlock $KEYCHAIN; going on, codesign decides" >&2
+  fi
   if info="$(security show-keychain-info "$KEYCHAIN" 2>&1)"; then
     echo "Keychain $KEYCHAIN: $info"
     KEYCHAIN_ARGS=(--keychain "$KEYCHAIN")
-    if security unlock-keychain -p "${KEYCHAIN_PASSWORD:-}" "$KEYCHAIN"; then
-      UNLOCKED="$KEYCHAIN"
-    else
-      echo "WARNING: couldn't unlock $KEYCHAIN; going on, codesign decides" >&2
-    fi
   else
     echo "Keychain $KEYCHAIN not usable: $info" >&2
   fi
@@ -133,9 +131,23 @@ notarize() {
   fi
 }
 
+# Stapling fetches the ticket from Apple's CloudKit, whose connection drops now and then ("The
+# network connection was lost", error 68) right after notarization was Accepted. Only the fetch is
+# retried; the file is already notarized.
+staple() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if xcrun stapler staple "$1"; then return 0; fi
+    echo "WARNING: stapling $(basename "$1") failed (attempt $attempt of 5)" >&2
+    [ "$attempt" -lt 5 ] && sleep $((attempt * 15))
+  done
+  echo "ERROR: couldn't staple $(basename "$1")" >&2
+  exit 1
+}
+
 /usr/bin/ditto -c -k --keepParent "$APP" "$WORK/notarize.zip"
 notarize "$WORK/notarize.zip"
-xcrun stapler staple "$APP"
+staple "$APP"
 xcrun stapler validate "$APP"
 spctl --assess --type execute --verbose=2 "$APP"
 
@@ -147,6 +159,6 @@ bash "$IN/tree/packaging/macos/dmg.sh" "$APP" "$OUT/$DMG"
 codesign --force --timestamp ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} --sign "$IDENTITY" "$OUT/$DMG"
 check_team "$OUT/$DMG"
 notarize "$OUT/$DMG"
-xcrun stapler staple "$OUT/$DMG"
+staple "$OUT/$DMG"
 spctl --assess --type open --context context:primary-signature --verbose=2 "$OUT/$DMG"
 ls -l "$OUT"
