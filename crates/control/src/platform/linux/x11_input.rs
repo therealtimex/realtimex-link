@@ -217,6 +217,15 @@ impl X11Input {
         self.fake(kind, keycode, 0, 0)
     }
 
+    /// A physical key by its evdev code: X keycodes are evdev's plus 8 (the evdev and libinput
+    /// drivers, and Xwayland). The X server's keymap turns it into a keysym, as for a keyboard.
+    pub fn physical_key(&mut self, evdev: u16, pressed: bool) -> Result<()> {
+        let keycode = u8::try_from(evdev + 8).context("no X keycode for this key")?;
+        self.key(keycode, pressed)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
     pub fn keysym(&mut self, keysym: u32, pressed: bool) -> Result<()> {
         if pressed {
             self.press(keysym)?;

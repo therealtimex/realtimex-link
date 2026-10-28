@@ -45,6 +45,14 @@ impl Input {
     pub fn keysym(&mut self, _keysym: u32, _pressed: bool) -> Result<()> {
         unreachable!()
     }
+    pub fn key(
+        &mut self,
+        _key: &'static crate::codes::PhysicalKey,
+        _pressed: bool,
+        _repeat: bool,
+    ) -> Result<()> {
+        unreachable!()
+    }
     pub fn scroll(&mut self, _dx: i32, _dy: i32) -> Result<()> {
         unreachable!()
     }

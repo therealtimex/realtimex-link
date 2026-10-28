@@ -8,6 +8,9 @@
 //!                                             give another picture size, e.g. a live view's)
 //! {"id":4,"op":"button","button":"left","pressed":true}
 //! {"id":5,"op":"keysym","keysym":65293,"pressed":true}   (X11 keysyms)
+//! {"id":18,"op":"key","code":"KeyA","pressed":true}   (a physical key by its KeyboardEvent.code,
+//!     realtimex-link#7: a down for a held key is its repeat; an unknown code or an up for a key
+//!     not held does nothing)
 //! {"id":6,"op":"scroll","dx":0,"dy":3}       (wheel steps, positive = down/right)
 //! {"id":7,"op":"paste_text","text":"…","terminal":false}
 //! {"id":14,"op":"paste_image","png":"<base64>","dib":"<base64>"}   (onto the clipboard as PNG,
@@ -44,6 +47,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
+use crate::codes::{physical_key, PhysicalKey};
 use crate::peer::{self, Peer, ToMain};
 use crate::platform::{self, Button, Input};
 
@@ -85,6 +89,8 @@ struct Controller {
     /// Ctrl or a mouse button held down on the desktop.
     held_keys: BTreeSet<u32>,
     held_buttons: Vec<Button>,
+    /// Physical keys held, in the order they went down (#2909).
+    held_codes: Vec<&'static PhysicalKey>,
     /// Open WebRTC live views by session number.
     peers: HashMap<u64, Peer>,
     next_peer: u64,
@@ -114,9 +120,13 @@ impl Controller {
 
     /// Release everything still held, best effort, then forget it.
     fn release_held(&mut self) {
+        let codes = std::mem::take(&mut self.held_codes);
         let keys: Vec<u32> = std::mem::take(&mut self.held_keys).into_iter().collect();
         let buttons = std::mem::take(&mut self.held_buttons);
         if let Some(input) = self.input.as_mut() {
+            for key in codes.into_iter().rev() {
+                let _ = input.key(key, false, false);
+            }
             for keysym in keys.into_iter().rev() {
                 let _ = input.keysym(keysym, false);
             }
@@ -126,23 +136,59 @@ impl Controller {
         }
     }
 
-    /// When the input session has work of its own due: on Windows, the clipboard text a paste
-    /// took off comes back a moment after the last paste.
-    #[cfg(windows)]
+    /// When the input session has work of its own due: on Windows and macOS, the clipboard text
+    /// a paste took off comes back a moment after the last paste.
+    #[cfg(any(windows, target_os = "macos"))]
     fn due(&self) -> Option<std::time::Instant> {
         self.input.as_ref().and_then(Input::restore_due)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn due(&self) -> Option<std::time::Instant> {
         None
     }
 
     fn run_due(&mut self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(input) = self.input.as_mut() {
             input.restore_clipboard();
         }
+    }
+
+    /// A physical key (#2909). A down for a key already held is a repeat; an up for a key not
+    /// held, or a code with no key here, does nothing.
+    fn key(&mut self, code: &str, pressed: bool) -> Result<()> {
+        let Some(key) = physical_key(code) else {
+            return Ok(());
+        };
+        match key_step(&mut self.held_codes, key, pressed) {
+            Some((pressed, repeat)) => self.input()?.key(key, pressed, repeat),
+            None => Ok(()),
+        }
+    }
+
+    /// A paste with the held physical modifiers let go first and pressed again after, so its
+    /// own combo is exactly Ctrl+V or ⌘V (Shift held would make it Ctrl+Shift+V) and a held key
+    /// is still held afterwards (#2909: ControlLeft held by a Mac viewer on a Windows host).
+    fn paste(&mut self, paste: impl FnOnce(&mut Input) -> Result<()>) -> Result<()> {
+        let modifiers: Vec<&'static PhysicalKey> = self
+            .held_codes
+            .iter()
+            .copied()
+            .filter(|key| key.modifier.is_some())
+            .collect();
+        let input = self.input()?;
+        for key in modifiers.iter().rev() {
+            input.key(key, false, false)?;
+        }
+        let pasted = paste(&mut *input);
+        let mut pressed_again = Ok(());
+        for key in &modifiers {
+            if let Err(error) = input.key(key, true, false) {
+                pressed_again = pressed_again.and(Err(error));
+            }
+        }
+        pasted.and(pressed_again)
     }
 
     /// End the input session, releasing anything still held first.
@@ -271,6 +317,14 @@ impl Controller {
                 }
                 Ok(json!({}))
             }
+            "key" => {
+                let code = request["code"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("code is required"))?;
+                let pressed = request["pressed"].as_bool().unwrap_or(false);
+                self.key(code, pressed)?;
+                Ok(json!({}))
+            }
             "scroll" => {
                 let dx = request["dx"].as_i64().unwrap_or(0) as i32;
                 let dy = request["dy"].as_i64().unwrap_or(0) as i32;
@@ -283,7 +337,7 @@ impl Controller {
                     bail!("text is required");
                 }
                 let terminal = request["terminal"].as_bool().unwrap_or(false);
-                self.input()?.paste_text(text, terminal)?;
+                self.paste(|input| input.paste_text(text, terminal))?;
                 Ok(json!({}))
             }
             "paste_image" => {
@@ -311,7 +365,7 @@ impl Controller {
                         bail!("dib is not a BITMAPINFOHEADER bitmap of at most {MAX_PASTE_DIB_BYTES} bytes");
                     }
                 }
-                self.input()?.paste_image(&png, dib.as_deref())?;
+                self.paste(|input| input.paste_image(&png, dib.as_deref()))?;
                 Ok(json!({}))
             }
             "paste_files" => {
@@ -332,7 +386,7 @@ impl Controller {
                 }) {
                     bail!("not an existing file: {missing}");
                 }
-                self.input()?.paste_files(&paths)?;
+                self.paste(|input| input.paste_files(&paths))?;
                 Ok(json!({}))
             }
             "clipboard_seq" => {
@@ -385,6 +439,28 @@ impl Controller {
             }
             other => bail!("Unknown op: {other}"),
         }
+    }
+}
+
+/// What a physical key op presses, as (pressed, repeat), with `held` brought up to date: a down
+/// for a held key is its repeat, an up for a key not held is nothing.
+fn key_step(
+    held: &mut Vec<&'static PhysicalKey>,
+    key: &'static PhysicalKey,
+    pressed: bool,
+) -> Option<(bool, bool)> {
+    let index = held.iter().position(|k| k.code == key.code);
+    match (pressed, index) {
+        (true, Some(_)) => Some((true, true)),
+        (true, None) => {
+            held.push(key);
+            Some((true, false))
+        }
+        (false, Some(index)) => {
+            held.remove(index);
+            Some((false, false))
+        }
+        (false, None) => None,
     }
 }
 
@@ -494,6 +570,7 @@ pub fn run() -> Result<()> {
         shot_size: None,
         held_keys: BTreeSet::new(),
         held_buttons: Vec::new(),
+        held_codes: Vec::new(),
         peers: HashMap::new(),
         next_peer: 0,
         to_main: to_main.clone(),
@@ -664,6 +741,23 @@ mod tests {
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    #[test]
+    fn a_held_key_repeats_and_an_up_for_a_key_not_held_does_nothing() {
+        let shift = physical_key("ShiftLeft").unwrap();
+        let a = physical_key("KeyA").unwrap();
+        let mut held = Vec::new();
+        assert_eq!(key_step(&mut held, shift, true), Some((true, false)));
+        assert_eq!(key_step(&mut held, a, true), Some((true, false)));
+        // The viewer's key repeat: another down.
+        assert_eq!(key_step(&mut held, a, true), Some((true, true)));
+        assert_eq!(held, vec![shift, a]);
+        assert_eq!(key_step(&mut held, a, false), Some((false, false)));
+        assert_eq!(key_step(&mut held, a, false), None);
+        assert_eq!(held, vec![shift]);
+        assert_eq!(key_step(&mut held, a, true), Some((true, false)));
+        assert_eq!(held, vec![shift, a]);
     }
 
     #[test]

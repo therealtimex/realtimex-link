@@ -8,14 +8,14 @@
 //! the keyboard's state (#2665).
 
 use std::ffi::c_void;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use crate::codes::{Modifier, PhysicalKey};
 use crate::keys::{from_keysym, Key};
-use crate::platform::Button;
+use crate::platform::{Button, ClipboardContent};
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
@@ -196,6 +196,13 @@ const MOUSE_MOVED: u32 = 5;
 const SCROLL_UNITS_LINE: u32 = 1;
 /// kCGMouseEventClickState: 2 makes a second click a double click.
 const FIELD_CLICK_STATE: u32 = 1;
+/// kCGKeyboardEventAutorepeat: 1 on a held key's repeated down. macOS doesn't repeat posted
+/// keys itself, so the viewer's repeats are posted with it.
+const FIELD_KEYBOARD_AUTOREPEAT: u32 = 8;
+/// How long the pasted text stays on the pasteboard before the previous text comes back: the
+/// app reads it when it handles ⌘V, after the events are posted. The paste doesn't wait for it;
+/// the control loop puts it back when due (`restore_due`), and a paste before then moves it on.
+const RESTORE_CLIPBOARD_AFTER: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 const FLAG_SHIFT: u64 = 0x0002_0000;
@@ -331,6 +338,15 @@ fn char_key(c: char) -> Option<(u16, bool)> {
     Some((keycode(Key::Char(base))?, shift))
 }
 
+fn physical_flag(modifier: Modifier) -> u64 {
+    match modifier {
+        Modifier::Shift => FLAG_SHIFT,
+        Modifier::Control => FLAG_CONTROL,
+        Modifier::Alt => FLAG_ALT,
+        Modifier::Meta => FLAG_COMMAND,
+    }
+}
+
 fn modifier_flag(key: Key) -> u64 {
     match key {
         Key::Shift => FLAG_SHIFT,
@@ -347,12 +363,18 @@ pub struct Input {
     bounds: CGRect,
     position: CGPoint,
     buttons_down: [bool; 3],
-    flags: u64,
+    /// Modifiers held through `keysym`.
+    keysym_flags: u64,
+    /// Physical modifier keys held (#2909): every posted key and mouse event carries their
+    /// flags, so Shift+click and ⌘+click arrive as such.
+    physical_modifiers: Vec<&'static PhysicalKey>,
     last_click: Option<(Button, Instant)>,
     click_state: i64,
     /// The pasteboard's changeCount right after this helper's own last write: not a copy to
     /// send back to the viewer (#2682).
     own_change: Option<isize>,
+    /// The text the last paste took off the pasteboard, and when it goes back.
+    restore: Option<(String, Instant)>,
 }
 
 impl Input {
@@ -376,11 +398,23 @@ impl Input {
                 y: bounds.origin.y,
             },
             buttons_down: [false; 3],
-            flags: 0,
+            keysym_flags: 0,
+            physical_modifiers: Vec::new(),
             last_click: None,
             own_change: None,
+            restore: None,
             click_state: 1,
         })
+    }
+
+    /// The flags of every modifier held, by keysym or physically.
+    fn flags(&self) -> u64 {
+        self.physical_modifiers
+            .iter()
+            .filter_map(|key| key.modifier)
+            .fold(self.keysym_flags, |flags, modifier| {
+                flags | physical_flag(modifier)
+            })
     }
 
     /// The main display in points; screenshot pixels are scaled onto it.
@@ -411,7 +445,7 @@ impl Input {
         };
         let event = unsafe { CGEventCreateMouseEvent(self.source, kind, self.position, button) };
         if !event.is_null() {
-            unsafe { CGEventSetFlags(event, self.flags) };
+            unsafe { CGEventSetFlags(event, self.flags()) };
         }
         post(event)
     }
@@ -444,7 +478,7 @@ impl Input {
         if !event.is_null() {
             unsafe {
                 CGEventSetIntegerValueField(event, FIELD_CLICK_STATE, self.click_state);
-                CGEventSetFlags(event, self.flags);
+                CGEventSetFlags(event, self.flags());
             }
         }
         post(event)
@@ -454,10 +488,10 @@ impl Input {
         let key = from_keysym(keysym).with_context(|| format!("unsupported keysym {keysym:#x}"))?;
         if key.is_modifier() {
             let flag = modifier_flag(key);
-            self.flags = if pressed {
-                self.flags | flag
+            self.keysym_flags = if pressed {
+                self.keysym_flags | flag
             } else {
-                self.flags & !flag
+                self.keysym_flags & !flag
             };
         }
         let (code, shift) = match key {
@@ -465,8 +499,8 @@ impl Input {
             _ => (keycode(key), false),
         };
         // A shortcut keeps its flags as sent: ⌘ with 'C' is still ⌘C.
-        let shortcut = self.flags & (FLAG_COMMAND | FLAG_CONTROL) != 0;
-        let flags = self.flags | if shift && !shortcut { FLAG_SHIFT } else { 0 };
+        let shortcut = self.flags() & (FLAG_COMMAND | FLAG_CONTROL) != 0;
+        let flags = self.flags() | if shift && !shortcut { FLAG_SHIFT } else { 0 };
         let event = unsafe { CGEventCreateKeyboardEvent(self.source, code.unwrap_or(0), pressed) };
         if event.is_null() {
             bail!("could not create the key event");
@@ -491,6 +525,28 @@ impl Input {
         post(event)
     }
 
+    /// A physical key by position (#2909). No Unicode string goes with it, so this Mac's own
+    /// layout and input source decide what it types. `repeat` marks a held key's repeated down.
+    pub fn key(&mut self, key: &'static PhysicalKey, pressed: bool, repeat: bool) -> Result<()> {
+        if key.modifier.is_some() {
+            self.physical_modifiers.retain(|held| held.code != key.code);
+            if pressed {
+                self.physical_modifiers.push(key);
+            }
+        }
+        let event = unsafe { CGEventCreateKeyboardEvent(self.source, key.mac, pressed) };
+        if event.is_null() {
+            bail!("could not create the key event");
+        }
+        unsafe {
+            if repeat {
+                CGEventSetIntegerValueField(event, FIELD_KEYBOARD_AUTOREPEAT, 1);
+            }
+            CGEventSetFlags(event, self.flags());
+        }
+        post(event)
+    }
+
     pub fn scroll(&mut self, dx: i32, dy: i32) -> Result<()> {
         // Positive requests scroll down/right; macOS wheel deltas point the other way.
         let event = unsafe {
@@ -506,7 +562,7 @@ impl Input {
     }
 
     /// What the general pasteboard holds: files, an image (PNG, TIFF made PNG) or text.
-    pub fn clipboard_read(&mut self) -> Result<crate::platform::ClipboardContent> {
+    pub fn clipboard_read(&mut self) -> Result<ClipboardContent> {
         read_pasteboard()
     }
 
@@ -515,8 +571,10 @@ impl Input {
     }
 
     /// Put these files on the general pasteboard (file URLs, as Finder copies them) and press ⌘V:
-    /// a Finder window copies them in, an app such as RealTimeX attaches them.
+    /// a Finder window copies them in, an app such as RealTimeX attaches them. They stay on the
+    /// pasteboard, as after a local paste.
     pub fn paste_files(&mut self, paths: &[String]) -> Result<()> {
+        self.restore = None;
         put_files_on_pasteboard(paths)?;
         self.note_own_write();
         self.press_paste()
@@ -524,32 +582,52 @@ impl Input {
 
     /// Put a PNG on the general pasteboard (`public.png`) and press ⌘V. (A bitmap is Windows'.)
     pub fn paste_image(&mut self, png: &[u8], _dib: Option<&[u8]>) -> Result<()> {
+        self.restore = None;
         put_png_on_pasteboard(png)?;
         self.note_own_write();
         self.press_paste()
     }
 
-    /// Put the text on the clipboard and press ⌘V (terminals paste with ⌘V on macOS too).
+    /// Put the text on the pasteboard and press ⌘V (terminals paste with ⌘V on macOS too). It is
+    /// written in-process, not by starting pbcopy, and the text that was there comes back later
+    /// (`restore_clipboard`). Other content (an image, files) stays replaced, as before.
     pub fn paste_text(&mut self, text: &str, _terminal: bool) -> Result<()> {
-        let mut child = Command::new("/usr/bin/pbcopy")
-            .env("LANG", "en_US.UTF-8")
-            .stdin(Stdio::piped())
-            .spawn()
-            .context("pbcopy")?;
-        child
-            .stdin
-            .take()
-            .context("pbcopy stdin")?
-            .write_all(text.as_bytes())?;
-        if !child.wait()?.success() {
-            bail!("pbcopy failed");
-        }
+        let previous = match self.restore.take() {
+            Some((previous, _)) => Some(previous),
+            None => match read_pasteboard() {
+                Ok(ClipboardContent::Text(previous)) => Some(previous),
+                _ => None,
+            },
+        };
+        put_text_on_pasteboard(text)?;
         self.note_own_write();
-        self.press_paste()
+        let sent = self.press_paste();
+        if let Some(previous) = previous {
+            self.restore = Some((previous, Instant::now() + RESTORE_CLIPBOARD_AFTER));
+        }
+        sent
+    }
+
+    /// When the last paste's previous text is due back.
+    pub fn restore_due(&self) -> Option<Instant> {
+        self.restore.as_ref().map(|(_, due)| *due)
+    }
+
+    /// Put the last paste's previous text back now, unless something newer was copied meanwhile.
+    pub fn restore_clipboard(&mut self) {
+        let Some((previous, _)) = self.restore.take() else {
+            return;
+        };
+        let unchanged = pasteboard_change_count()
+            .ok()
+            .is_some_and(|count| self.own_change == Some(count));
+        if unchanged && put_text_on_pasteboard(&previous).is_ok() {
+            self.note_own_write();
+        }
     }
 
     fn press_paste(&mut self) -> Result<()> {
-        let flags = self.flags | FLAG_COMMAND;
+        let flags = self.flags() | FLAG_COMMAND;
         for (code, down) in [
             (KEYCODE_COMMAND, true),
             (KEYCODE_V, true),
@@ -559,7 +637,7 @@ impl Input {
             let event = unsafe { CGEventCreateKeyboardEvent(self.source, code, down) };
             if !event.is_null() {
                 let event_flags = if code == KEYCODE_COMMAND && !down {
-                    self.flags
+                    self.flags()
                 } else {
                     flags
                 };
@@ -574,6 +652,26 @@ impl Input {
 // NSPasteboard lives in AppKit, which the helper otherwise doesn't link.
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
+
+/// Replace the general pasteboard's contents with this text.
+fn put_text_on_pasteboard(text: &str) -> Result<()> {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2_foundation::NSString;
+
+    let pasteboard: *mut AnyObject = general_pasteboard()?;
+    let string = NSString::from_str(text);
+    let kind = NSString::from_str("public.utf8-plain-text");
+    let written = unsafe {
+        let _: isize = msg_send![pasteboard, clearContents];
+        let ok: Bool = msg_send![pasteboard, setString: &*string, forType: &*kind];
+        ok.as_bool()
+    };
+    if !written {
+        bail!("the pasteboard refused the text");
+    }
+    Ok(())
+}
 
 /// Replace the general pasteboard's contents with this PNG.
 fn put_png_on_pasteboard(png: &[u8]) -> Result<()> {
@@ -617,8 +715,7 @@ fn pasteboard_change_count() -> Result<isize> {
 }
 
 /// Files first (Finder puts their names as text too), then an image, then text.
-fn read_pasteboard() -> Result<crate::platform::ClipboardContent> {
-    use crate::platform::ClipboardContent;
+fn read_pasteboard() -> Result<ClipboardContent> {
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject};
@@ -709,7 +806,13 @@ fn put_files_on_pasteboard(paths: &[String]) -> Result<()> {
 }
 
 impl Drop for Input {
+    /// The session ends: the last paste's previous text still comes back, once the app had its
+    /// time to read the paste.
     fn drop(&mut self) {
+        if let Some(due) = self.restore_due() {
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            self.restore_clipboard();
+        }
         unsafe { CFRelease(self.source) };
     }
 }

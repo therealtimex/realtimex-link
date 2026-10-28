@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use crate::backend::Backend;
+use crate::codes::physical_key;
 use crate::error::ApiError;
 
 pub const MAX_ACTIONS: usize = 50;
@@ -227,16 +228,20 @@ pub fn plan_action(action: &Value) -> Result<Vec<Value>, ApiError> {
                 _ => return Err(bad("type method must be \"paste\" or \"keys\"")),
             }
         }
-        "key" => {
-            let combo = action.get("keys").and_then(Value::as_str).unwrap_or("");
-            let keysyms = combo_keysyms(combo).map_err(bad)?;
-            for keysym in &keysyms {
-                ops.push(json!({ "op": "keysym", "keysym": keysym, "pressed": true }));
+        "key" => match (action.get("code"), action.get("keys")) {
+            (Some(code), None) => ops.extend(physical_key_op(action, code)?),
+            (Some(_), Some(_)) => return Err(bad("A key action has code or keys, not both")),
+            (None, _) => {
+                let combo = action.get("keys").and_then(Value::as_str).unwrap_or("");
+                let keysyms = combo_keysyms(combo).map_err(bad)?;
+                for keysym in &keysyms {
+                    ops.push(json!({ "op": "keysym", "keysym": keysym, "pressed": true }));
+                }
+                for keysym in keysyms.iter().rev() {
+                    ops.push(json!({ "op": "keysym", "keysym": keysym, "pressed": false }));
+                }
             }
-            for keysym in keysyms.iter().rev() {
-                ops.push(json!({ "op": "keysym", "keysym": keysym, "pressed": false }));
-            }
-        }
+        },
         "scroll" => {
             let dy = integer(action.get("dy"), "dy", -50, 50)?;
             let dx = integer(action.get("dx"), "dx", -50, 50)?;
@@ -260,6 +265,32 @@ pub fn plan_action(action: &Value) -> Result<Vec<Value>, ApiError> {
     Ok(ops)
 }
 
+/// A physical key (realtimex-link#7): `{type:"key", code, down, repeat?}`, a KeyboardEvent.code
+/// pressed by position. A code with no key here (`Lang1`, `Fn`) is skipped, not refused: a
+/// refusal would clear the viewer's queue and end its Control (#2909). rtx-control treats a down
+/// for a held key as its repeat, so `repeat` is only checked.
+fn physical_key_op(action: &Value, code: &Value) -> Result<Option<Value>, ApiError> {
+    let code = code
+        .as_str()
+        .ok_or_else(|| bad("code must be a string such as KeyA"))?;
+    let down = action
+        .get("down")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| bad("down must be true or false"))?;
+    if action
+        .get("repeat")
+        .is_some_and(|repeat| !repeat.is_boolean())
+    {
+        return Err(bad("repeat must be true or false"));
+    }
+    Ok(physical_key(code).map(|key| json!({ "op": "key", "code": key.code, "pressed": down })))
+}
+
+/// `{type:"key", code}`: a physical key, as opposed to a `keys` combo.
+pub fn is_physical_key(action: &Value) -> bool {
+    action.get("type").and_then(Value::as_str) == Some("key") && action.get("code").is_some()
+}
+
 fn paste_text(action: &Value, text: &str) -> Value {
     let terminal = action.get("terminal") == Some(&Value::Bool(true));
     json!({ "op": "paste_text", "text": text, "terminal": terminal })
@@ -275,7 +306,9 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
-pub fn plan_actions(actions: Option<&Value>) -> Result<Vec<Vec<Value>>, ApiError> {
+/// A batch's ops. Physical keys come only from a live view (`live_view`): over HTTP nothing
+/// would release a key left held (#2909), so the agent skill keeps `keys` and `type`.
+pub fn plan_actions(actions: Option<&Value>, live_view: bool) -> Result<Vec<Vec<Value>>, ApiError> {
     let Some(list) = actions
         .and_then(Value::as_array)
         .filter(|list| !list.is_empty())
@@ -285,15 +318,25 @@ pub fn plan_actions(actions: Option<&Value>) -> Result<Vec<Vec<Value>>, ApiError
     if list.len() > MAX_ACTIONS {
         return Err(bad(format!("At most {MAX_ACTIONS} actions per request")));
     }
-    list.iter().map(plan_action).collect()
+    list.iter()
+        .map(|action| {
+            if !live_view && is_physical_key(action) {
+                return Err(bad(
+                    "Physical keys (code) are for a live view only; send keys such as ctrl+l",
+                ));
+            }
+            plan_action(action)
+        })
+        .collect()
 }
 
 /// Run a batch; resolves with how many actions ran.
 pub async fn run_actions(
     backend: &Arc<Backend>,
     actions: Option<&Value>,
+    live_view: bool,
 ) -> Result<usize, ApiError> {
-    let plans = plan_actions(actions)?;
+    let plans = plan_actions(actions, live_view)?;
     for ops in &plans {
         for step in ops {
             let mut params = step.as_object().cloned().unwrap_or_default();
@@ -373,9 +416,130 @@ mod tests {
             plan_action(&json!({ "type": "zap" })).unwrap_err().message,
             "Unknown action type: zap"
         );
-        assert!(plan_actions(Some(&json!([]))).is_err());
-        assert!(plan_actions(Some(&json!([{ "type": "move", "x": -1, "y": 0 }]))).is_err());
+        assert!(plan_actions(Some(&json!([])), false).is_err());
+        assert!(plan_actions(Some(&json!([{ "type": "move", "x": -1, "y": 0 }])), false).is_err());
         assert_eq!(combo_keysyms("f5").unwrap(), vec![0xffc2]);
         assert!(text_keysyms("a\u{7}").is_err());
+    }
+
+    fn error(action: Value) -> String {
+        plan_action(&action).unwrap_err().message
+    }
+
+    #[test]
+    fn a_physical_key_is_one_key_op_by_code() {
+        assert_eq!(
+            plan_action(&json!({ "type": "key", "code": "ShiftLeft", "down": true })).unwrap(),
+            vec![json!({ "op": "key", "code": "ShiftLeft", "pressed": true })]
+        );
+        assert_eq!(
+            plan_action(&json!({ "type": "key", "code": "KeyA", "down": true, "repeat": true }))
+                .unwrap(),
+            vec![json!({ "op": "key", "code": "KeyA", "pressed": true })]
+        );
+        assert_eq!(
+            plan_action(&json!({ "type": "key", "code": "KeyA", "down": false })).unwrap(),
+            vec![json!({ "op": "key", "code": "KeyA", "pressed": false })]
+        );
+    }
+
+    /// #2909: a refusal would clear the viewer's queue and turn its Control off.
+    #[test]
+    fn a_well_formed_code_link_has_no_key_for_is_skipped() {
+        for code in ["Lang1", "Fn", "MediaPlayPause", "Unidentified", ""] {
+            let ops = plan_action(&json!({ "type": "key", "code": code, "down": true })).unwrap();
+            assert!(ops.is_empty(), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_physical_key_is_refused() {
+        assert_eq!(
+            error(json!({ "type": "key", "code": 65, "down": true })),
+            "code must be a string such as KeyA"
+        );
+        assert_eq!(
+            error(json!({ "type": "key", "code": "KeyA" })),
+            "down must be true or false"
+        );
+        assert_eq!(
+            error(json!({ "type": "key", "code": "KeyA", "down": 1 })),
+            "down must be true or false"
+        );
+        assert_eq!(
+            error(json!({ "type": "key", "code": "KeyA", "down": true, "repeat": "yes" })),
+            "repeat must be true or false"
+        );
+        assert_eq!(
+            error(json!({ "type": "key", "code": "KeyA", "keys": "ctrl+l", "down": true })),
+            "A key action has code or keys, not both"
+        );
+        // Neither: the combo's own message, as before.
+        assert_eq!(
+            error(json!({ "type": "key" })),
+            "keys must be a non-empty string such as ctrl+l"
+        );
+    }
+
+    #[test]
+    fn the_old_combo_is_unchanged() {
+        assert_eq!(
+            plan_action(&json!({ "type": "key", "keys": "ctrl+l" })).unwrap(),
+            vec![
+                json!({ "op": "keysym", "keysym": 0xffe3, "pressed": true }),
+                json!({ "op": "keysym", "keysym": 0x6c, "pressed": true }),
+                json!({ "op": "keysym", "keysym": 0x6c, "pressed": false }),
+                json!({ "op": "keysym", "keysym": 0xffe3, "pressed": false }),
+            ]
+        );
+    }
+
+    /// Downs and ups keep their order in a batch, between moves and clicks.
+    #[test]
+    fn a_batch_keeps_its_order() {
+        let batch = json!([
+            { "type": "key", "code": "ShiftLeft", "down": true },
+            { "type": "move", "x": 5, "y": 6 },
+            { "type": "key", "code": "KeyA", "down": true },
+            { "type": "key", "code": "KeyA", "down": false },
+            { "type": "click", "x": 5, "y": 6 },
+            { "type": "key", "code": "ShiftLeft", "down": false },
+        ]);
+        let ops: Vec<String> = plan_actions(Some(&batch), true)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|op| match op["op"].as_str().unwrap() {
+                "key" => format!(
+                    "{}{}",
+                    op["code"].as_str().unwrap(),
+                    if op["pressed"] == true { "↓" } else { "↑" }
+                ),
+                other => other.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                "ShiftLeft↓",
+                "move",
+                "KeyA↓",
+                "KeyA↑",
+                "move",
+                "button",
+                "button",
+                "ShiftLeft↑"
+            ]
+        );
+    }
+
+    #[test]
+    fn physical_keys_are_for_a_live_view_only() {
+        let batch = json!([{ "type": "key", "code": "KeyA", "down": true }]);
+        let refused = plan_actions(Some(&batch), false).unwrap_err();
+        assert_eq!(refused.status, 400);
+        assert!(plan_actions(Some(&batch), true).is_ok());
+        // The combo still works over HTTP.
+        assert!(plan_actions(Some(&json!([{ "type": "key", "keys": "ctrl+l" }])), false).is_ok());
     }
 }

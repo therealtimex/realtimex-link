@@ -23,11 +23,11 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-    VIRTUAL_KEY,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, GetSystemMetrics, PostMessageW,
@@ -39,7 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use rtx_screens::win as screens;
 
 use self::clipboard::Clipboard;
-use self::keymap::{named_vk, normalise, unshifted_scan, Desktop, Vk};
+use self::keymap::{named_vk, normalise, physical_press, unshifted_scan, Desktop, Press, Vk};
+use crate::codes::PhysicalKey;
 use crate::keys::{from_keysym, Key};
 use crate::platform::{Button, InputError, Shot};
 
@@ -170,6 +171,40 @@ impl Input {
             .map(|&unit| keyboard(0, unit, up | KEYEVENTF_UNICODE))
             .collect();
         send(&events)
+    }
+
+    /// A physical key (#2909), by scancode: this computer's layout and input method decide what
+    /// it types. Windows doesn't repeat injected keys, so a repeat is simply another down.
+    pub fn key(&mut self, key: &'static PhysicalKey, pressed: bool, _repeat: bool) -> Result<()> {
+        let up = if pressed {
+            KEYBD_EVENT_FLAGS(0)
+        } else {
+            KEYEVENTF_KEYUP
+        };
+        let event = match physical_press(key) {
+            Press::Scancode { scan, extended } => {
+                let flags = up | KEYEVENTF_SCANCODE;
+                keyboard(
+                    0,
+                    scan,
+                    if extended {
+                        flags | KEYEVENTF_EXTENDEDKEY
+                    } else {
+                        flags
+                    },
+                )
+            }
+            Press::Vk(vk) => keyboard(
+                vk.code,
+                0,
+                if vk.extended {
+                    up | KEYEVENTF_EXTENDEDKEY
+                } else {
+                    up
+                },
+            ),
+        };
+        send(&[event])
     }
 
     /// Wheel steps; positive scrolls down/right (Windows' vertical wheel points the other way).

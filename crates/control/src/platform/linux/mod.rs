@@ -8,6 +8,7 @@ use rtx_screens::x11;
 use self::wayland_input::WaylandInput;
 use self::x11_input::X11Input;
 use super::{Button, Frame, Shot};
+use crate::codes::PhysicalKey;
 
 mod terminal;
 mod wayland_input;
@@ -88,6 +89,19 @@ impl Input {
         match self {
             Self::Wayland(input) => input.keysym(keysym, pressed),
             Self::X11(input) => input.keysym(keysym, pressed),
+        }
+    }
+
+    /// A physical key (#2909). X11 and Wayland repeat a held key themselves (the X server's
+    /// autorepeat for the XTEST device, wl_keyboard's repeat rate in clients), so the viewer's
+    /// repeats are skipped: one repeat stream, the host's.
+    pub fn key(&mut self, key: &'static PhysicalKey, pressed: bool, repeat: bool) -> Result<()> {
+        if pressed && repeat {
+            return Ok(());
+        }
+        match self {
+            Self::Wayland(input) => input.key(key.evdev, pressed),
+            Self::X11(input) => input.physical_key(key.evdev, pressed),
         }
     }
 

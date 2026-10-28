@@ -16,8 +16,15 @@ control other computers from.
 - **`rtx-control`** (`crates/control`): the desktop helper `rtx-linkd` starts, installed next to
   it: screenshots, the WebRTC live view, mouse and keyboard input and the clipboard, as JSON lines
   on stdin/stdout (`crates/control/src/control.rs`). `rtx-control --check` prints one JSON line,
-  `{"tool":"rtx-control","version":"0.1.0","protocol":1,"platform":"macos","input":true}`, and
+  `{"tool":"rtx-control","version":"0.1.0","protocol":2,"platform":"macos","input":true}`, and
   exits 0 when this platform has input. It posts input but never reads the keyboard.
+  **Physical keys** (0.2.4, realtimex-link#7, realtimex-ai-app#2909): a live view sends
+  `{type:"key", code, down, repeat?}` with a `KeyboardEvent.code`, pressed by position (macOS key
+  codes, Windows scancodes, evdev on X11 and Wayland), so this computer's layout and input source
+  decide what it types; `info` lists the `physical-keys` feature. Codes Link has no key for are
+  skipped. A view's held keys are released when it closes, loses control, sends a batch that fails
+  or is refused, or sends nothing for 30 s; macOS and Windows post the viewer's repeats, X11 and
+  Wayland repeat on their own. The HTTP `actions` endpoint takes `keys` combos only.
 - **`rtx-screens`** (`crates/screens`): window and display screenshots, capture only. RealTimeX's
   recorder uses it too, pinned to a commit of this repo.
 - **`rtx-glibc-compat`** (`crates/glibc-compat`): the glibc 2.34 floor on Linux, linked into each
