@@ -138,7 +138,7 @@ sign-mac-arm64:
 sign-mac-x86_64:
   extends: .sign-mac
   tags:
-    - office-macmini-200
+    - usa-imac-pro-01
   variables:
     CPU_ARCH: x86_64
 
