@@ -161,10 +161,12 @@ impl Controller {
         let Some(key) = physical_key(code) else {
             return Ok(());
         };
-        match key_step(&mut self.held_codes, key, pressed) {
-            Some((pressed, repeat)) => self.input()?.key(key, pressed, repeat),
-            None => Ok(()),
+        if !pressed && !self.held_codes.iter().any(|held| held.code == key.code) {
+            return Ok(());
         }
+        self.input()?;
+        let input = self.input.as_mut().expect("input was just made");
+        press_key(&mut self.held_codes, input, key, pressed)
     }
 
     /// A paste with the held physical modifiers let go first and pressed again after, so its
@@ -442,25 +444,40 @@ impl Controller {
     }
 }
 
-/// What a physical key op presses, as (pressed, repeat), with `held` brought up to date: a down
-/// for a held key is its repeat, an up for a key not held is nothing.
-fn key_step(
+/// Where a physical key goes: the platform's input, or a test's.
+trait KeyInput {
+    fn key(&mut self, key: &'static PhysicalKey, pressed: bool, repeat: bool) -> Result<()>;
+}
+
+impl KeyInput for Input {
+    fn key(&mut self, key: &'static PhysicalKey, pressed: bool, repeat: bool) -> Result<()> {
+        Input::key(self, key, pressed, repeat)
+    }
+}
+
+/// Press or let go of a physical key, keeping `held` to what may still be down: a down for a
+/// held key is its repeat, an up for a key not held does nothing. A key is held from before its
+/// down (a down that fails may still have pressed it) until an up succeeds, so a failed up is
+/// tried again by the next up and by `release_held`.
+fn press_key(
     held: &mut Vec<&'static PhysicalKey>,
+    input: &mut impl KeyInput,
     key: &'static PhysicalKey,
     pressed: bool,
-) -> Option<(bool, bool)> {
+) -> Result<()> {
     let index = held.iter().position(|k| k.code == key.code);
     match (pressed, index) {
-        (true, Some(_)) => Some((true, true)),
+        (true, Some(_)) => input.key(key, true, true),
         (true, None) => {
             held.push(key);
-            Some((true, false))
+            input.key(key, true, false)
         }
         (false, Some(index)) => {
+            input.key(key, false, false)?;
             held.remove(index);
-            Some((false, false))
+            Ok(())
         }
-        (false, None) => None,
+        (false, None) => Ok(()),
     }
 }
 
@@ -743,21 +760,86 @@ mod tests {
         assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
     }
 
+    /// Records what reaches the platform; fails the calls numbered in `fail` (from 0).
+    #[derive(Default)]
+    struct FakeInput {
+        sent: Vec<(&'static str, bool, bool)>,
+        fail: Vec<usize>,
+        calls: usize,
+    }
+
+    impl KeyInput for FakeInput {
+        fn key(&mut self, key: &'static PhysicalKey, pressed: bool, repeat: bool) -> Result<()> {
+            let call = self.calls;
+            self.calls += 1;
+            if self.fail.contains(&call) {
+                bail!("SendInput refused it");
+            }
+            self.sent.push((key.code, pressed, repeat));
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_held_key_repeats_and_an_up_for_a_key_not_held_does_nothing() {
         let shift = physical_key("ShiftLeft").unwrap();
         let a = physical_key("KeyA").unwrap();
         let mut held = Vec::new();
-        assert_eq!(key_step(&mut held, shift, true), Some((true, false)));
-        assert_eq!(key_step(&mut held, a, true), Some((true, false)));
+        let mut input = FakeInput::default();
+        press_key(&mut held, &mut input, shift, true).unwrap();
+        press_key(&mut held, &mut input, a, true).unwrap();
         // The viewer's key repeat: another down.
-        assert_eq!(key_step(&mut held, a, true), Some((true, true)));
+        press_key(&mut held, &mut input, a, true).unwrap();
         assert_eq!(held, vec![shift, a]);
-        assert_eq!(key_step(&mut held, a, false), Some((false, false)));
-        assert_eq!(key_step(&mut held, a, false), None);
+        press_key(&mut held, &mut input, a, false).unwrap();
+        press_key(&mut held, &mut input, a, false).unwrap();
         assert_eq!(held, vec![shift]);
-        assert_eq!(key_step(&mut held, a, true), Some((true, false)));
-        assert_eq!(held, vec![shift, a]);
+        assert_eq!(
+            input.sent,
+            vec![
+                ("ShiftLeft", true, false),
+                ("KeyA", true, false),
+                ("KeyA", true, true),
+                ("KeyA", false, false),
+            ]
+        );
+    }
+
+    /// Review of !6: a key is not forgotten before its up succeeds.
+    #[test]
+    fn a_failed_up_keeps_the_key_held_until_an_up_succeeds() {
+        let shift = physical_key("ShiftLeft").unwrap();
+        let mut held = Vec::new();
+        let mut input = FakeInput {
+            fail: vec![1],
+            ..FakeInput::default()
+        };
+        press_key(&mut held, &mut input, shift, true).unwrap();
+        assert!(press_key(&mut held, &mut input, shift, false).is_err());
+        assert_eq!(held, vec![shift]);
+        // The recovery up reaches the platform, and only then is the key let go.
+        press_key(&mut held, &mut input, shift, false).unwrap();
+        assert!(held.is_empty());
+        assert_eq!(
+            input.sent,
+            vec![("ShiftLeft", true, false), ("ShiftLeft", false, false)]
+        );
+    }
+
+    /// A down that fails may still have pressed the key: it stays held, so it is let go later.
+    #[test]
+    fn a_failed_down_is_still_released() {
+        let a = physical_key("KeyA").unwrap();
+        let mut held = Vec::new();
+        let mut input = FakeInput {
+            fail: vec![0],
+            ..FakeInput::default()
+        };
+        assert!(press_key(&mut held, &mut input, a, true).is_err());
+        assert_eq!(held, vec![a]);
+        press_key(&mut held, &mut input, a, false).unwrap();
+        assert!(held.is_empty());
+        assert_eq!(input.sent, vec![("KeyA", false, false)]);
     }
 
     #[test]

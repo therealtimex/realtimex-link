@@ -27,6 +27,7 @@ use crate::actions::{is_physical_key, run_actions};
 use crate::backend::Backend;
 use crate::clients::Authenticated;
 use crate::clipboard_share::{self, ClipboardShare, Pulled, POLL_MS};
+use crate::codes::physical_key;
 use crate::error::{ApiError, ApiResult};
 use crate::file_browse;
 use crate::host::Host;
@@ -1095,27 +1096,47 @@ fn close_peer(shared: &Arc<Shared>, session: u64) {
 /// sure none of its actions are still running.
 async fn release_keys(backend: &Arc<Backend>, peer: &Peer) {
     let held: Vec<String> = std::mem::take(&mut *lock(&peer.held_keys));
-    if held.is_empty() {
-        return;
+    for up in release_actions(&held) {
+        // One up each: an up that fails doesn't keep the others down (rtx-control keeps the
+        // failed one held and lets go of it when its session ends), and no batch limit applies.
+        let _ = run_actions(backend, Some(&Value::Array(vec![up])), true).await;
     }
-    let ups: Vec<Value> = held
-        .iter()
-        .rev()
-        .map(|code| json!({ "type": "key", "code": code, "down": false }))
-        .collect();
-    let _ = run_actions(backend, Some(&Value::Array(ups)), true).await;
 }
 
-/// Note the physical keys a batch presses and lets go of, before it runs: a view that closes
-/// part way through still has them released.
-fn note_held_keys(held: &mut Vec<String>, actions: &[Value]) {
-    for action in actions.iter().filter(|a| is_physical_key(a)) {
-        let (Some(code), Some(down)) = (
-            action.get("code").and_then(Value::as_str),
-            action.get("down").and_then(Value::as_bool),
-        ) else {
-            continue;
-        };
+/// The ups for these held keys, the last pressed first.
+fn release_actions(held: &[String]) -> Vec<Value> {
+    held.iter()
+        .rev()
+        .map(|code| json!({ "type": "key", "code": code, "down": false }))
+        .collect()
+}
+
+/// The physical key actions Link presses: a code with a key here, and a boolean `down`.
+fn key_transitions(actions: &[Value]) -> impl Iterator<Item = (&str, bool)> {
+    actions
+        .iter()
+        .filter(|a| is_physical_key(a))
+        .filter_map(|action| {
+            let code = action.get("code").and_then(Value::as_str)?;
+            let down = action.get("down").and_then(Value::as_bool)?;
+            physical_key(code).map(|_| (code, down))
+        })
+}
+
+/// Before a batch runs: every key it may press is held, and none it lets go of is forgotten
+/// yet. If the batch fails or stops part way, its downs and the keys held before it are all
+/// released (review of !6).
+fn hold_downs(held: &mut Vec<String>, actions: &[Value]) {
+    for (code, down) in key_transitions(actions) {
+        if down && !held.iter().any(|held| held == code) {
+            held.push(code.to_string());
+        }
+    }
+}
+
+/// After the whole batch ran: the keys it let go of are no longer held.
+fn settle_held(held: &mut Vec<String>, actions: &[Value]) {
+    for (code, down) in key_transitions(actions) {
         if !down {
             held.retain(|held| held != code);
         } else if !held.iter().any(|held| held == code) {
@@ -1338,10 +1359,6 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
         );
         return;
     }
-    note_held_keys(
-        &mut lock(&peer.held_keys),
-        list.map_or(&[][..], Vec::as_slice),
-    );
     // A drag's press (#2736): let go of it if this view closes before its release arrives.
     for action in list.into_iter().flatten() {
         let button = action
@@ -1361,11 +1378,19 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
         }
     }
     let running = peer.running.read().await;
+    // Closed while it waited: close_peer releases what the view held, and nothing more runs.
+    if peer.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    let actions = list.map_or(&[][..], Vec::as_slice);
+    hold_downs(&mut lock(&peer.held_keys), actions);
     let performed = perform_actions(&shared, &client, message.get("actions"), light, true).await;
-    if performed.is_err() {
-        // A failed batch (input-blocked, screen-locked, an error part way) releases every key
-        // the view holds: it can't know which of its actions ran, so it forgets its own (#2909).
-        release_keys(&shared.backend, &peer).await;
+    match &performed {
+        Ok(_) => settle_held(&mut lock(&peer.held_keys), actions),
+        // A failed batch (input-blocked, screen-locked, an error part way, a refused action)
+        // releases every key the view holds: it can't know which of its actions ran, so it
+        // forgets its own (#2909).
+        Err(_) => release_keys(&shared.backend, &peer).await,
     }
     drop(running);
     watch_held_keys(&shared, &peer);
@@ -1789,27 +1814,88 @@ async fn stop(
 mod tests {
     use super::*;
 
+    fn key(code: &str, down: bool) -> Value {
+        json!({ "type": "key", "code": code, "down": down })
+    }
+
+    fn codes(held: &[String]) -> Vec<&str> {
+        held.iter().map(String::as_str).collect()
+    }
+
     #[test]
-    fn held_keys_follow_a_batch_in_order() {
+    fn held_keys_follow_a_batch_that_ran() {
         let mut held = Vec::new();
         let batch = [
-            json!({ "type": "key", "code": "ShiftLeft", "down": true }),
-            json!({ "type": "key", "code": "KeyA", "down": true }),
+            key("ShiftLeft", true),
+            key("KeyA", true),
             json!({ "type": "move", "x": 1, "y": 2 }),
             // A repeat keeps its place; an up for a key not held changes nothing.
             json!({ "type": "key", "code": "KeyA", "down": true, "repeat": true }),
-            json!({ "type": "key", "code": "KeyB", "down": false }),
+            key("KeyB", false),
             json!({ "type": "key", "keys": "ctrl+l" }),
-            json!({ "type": "key", "code": "ControlLeft", "down": true }),
-            json!({ "type": "key", "code": "KeyA", "down": false }),
+            key("ControlLeft", true),
+            key("KeyA", false),
         ];
-        note_held_keys(&mut held, &batch);
-        assert_eq!(held, vec!["ShiftLeft", "ControlLeft"]);
-        note_held_keys(
-            &mut held,
-            &[json!({ "type": "key", "code": "ShiftLeft", "down": false })],
-        );
-        assert_eq!(held, vec!["ControlLeft"]);
+        hold_downs(&mut held, &batch);
+        assert_eq!(codes(&held), ["ShiftLeft", "KeyA", "ControlLeft"]);
+        settle_held(&mut held, &batch);
+        assert_eq!(codes(&held), ["ShiftLeft", "ControlLeft"]);
+        let up = [key("ShiftLeft", false)];
+        hold_downs(&mut held, &up);
+        settle_held(&mut held, &up);
+        assert_eq!(codes(&held), ["ControlLeft"]);
+    }
+
+    /// Review of !6: a down that ran before a later action failed is still released.
+    #[test]
+    fn a_batch_that_fails_part_way_releases_what_it_pressed() {
+        let mut held = Vec::new();
+        let batch = [
+            key("ShiftLeft", true),
+            json!({ "type": "move", "x": 1, "y": 2 }),
+            key("ShiftLeft", false),
+        ];
+        hold_downs(&mut held, &batch);
+        // The move failed: no settle_held. What release_keys sends:
+        assert_eq!(release_actions(&held), vec![key("ShiftLeft", false)]);
+    }
+
+    /// Review of !6: a refused batch's up for a held key doesn't forget it.
+    #[test]
+    fn a_refused_batch_keeps_the_keys_held_before_it() {
+        let mut held = vec!["ShiftLeft".to_string()];
+        let batch = [json!({ "type": "zap" }), key("ShiftLeft", false)];
+        assert!(crate::actions::plan_actions(Some(&Value::Array(batch.to_vec())), true).is_err());
+        hold_downs(&mut held, &batch);
+        assert_eq!(release_actions(&held), vec![key("ShiftLeft", false)]);
+    }
+
+    /// Review of !6: codes Link skips are not tracked, and more keys than a batch takes are all
+    /// released.
+    #[test]
+    fn only_keys_link_presses_are_held_and_all_of_them_are_released() {
+        let mut held = Vec::new();
+        let mut unknown: Vec<Value> = (0..50).map(|n| key(&format!("Lang{n}"), true)).collect();
+        unknown.push(key("ShiftLeft", true));
+        hold_downs(&mut held, &unknown);
+        settle_held(&mut held, &unknown);
+        assert_eq!(codes(&held), ["ShiftLeft"]);
+
+        let all: Vec<Value> = crate::codes::KEYS
+            .iter()
+            .map(|k| key(k.code, true))
+            .collect();
+        assert!(all.len() > crate::actions::MAX_ACTIONS);
+        let mut held = Vec::new();
+        hold_downs(&mut held, &all);
+        let ups = release_actions(&held);
+        assert_eq!(ups.len(), crate::codes::KEYS.len());
+        assert_eq!(ups[0], key("NumpadEqual", false));
+        // Each up goes alone, so every one is a valid batch.
+        for up in ups {
+            let one = crate::actions::plan_actions(Some(&json!([up])), true).unwrap();
+            assert_eq!(one[0].len(), 1);
+        }
     }
 
     #[test]
