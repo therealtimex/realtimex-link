@@ -131,24 +131,24 @@ notarize() {
   fi
 }
 
-# Stapling fetches the ticket from Apple's CloudKit, whose connection drops now and then ("The
-# network connection was lost", error 68) right after notarization was Accepted. Only the fetch is
-# retried; the file is already notarized.
-staple() {
-  local attempt
+# stapler staple and stapler validate both fetch the ticket from Apple's CloudKit, whose connection
+# drops now and then ("The network connection was lost", error 68) right after notarization was
+# Accepted. Only that fetch is retried; the file is already notarized.
+stapler() {
+  local action="$1" file="$2" attempt
   for attempt in 1 2 3 4 5; do
-    if xcrun stapler staple "$1"; then return 0; fi
-    echo "WARNING: stapling $(basename "$1") failed (attempt $attempt of 5)" >&2
+    if xcrun stapler "$action" "$file"; then return 0; fi
+    echo "WARNING: stapler $action $(basename "$file") failed (attempt $attempt of 5)" >&2
     [ "$attempt" -lt 5 ] && sleep $((attempt * 15))
   done
-  echo "ERROR: couldn't staple $(basename "$1")" >&2
+  echo "ERROR: stapler $action $(basename "$file") failed 5 times" >&2
   exit 1
 }
 
 /usr/bin/ditto -c -k --keepParent "$APP" "$WORK/notarize.zip"
 notarize "$WORK/notarize.zip"
-staple "$APP"
-xcrun stapler validate "$APP"
+stapler staple "$APP"
+stapler validate "$APP"
 spctl --assess --type execute --verbose=2 "$APP"
 
 # The signed archive, under the unsigned one's name (RealTimeX's pin and installers use it).
@@ -159,6 +159,6 @@ bash "$IN/tree/packaging/macos/dmg.sh" "$APP" "$OUT/$DMG"
 codesign --force --timestamp ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} --sign "$IDENTITY" "$OUT/$DMG"
 check_team "$OUT/$DMG"
 notarize "$OUT/$DMG"
-staple "$OUT/$DMG"
+stapler staple "$OUT/$DMG"
 spctl --assess --type open --context context:primary-signature --verbose=2 "$OUT/$DMG"
 ls -l "$OUT"
