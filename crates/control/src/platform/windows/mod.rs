@@ -42,7 +42,7 @@ use self::clipboard::Clipboard;
 use self::keymap::{named_vk, normalise, physical_press, unshifted_scan, Desktop, Press, Vk};
 use crate::codes::PhysicalKey;
 use crate::keys::{from_keysym, Key};
-use crate::platform::{Button, InputError, Shot};
+use crate::platform::{Button, InputError, PasteGap, Shot};
 
 mod clipboard;
 mod keymap;
@@ -93,6 +93,7 @@ pub struct Input {
     own_seq: Option<u32>,
     /// The last paste's text to put back, when, and how many tries are left.
     restore: Option<(clipboard::Saved, std::time::Instant, u8)>,
+    gap: PasteGap,
 }
 
 impl Input {
@@ -108,6 +109,7 @@ impl Input {
             clipboard: WinClipboard::new()?,
             own_seq: None,
             restore: None,
+            gap: PasteGap::default(),
         })
     }
 
@@ -226,10 +228,12 @@ impl Input {
     /// Windows Terminal and most others accept). The previous text comes back later
     /// (`restore_clipboard`).
     pub fn paste_text(&mut self, text: &str, terminal: bool) -> Result<()> {
+        self.gap.wait();
         let pending = self.restore.take().map(|(saved, _, _)| saved);
         let saved = clipboard::put_text(&mut self.clipboard, text, pending)?;
         self.note_own_write();
         let sent = press_paste(terminal);
+        self.gap.pasted();
         if saved.previous.is_some() {
             self.restore = Some((
                 saved,
@@ -287,13 +291,16 @@ impl Input {
     /// Ctrl+V: a folder copies them in, an app such as RealTimeX attaches them.
     pub fn paste_files(&mut self, paths: &[String]) -> Result<()> {
         // They stay on the clipboard, as after a local paste.
+        self.gap.wait();
         self.restore = None;
         self.clipboard.open()?;
         let put = self.clipboard.replace_files(paths);
         self.clipboard.close();
         put?;
         self.note_own_write();
-        press_paste(false)
+        let sent = press_paste(false);
+        self.gap.pasted();
+        sent
     }
 
     /// Put a PNG on the clipboard (the registered "PNG" format) with the same picture as a
@@ -301,13 +308,16 @@ impl Input {
     /// image from CF_DIB; PNG alone pasted nothing in RealTimeX (#2747). It stays on the
     /// clipboard, as after a local paste.
     pub fn paste_image(&mut self, png: &[u8], dib: Option<&[u8]>) -> Result<()> {
+        self.gap.wait();
         self.restore = None;
         self.clipboard.open()?;
         let put = self.clipboard.replace_png(png, dib);
         self.clipboard.close();
         put?;
         self.note_own_write();
-        press_paste(false)
+        let sent = press_paste(false);
+        self.gap.pasted();
+        sent
     }
 }
 

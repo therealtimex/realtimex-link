@@ -109,7 +109,7 @@ jobs:
           cargo test --locked -p rtx-linkd -p rtx-link -p rtx-screens
           # rtx-control's physical key table and held-key rules (#2909); its other tests need a
           # desktop.
-          cargo test --locked -p rtx-control -- codes:: control::tests
+          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests
       # Lints, once (Linux): warnings show in the log; errors fail the build.
       - name: Clippy (Linux)
         if: matrix.name == 'linux-x86_64'

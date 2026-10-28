@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::codes::{Modifier, PhysicalKey};
 use crate::keys::{from_keysym, Key};
-use crate::platform::{Button, ClipboardContent};
+use crate::platform::{Button, ClipboardContent, PasteGap};
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
@@ -375,6 +375,7 @@ pub struct Input {
     own_change: Option<isize>,
     /// The text the last paste took off the pasteboard, and when it goes back.
     restore: Option<(String, Instant)>,
+    gap: PasteGap,
 }
 
 impl Input {
@@ -403,6 +404,7 @@ impl Input {
             last_click: None,
             own_change: None,
             restore: None,
+            gap: PasteGap::default(),
             click_state: 1,
         })
     }
@@ -574,6 +576,7 @@ impl Input {
     /// a Finder window copies them in, an app such as RealTimeX attaches them. They stay on the
     /// pasteboard, as after a local paste.
     pub fn paste_files(&mut self, paths: &[String]) -> Result<()> {
+        self.gap.wait();
         self.restore = None;
         put_files_on_pasteboard(paths)?;
         self.note_own_write();
@@ -582,6 +585,7 @@ impl Input {
 
     /// Put a PNG on the general pasteboard (`public.png`) and press ⌘V. (A bitmap is Windows'.)
     pub fn paste_image(&mut self, png: &[u8], _dib: Option<&[u8]>) -> Result<()> {
+        self.gap.wait();
         self.restore = None;
         put_png_on_pasteboard(png)?;
         self.note_own_write();
@@ -592,6 +596,7 @@ impl Input {
     /// written in-process, not by starting pbcopy, and the text that was there comes back later
     /// (`restore_clipboard`). Other content (an image, files) stays replaced, as before.
     pub fn paste_text(&mut self, text: &str, _terminal: bool) -> Result<()> {
+        self.gap.wait();
         let previous = match self.restore.take() {
             Some((previous, _)) => Some(previous),
             None => match read_pasteboard() {
@@ -645,6 +650,7 @@ impl Input {
             }
             post(event)?;
         }
+        self.gap.pasted();
         Ok(())
     }
 }
