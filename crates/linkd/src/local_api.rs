@@ -328,11 +328,11 @@ async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answe
     };
     let background = body.get("background").and_then(Value::as_bool) == Some(true);
     let mut roles = state.window.lock().unwrap_or_else(|p| p.into_inner());
-    let (owner, show) = claim(&mut roles, role, pid, background, crate::lock::alive);
+    let (owner, show) = claim(&mut roles, role, pid, background, crate::lock::link_app_alive);
     if show {
         state.show_window.fetch_add(1, Ordering::Relaxed);
     }
-    let tray = roles.get("tray").copied().is_some_and(crate::lock::alive);
+    let tray = roles.get("tray").copied().is_some_and(crate::lock::link_app_alive);
     Ok(Json(json!({ "owner": owner, "tray": tray })))
 }
 
@@ -695,8 +695,12 @@ async fn use_realtimex(State(state): State<Shared>) -> Answer {
 /// item (instance.rs): another answers enabled and available false, defaultInstance false.
 async fn autostart(State(state): State<Shared>) -> Answer {
     let standard = crate::paths::is_standard();
+    // Under Link's service the daemon is SYSTEM, whose HKCU isn't the owner's: the owner's login
+    // item was made sure of when Start with this computer was turned on, and stays while it is
+    // (SD §1; QA of !12).
+    let enabled = crate::service::active() || crate::autostart::enabled();
     Ok(Json(json!({
-        "enabled": standard && crate::autostart::enabled(),
+        "enabled": standard && enabled,
         "available": standard && crate::autostart::available(),
         "optedOut": state.host.start_at_login_opted_out(),
         "defaultInstance": standard,
@@ -1004,6 +1008,19 @@ mod tests {
         roles.insert("window".into(), 9);
         assert_eq!(claim(&mut roles, "window", 6, true, alive), (true, false));
         assert_eq!(roles["window"], 6);
+    }
+
+    /// QA of !12: the service's daemon outlives a sign-out, and the gone window's pid went to
+    /// another process. Only a pid that is still Link's window counts, so the next sign-in's
+    /// login item and window open.
+    #[test]
+    fn a_window_pid_reused_by_another_process_doesnt_block_the_next_window() {
+        let mut roles = std::collections::HashMap::new();
+        // 14976 was the window; now it's a conhost: alive, but not rtx-link.
+        let still_link = |pid: u32| pid != 14976;
+        roles.insert("window".to_string(), 14976);
+        assert_eq!(claim(&mut roles, "window", 15120, true, still_link), (true, false));
+        assert_eq!(roles["window"], 15120);
     }
 
     #[test]
