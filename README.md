@@ -145,7 +145,8 @@ kebab-case.
   (`/<surface>/<id>`), `x-forwarded-proto: https`, `x-forwarded-for` (the relay's client address),
   `x-realtimex-relay-surface`, `x-realtimex-relay-source: public-relay`, and
   `x-realtimex-link-origin: <token>` (RealTimeX accepts relayed requests only with it). The client's own `x-forwarded-*` and `x-realtimex-*` headers
-  are dropped. Paths follow the enrollment's `pathAllowlist`, else relayConnector.cjs's defaults
+  are dropped, except the phone's own on `m` (0.2.5, realtimex-link#8): `x-realtimex-mobile-device-token`,
+  `x-realtimex-device-signature`, `-timestamp`, `-nonce` and `x-realtimex-operator-capabilities`. Paths follow the enrollment's `pathAllowlist`, else relayConnector.cjs's defaults
   (`p` never leaves `/api/peer/v1`). The origin is kept in memory: RealTimeX sends it at each start
   and when Link's `startedAt` changes. With no target, or when nothing answers on it (it is then
   forgotten), the answer is 503 `{ error: "desktop offline", code: "desktop-offline" }` with

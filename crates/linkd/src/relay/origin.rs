@@ -832,4 +832,61 @@ mod tests {
         assert_eq!(&frames[1].payload[..], b"ok");
         assert_eq!(frames.last().unwrap().kind, frame::END);
     }
+
+    #[tokio::test]
+    async fn a_phones_request_reaches_the_origin_with_its_token_and_links_markers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                seen.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&seen).to_lowercase()
+        });
+        let registry = Registry::default();
+        registry.set(Origin {
+            targets: BTreeMap::from([("m".into(), port)]),
+            token: Some("t".repeat(32)),
+        });
+        let (data, _sent) = mpsc::channel(8);
+        let (control, _) = mpsc::unbounded_channel();
+        let send = Sender::new(data, control);
+        let (body, rx) = mpsc::channel(1);
+        drop(body);
+        let mut request = request();
+        request.surface = "m".into();
+        request.path = "/mb/chat".into();
+        request.public_host = "x.realtimex.ai".into();
+        request.public_prefix = "/m/ID".into();
+        // As the relay parser passes them on m.
+        request.headers = vec![
+            ("x-realtimex-mobile-device-token".into(), "device".into()),
+            ("x-realtimex-device-signature".into(), "signature".into()),
+        ];
+        http(9, request, rx, registry.target("m"), registry, None, send).await;
+        let seen = server.await.unwrap();
+        let count = |line: &str| seen.matches(line).count();
+        assert_eq!(count("x-realtimex-mobile-device-token: device\r\n"), 1);
+        assert_eq!(count("x-realtimex-device-signature: signature\r\n"), 1);
+        assert_eq!(count("x-realtimex-relay-source: public-relay\r\n"), 1);
+        assert_eq!(count("x-realtimex-relay-surface: m\r\n"), 1);
+        assert_eq!(count("x-realtimex-relay-surface"), 1);
+        assert_eq!(count("x-forwarded-for: 203.0.113.7\r\n"), 1);
+        assert_eq!(count("x-forwarded-host: x.realtimex.ai\r\n"), 1);
+        assert_eq!(
+            count(&format!("x-realtimex-link-origin: {}\r\n", "t".repeat(32))),
+            1
+        );
+    }
 }

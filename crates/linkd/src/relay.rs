@@ -86,6 +86,17 @@ fn account_subject(store: &crate::store::Store) -> Option<String> {
 pub const SURFACES: [&str; 6] = ["a", "e", "h", "m", "p", "d"];
 const REMOTE_CONTROL: &str = "d";
 const PEER: &str = "p";
+const MOBILE: &str = "m";
+/// The client headers the mobile surface passes on: the phone's device token and request
+/// signature, and the operator capabilities it declares. These are what RealTimeX reads from
+/// phones; every other x-realtimex-* header stays Link's, or is dropped.
+const MOBILE_HEADERS: [&str; 5] = [
+    "x-realtimex-mobile-device-token",
+    "x-realtimex-device-signature",
+    "x-realtimex-device-signature-timestamp",
+    "x-realtimex-device-signature-nonce",
+    "x-realtimex-operator-capabilities",
+];
 /// Desktop messaging carries only the peer wire: a policy may narrow it, never widen it.
 const PEER_CEILING: &str = "/api/peer/v1";
 const DEFAULT_API_BASE: &str = "https://marketplace-api-next.realtimex.ai";
@@ -2404,13 +2415,15 @@ impl Connection {
                             .filter(|p| !p.is_empty()),
                     );
                 }
-                // The forwarding headers, and RealTimeX's relay markers, are Link's to set.
+                // The forwarding headers, and RealTimeX's relay markers, are Link's to set. The
+                // phone's own credentials pass on the mobile surface only.
+                let phone = surface == MOBILE && MOBILE_HEADERS.contains(&name.as_str());
                 if name.is_empty()
                     || HOP_BY_HOP.contains(&name.as_str())
                     || name == "host"
                     || name == "content-length"
                     || name.starts_with("x-forwarded-")
-                    || name.starts_with("x-realtimex-")
+                    || (name.starts_with("x-realtimex-") && !phone)
                     || (websocket && name.starts_with("sec-websocket-"))
                     || name.contains(['\r', '\n'])
                 {
@@ -3054,6 +3067,75 @@ mod tests {
         assert!(connection()
             .request(&open("e", "x.realtimex.ai", "/embed"), false)
             .is_err());
+    }
+
+    /// What the phone sends: its five credentials, and headers it may not set.
+    fn phone(surface: &str, host: &str, path: &str) -> Value {
+        let mut value = open(surface, host, path);
+        let headers = value["headers"].as_object_mut().unwrap();
+        for name in MOBILE_HEADERS {
+            headers.insert(name.to_uppercase(), json!(format!("{name}-value")));
+        }
+        headers.insert("X-RealTimeX-Relay-Surface".into(), json!("d"));
+        headers.insert("X-RealTimeX-Link-Origin".into(), json!("forged"));
+        headers.insert("X-Forwarded-Host".into(), json!("evil"));
+        headers.insert("X-RealTimeX-Desktop-Session".into(), json!("session"));
+        headers.insert("X-RealTimeX-Desktop-Authorization".into(), json!("bearer"));
+        value
+    }
+
+    fn x_realtimex(request: &RelayRequest) -> Vec<String> {
+        let mut names: Vec<String> = request
+            .headers
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| n.starts_with("x-realtimex-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_mobile_surface_passes_the_phones_credentials_and_nothing_else() {
+        let mut answer = answer();
+        answer["surfaces"].as_array_mut().unwrap().extend([
+            json!({ "surface": "m", "hostname": "x.realtimex.ai", "pathPrefix": format!("/m/{ID}"), "publicBaseUrl": format!("https://x.realtimex.ai/m/{ID}/") }),
+            json!({ "surface": "e", "hostname": "c.realtimex.ai", "pathPrefix": format!("/e/{ID}"), "publicBaseUrl": format!("https://c.realtimex.ai/e/{ID}/") }),
+        ]);
+        let connection =
+            Connection::from_stored(&exposure_of(&answer).unwrap(), "i", "c".into()).unwrap();
+        let mut expected: Vec<String> = MOBILE_HEADERS.iter().map(|n| n.to_string()).collect();
+        expected.sort();
+        for websocket in [false, true] {
+            let request = connection
+                .request(&phone("m", "x.realtimex.ai", "/mb/chat"), websocket)
+                .unwrap();
+            assert_eq!(x_realtimex(&request), expected, "websocket {websocket}");
+            for name in MOBILE_HEADERS {
+                assert!(request
+                    .headers
+                    .contains(&(name.to_string(), format!("{name}-value"))));
+            }
+            // Link sets the forwarding headers and relay markers itself (relay/origin.rs).
+            assert!(!request
+                .headers
+                .iter()
+                .any(|(n, v)| n.starts_with("x-forwarded-") || v == "6.6.6.6"));
+        }
+        for (surface, host, path, websocket) in [
+            ("d", "x.realtimex.ai", "/remote-control/connect", false),
+            ("p", "s.realtimex.ai", "/api/peer/v1/hello", false),
+            ("a", "x.realtimex.ai", "/ar/abc/index.html", false),
+            ("a", "x.realtimex.ai", "/ar/abc/socket", true),
+            ("e", "c.realtimex.ai", "/embed/x", false),
+            ("e", "c.realtimex.ai", "/embed/socket", true),
+            ("h", "s.realtimex.ai", "/wh/token", false),
+        ] {
+            let request = connection
+                .request(&phone(surface, host, path), websocket)
+                .unwrap();
+            assert!(x_realtimex(&request).is_empty(), "{surface} {path}");
+        }
     }
 
     #[test]
