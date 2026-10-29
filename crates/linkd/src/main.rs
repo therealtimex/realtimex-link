@@ -21,6 +21,7 @@ mod dib;
 mod error;
 mod file_browse;
 mod files;
+mod helper;
 mod host;
 mod identity;
 mod install;
