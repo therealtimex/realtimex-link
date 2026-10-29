@@ -719,7 +719,9 @@ async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Ans
 /// service, which decides whether the caller may change it.
 async fn unattended(State(_state): State<Shared>) -> Answer {
     use crate::unattended::{body, Request, SUPPORTED};
-    if !SUPPORTED {
+    // Only this computer's own Link can start with it (SD C5): another instance (a development
+    // RealTimeX's) has no row, as with starting at login (Product/UX review of !12).
+    if !SUPPORTED || !crate::paths::is_standard() {
         return Ok(Json(body(false, None)));
     }
     let data_dir = crate::paths::data_dir().unwrap_or_default();

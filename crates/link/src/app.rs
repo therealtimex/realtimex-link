@@ -442,6 +442,9 @@ pub struct LinkApp {
     focused: bool,
     /// The window's title: the instance's name (instance.rs).
     title: String,
+    /// Give Start with this computer's switch the focus once it can take it: after its confirm
+    /// closes or its change is answered (contract §5).
+    focus_start_with_computer: bool,
 }
 
 impl LinkApp {
@@ -485,6 +488,7 @@ impl LinkApp {
             confirm: None,
             focused: false,
             title: crate::instance::current().name(),
+            focus_start_with_computer: false,
         }
     }
 
@@ -1808,7 +1812,9 @@ impl LinkApp {
         ui.add_space(4.0);
         let label = t("settings.startWithComputer");
         if !field("serviceInstalled") {
+            // What it would do, then why it can't (prototype v3): no switch, no badge.
             ui.label(semibold(label.as_str()));
+            caption(ui, t("settings.startWithComputerHelp"));
             alert(ui, Tone::Warning, &t("settings.serviceMissingTitle"), |ui| {
                 ui.label(t("settings.serviceMissing"));
             });
@@ -1839,7 +1845,13 @@ impl LinkApp {
             );
             if can_change {
                 ui.add_enabled_ui(!pending, |ui| {
-                    changed = toggle(ui, &mut on, &label).changed();
+                    let response = toggle(ui, &mut on, &label);
+                    // Disabled while a change applies: the focus waits for its answer.
+                    if self.focus_start_with_computer && !pending {
+                        response.request_focus();
+                        self.focus_start_with_computer = false;
+                    }
+                    changed = response.changed();
                 });
             } else {
                 let text = t(if on { "link.on" } else { "link.off" });
@@ -1863,6 +1875,7 @@ impl LinkApp {
                 self.confirm = Some(Confirm::StartWithComputer);
             } else {
                 set_unattended(&self.shared, &self.refresh, ctx, false);
+                self.focus_start_with_computer = true;
             }
         }
     }
@@ -1962,10 +1975,14 @@ impl LinkApp {
                 ),
                 Some(Confirm::StartWithComputer) => {
                     set_unattended(&self.shared, &self.refresh, ctx, true);
+                    self.focus_start_with_computer = true;
                 }
                 None => {}
             }
         } else if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if matches!(self.confirm, Some(Confirm::StartWithComputer)) {
+                self.focus_start_with_computer = true;
+            }
             self.confirm = None;
         }
     }
