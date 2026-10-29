@@ -25,6 +25,10 @@ control other computers from.
   skipped. A view's held keys are released when it closes, loses control, sends a batch that fails
   or is refused, or sends nothing for 30 s; macOS and Windows post the viewer's repeats, X11 and
   Wayland repeat on their own. The HTTP `actions` endpoint takes `keys` combos only.
+  **Headless GNOME Wayland** (0.2.6, realtimex-link#9): with no monitor attached, the session
+  records a 1920×1080 virtual monitor (Mutter's `RecordVirtual`) instead of the primary one, and
+  it goes away when the session stops. GNOME refuses remote sessions while the screen is locked
+  ("Session creation inhibited"), so a computer used only remotely needs automatic screen lock off.
 - **`rtx-screens`** (`crates/screens`): window and display screenshots, capture only. RealTimeX's
   recorder uses it too, pinned to a commit of this repo.
 - **`rtx-glibc-compat`** (`crates/glibc-compat`): the glibc 2.34 floor on Linux, linked into each

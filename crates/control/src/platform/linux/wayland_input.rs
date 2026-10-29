@@ -7,6 +7,10 @@
 //! rtx-control free of PipeWire linking, as rtx-capture's audio side does with PipeWire's CLI tools.
 //! A screenshot is the latest frame, so a live view is not held to one new pipeline (about
 //! half a second) per frame.
+//!
+//! A computer with no monitor attached (headless, #9) has no monitor to record: the session
+//! records a virtual monitor instead, which Mutter sizes from the stream's negotiated format, as
+//! gnome-remote-desktop does headless.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -32,6 +36,9 @@ const SC_BUS: &str = "org.gnome.Mutter.ScreenCast";
 const SC_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
 const SC_STREAM: &str = "org.gnome.Mutter.ScreenCast.Stream";
 const CURSOR_EMBEDDED: u32 = 1;
+/// The virtual monitor's size when no monitor is attached: Mutter makes it the size the stream
+/// negotiates.
+const VIRTUAL_SIZE: (u32, u32) = (1920, 1080);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 /// Frames read from the stream at most this often; Mutter sends one per repaint.
@@ -109,6 +116,8 @@ pub struct WaylandInput {
     /// whether this session owns it (its own paste).
     selection: Arc<Mutex<Selection>>,
     frames: Option<FrameStream>,
+    /// The virtual monitor's size, when the session records one (no monitor attached).
+    virtual_size: Option<(u32, u32)>,
     /// The last live-view frame: the stream frame it came from, the width it was made for.
     last_frame: Option<(u64, u32, super::super::Frame)>,
 }
@@ -136,7 +145,7 @@ struct FrameStream {
 }
 
 impl FrameStream {
-    fn start(node_id: u32) -> Result<Self> {
+    fn start(node_id: u32, size: Option<(u32, u32)>) -> Result<Self> {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
         let fifo = std::path::Path::new(&dir)
             .join(format!("rtx-control-frames-{}.bgrx", std::process::id()));
@@ -149,32 +158,7 @@ impl FrameStream {
         let mut command = Command::new("gst-launch-1.0");
         die_with_parent(&mut command);
         let mut child = command
-            .arg("-v")
-            .arg("pipewiresrc")
-            .arg(format!("path={node_id}"))
-            // Timestamps from arrival and a frame-rate cap in the caps: `max-rate` alone let 30
-            // full frames a second (263 MB/s at 1920x1200) through on GNOME 46 (#2683).
-            .args([
-                "always-copy=true",
-                "do-timestamp=true",
-                "!",
-                "videorate",
-                "drop-only=true",
-            ])
-            .arg(format!("max-rate={MAX_FRAME_RATE}"))
-            .args(["!"])
-            .arg(format!("video/x-raw,framerate={MAX_FRAME_RATE}/1"))
-            .args([
-                "!",
-                "videoconvert",
-                "!",
-                "video/x-raw,format=BGRx",
-                "!",
-                "filesink",
-            ])
-            .arg(format!("location={}", fifo.display()))
-            // Unbuffered: a whole frame reaches the reader as soon as GStreamer has it.
-            .args(["buffer-mode=unbuffered", "sync=false"])
+            .args(pipeline_args(node_id, size, &fifo))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -327,10 +311,26 @@ impl WaylandInput {
         );
         let sc_path: OwnedObjectPath = screencast.call("CreateSession", &(options,))?;
         let sc_session = Proxy::new_owned(conn.clone(), SC_BUS, sc_path, SC_SESSION)?;
-        let mut record: HashMap<&str, Value> = HashMap::new();
-        record.insert("cursor-mode", Value::U32(CURSOR_EMBEDDED));
-        // An empty connector records the primary monitor.
-        let stream_path: OwnedObjectPath = sc_session.call("RecordMonitor", &("", record))?;
+        let record = || -> HashMap<&str, Value> {
+            HashMap::from([("cursor-mode", Value::U32(CURSOR_EMBEDDED))])
+        };
+        // An empty connector records the primary monitor. With no monitor attached there is
+        // none: record a virtual one, of the size the frame pipeline asks for (#9). As a
+        // platform monitor, the desktop lays out on it as on a real one.
+        let mut virtual_size = None;
+        let stream_path: OwnedObjectPath = match sc_session.call("RecordMonitor", &("", record()))
+        {
+            Ok(path) => path,
+            Err(error) if no_monitor(&error.to_string()) => {
+                let mut properties = record();
+                properties.insert("is-platform", Value::Bool(true));
+                virtual_size = Some(VIRTUAL_SIZE);
+                sc_session
+                    .call("RecordVirtual", &(properties,))
+                    .context("no monitor attached, and Mutter recorded no virtual one")?
+            }
+            Err(error) => return Err(error.into()),
+        };
         let stream = Proxy::new_owned(conn.clone(), SC_BUS, stream_path.clone(), SC_STREAM)?;
 
         let (tx, rx) = mpsc::channel();
@@ -354,6 +354,7 @@ impl WaylandInput {
             clipboard_enabled: false,
             selection: Arc::new(Mutex::new(Selection::default())),
             frames: None,
+            virtual_size,
             last_frame: None,
         })
     }
@@ -436,7 +437,7 @@ impl WaylandInput {
             self.frames = None;
             // A new stream numbers its frames from 1 again: nothing cached may match them.
             self.last_frame = None;
-            self.frames = Some(FrameStream::start(self.node_id)?);
+            self.frames = Some(FrameStream::start(self.node_id, self.virtual_size)?);
         }
         let frames = self.frames.as_ref().unwrap();
         let before = frames.seq();
@@ -735,6 +736,43 @@ impl Drop for WaylandInput {
     }
 }
 
+/// Mutter's answer to RecordMonitor when there is no monitor to record (none attached).
+fn no_monitor(error: &str) -> bool {
+    error.contains("Unknown monitor")
+}
+
+/// gst-launch-1.0's arguments: the session's PipeWire node into `fifo` as raw BGRx frames. A
+/// virtual monitor's stream is held to `size` right at the source, so that is what it negotiates
+/// and Mutter sizes the monitor to.
+fn pipeline_args(node_id: u32, size: Option<(u32, u32)>, fifo: &std::path::Path) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-v".into(), "pipewiresrc".into(), format!("path={node_id}")];
+    // Timestamps from arrival and a frame-rate cap in the caps: `max-rate` alone let 30 full
+    // frames a second (263 MB/s at 1920x1200) through on GNOME 46 (#2683).
+    args.extend(["always-copy=true", "do-timestamp=true"].map(String::from));
+    if let Some((width, height)) = size {
+        args.extend(["!".into(), format!("video/x-raw,width={width},height={height}")]);
+    }
+    args.extend([
+        "!".into(),
+        "videorate".into(),
+        "drop-only=true".into(),
+        format!("max-rate={MAX_FRAME_RATE}"),
+        "!".into(),
+        format!("video/x-raw,framerate={MAX_FRAME_RATE}/1"),
+        "!".into(),
+        "videoconvert".into(),
+        "!".into(),
+        "video/x-raw,format=BGRx".into(),
+        "!".into(),
+        "filesink".into(),
+        format!("location={}", fifo.display()),
+        // Unbuffered: a whole frame reaches the reader as soon as GStreamer has it.
+        "buffer-mode=unbuffered".into(),
+        "sync=false".into(),
+    ]);
+    args
+}
+
 /// The negotiated size from `gst-launch-1.0 -v` output (the last caps line wins).
 fn frame_size_from_caps(text: &str) -> Option<(usize, usize)> {
     text.lines().rev().find_map(|line| {
@@ -752,7 +790,7 @@ fn frame_size_from_caps(text: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{die_with_parent, frame_size_from_caps};
+    use super::{die_with_parent, frame_size_from_caps, no_monitor, pipeline_args};
     use std::process::Command;
 
     #[test]
@@ -781,5 +819,30 @@ mod tests {
                    format=(string)BGRx, width=(int)1920, height=(int)1200, framerate=(fraction)0/1\n";
         assert_eq!(frame_size_from_caps(out), Some((1920, 1200)));
         assert_eq!(frame_size_from_caps("no caps here"), None);
+    }
+
+    #[test]
+    fn only_a_missing_monitor_records_a_virtual_one() {
+        // zbus's text for Mutter's answer on a computer with no monitor attached (#9).
+        assert!(no_monitor("org.freedesktop.DBus.Error.Failed: Unknown monitor"));
+        assert!(!no_monitor("org.freedesktop.DBus.Error.Failed: Session creation inhibited"));
+        assert!(!no_monitor("org.freedesktop.DBus.Error.ServiceUnknown"));
+    }
+
+    #[test]
+    fn a_virtual_monitors_stream_is_held_to_its_size_at_the_source() {
+        let fifo = std::path::Path::new("/run/user/1000/frames.bgrx");
+        let monitor = pipeline_args(42, None, fifo);
+        assert_eq!(
+            &monitor[..5],
+            ["-v", "pipewiresrc", "path=42", "always-copy=true", "do-timestamp=true"]
+        );
+        assert!(!monitor.iter().any(|arg| arg.contains("width=")));
+        assert_eq!(monitor.last().unwrap(), "sync=false");
+        let virtual_ = pipeline_args(42, Some((1920, 1080)), fifo);
+        // Right after pipewiresrc, before anything that could rescale.
+        assert_eq!(&virtual_[5..7], ["!", "video/x-raw,width=1920,height=1080"]);
+        assert_eq!(&virtual_[7..], &monitor[5..]);
+        assert!(virtual_.contains(&"location=/run/user/1000/frames.bgrx".to_string()));
     }
 }
