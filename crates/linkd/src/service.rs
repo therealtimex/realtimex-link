@@ -771,6 +771,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A conditional allow (SDDL XA) grants like a plain one: a folder whose only stranger's
+    /// write grant is one isn't trusted, and its choice goes (Review of !12).
+    #[test]
+    fn a_conditional_write_grant_makes_the_folder_untrusted() {
+        let root = scratch("conditional");
+        let conditional = "(XA;OICI;FA;;;WD;(Member_of {SID(WD)}))";
+        for on_config in [false, true] {
+            let dir = root.join(if on_config { "on-config" } else { "on-folder" });
+            assert_eq!(win::secure_tree(&dir, &[]).unwrap(), win::Trust::Kept);
+            let config = dir.join("unattended.json");
+            std::fs::write(&config, ENABLED).unwrap();
+            assert!(win::is_trusted(&dir) && win::is_trusted(&config));
+            // Owned by administrators still; only the extra conditional grant differs.
+            let target = if on_config { &config } else { &dir };
+            win::set_security(target, Some(&format!("{}{conditional}", win::MACHINE_DIR_SDDL)))
+                .unwrap();
+            assert!(!win::is_trusted(target), "on_config {on_config}");
+            assert_eq!(win::secure_tree(&dir, &[]).unwrap(), win::Trust::Reset);
+            assert!(!config.exists(), "the enabled choice is dropped");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The start-up path itself (prepare_machine_dir, then the log): nothing is written through
     /// a planted link, on the refusal path or after a repair.
     #[test]

@@ -571,7 +571,7 @@ pub const MACHINE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;F
 
 /// Give `path` administrators as owner and exactly `sddl`'s DACL (protected), or, with None,
 /// no ACEs of its own so that it only inherits from its folder (what `icacls /reset` does).
-fn set_security(path: &std::path::Path, sddl: Option<&str>) -> std::io::Result<()> {
+pub(crate) fn set_security(path: &std::path::Path, sddl: Option<&str>) -> std::io::Result<()> {
     let admins = Sid::parse("S-1-5-32-544").ok_or_else(std::io::Error::last_os_error)?;
     let security = Security::new(sddl.unwrap_or("D:"))?;
     let (mut present, mut defaulted): (BOOL, BOOL) = (0, 0);
@@ -630,6 +630,8 @@ const WRITE_RIGHTS: u32 = 0x0000_0002 // FILE_WRITE_DATA / ADD_FILE
     | 0x0008_0000 // WRITE_OWNER
     | 0x1000_0000 // GENERIC_ALL
     | 0x4000_0000; // GENERIC_WRITE
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 /// The only principals that may own or write Link's machine state: SYSTEM, administrators.
 const TRUSTED_SIDS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
 
@@ -674,10 +676,13 @@ pub fn is_trusted(path: &std::path::Path) -> bool {
                 return Some(false);
             }
             // ACE_HEADER { type: u8, flags: u8, size: u16 }, then the mask, then the SID.
-            let kind = unsafe { *ace.cast::<u8>() };
-            if kind != 0 {
-                // Only ACCESS_ALLOWED_ACE_TYPE grants; deny ACEs only take away.
-                continue;
+            // Fail closed (Review of !12): a plain deny only takes away; a plain allow is read
+            // below; any other kind (conditional or callback allows such as XA, object ACEs)
+            // may grant, so the folder isn't trusted.
+            match unsafe { *ace.cast::<u8>() } {
+                ACCESS_DENIED_ACE_TYPE => continue,
+                ACCESS_ALLOWED_ACE_TYPE => {}
+                _ => return Some(false),
             }
             let mask = unsafe { *(ace.cast::<u8>().add(4).cast::<u32>()) };
             let sid = unsafe { ace.cast::<u8>().add(8) } as PSID;
