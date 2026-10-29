@@ -41,6 +41,8 @@ const CURSOR_EMBEDDED: u32 = 1;
 const VIRTUAL_SIZE: (u32, u32) = (1920, 1080);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+/// How often a virtual monitor's first-frame wait checks the writer and nudges the pointer.
+const READY_POLL: Duration = Duration::from_millis(250);
 /// Frames read from the stream at most this often; Mutter sends one per repaint.
 const MAX_FRAME_RATE: u32 = 15;
 /// The frame pipe's buffer, asked for with F_SETPIPE_SZ.
@@ -146,23 +148,42 @@ struct FrameStream {
 
 impl FrameStream {
     fn start(node_id: u32, size: Option<(u32, u32)>) -> Result<Self> {
+        Self::spawn(|fifo| {
+            let mut command = Command::new("gst-launch-1.0");
+            command.args(pipeline_args(node_id, size, fifo));
+            command
+        })
+        .context("gst-launch-1.0 (install gstreamer1.0-tools and gstreamer1.0-pipewire)")
+    }
+
+    /// Run the frame writer `command` makes for the FIFO: it prints GStreamer's `-v` caps on
+    /// stdout and writes raw BGRx frames into the FIFO.
+    fn spawn(command: impl FnOnce(&std::path::Path) -> Command) -> Result<Self> {
+        // One FIFO per stream: a restarted stream, or a test's, never opens another's.
+        static STREAMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = STREAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
         let fifo = std::path::Path::new(&dir)
-            .join(format!("rtx-control-frames-{}.bgrx", std::process::id()));
+            .join(format!("rtx-control-frames-{}-{n}.bgrx", std::process::id()));
         let _ = std::fs::remove_file(&fifo);
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())?;
         // SAFETY: a valid NUL-terminated path.
         if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
             bail!("mkfifo: {}", std::io::Error::last_os_error());
         }
-        let mut command = Command::new("gst-launch-1.0");
+        let mut command = command(&fifo);
         die_with_parent(&mut command);
-        let mut child = command
-            .args(pipeline_args(node_id, size, &fifo))
+        let mut child = match command
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .context("gst-launch-1.0 (install gstreamer1.0-tools and gstreamer1.0-pipewire)")?;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&fifo);
+                return Err(error.into());
+            }
+        };
         let shared: Shared = Arc::default();
 
         let stdout = child.stdout.take().expect("piped stdout");
@@ -256,6 +277,29 @@ impl FrameStream {
     fn seq(&self) -> u64 {
         self.shared.0.lock().unwrap().seq
     }
+
+    /// Wait up to `timeout` for the first frame and return its size, calling `poke` between
+    /// waits (a pointer nudge makes Mutter send one). Fails as soon as the writer exits or the
+    /// stream ends without one.
+    fn wait_ready(&mut self, timeout: Duration, mut poke: impl FnMut()) -> Result<(usize, usize)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let latest = self.shared.0.lock().unwrap();
+                if latest.seq > 0 {
+                    return Ok((latest.width, latest.height));
+                }
+            }
+            if !self.running() {
+                bail!("the screen stream ended before its first frame");
+            }
+            if Instant::now() >= deadline {
+                bail!("no frame from the screen stream in {timeout:?}");
+            }
+            poke();
+            self.wait_newer(0, READY_POLL);
+        }
+    }
 }
 
 /// SIGKILL to the child when the thread that started it dies (#2670). `Drop` stops the pipeline on
@@ -344,14 +388,8 @@ impl WaylandInput {
         let node_id = rx
             .recv_timeout(STREAM_TIMEOUT)
             .map_err(|_| anyhow!("GNOME did not start the screen stream"))??;
-        // A virtual monitor exists only while something reads its stream: read it from the
-        // start, so input sent before the first screenshot has a monitor to land on.
-        let frames = match virtual_size {
-            Some(size) => Some(FrameStream::start(node_id, Some(size))?),
-            None => None,
-        };
 
-        Ok(Self {
+        let mut input = Self {
             session,
             stream_path,
             node_id,
@@ -359,10 +397,23 @@ impl WaylandInput {
             clipboard_data: Arc::new(Mutex::new(HashMap::new())),
             clipboard_enabled: false,
             selection: Arc::new(Mutex::new(Selection::default())),
-            frames,
+            frames: None,
             virtual_size,
             last_frame: None,
-        })
+        };
+        // A virtual monitor exists only once its stream is negotiated and read: read it from the
+        // start and wait for its first frame, so the first input (before any screenshot) has a
+        // monitor to land on and is scaled to its size. A failure here drops `input`, which
+        // stops the session.
+        if let Some(size) = virtual_size {
+            let mut frames = FrameStream::start(node_id, Some(size))?;
+            let (width, height) = frames.wait_ready(FRAME_TIMEOUT, || {
+                let _ = input.nudge();
+            })?;
+            input.frame_size = Some((width as u32, height as u32));
+            input.frames = Some(frames);
+        }
+        Ok(input)
     }
 
     /// Frame pixels; known after the first screenshot.
@@ -796,8 +847,18 @@ fn frame_size_from_caps(text: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{die_with_parent, frame_size_from_caps, no_monitor, pipeline_args};
+    use super::{die_with_parent, frame_size_from_caps, no_monitor, pipeline_args, FrameStream};
     use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A stand-in for gst-launch-1.0: `script` runs in sh with the FIFO as $1.
+    fn writer(script: &'static str) -> impl FnOnce(&std::path::Path) -> Command {
+        move |fifo: &std::path::Path| {
+            let mut command = Command::new("sh");
+            command.args(["-c", script, "sh"]).arg(fifo);
+            command
+        }
+    }
 
     #[test]
     fn the_pipeline_dies_with_the_thread_that_started_it() {
@@ -850,5 +911,39 @@ mod tests {
         assert_eq!(&virtual_[5..7], ["!", "video/x-raw,width=1920,height=1080"]);
         assert_eq!(&virtual_[7..], &monitor[5..]);
         assert!(virtual_.contains(&"location=/run/user/1000/frames.bgrx".to_string()));
+    }
+
+    #[test]
+    fn a_virtual_monitor_is_ready_once_its_first_frame_arrives_late() {
+        // Caps and a 2x2 BGRx frame (16 bytes) only after a while, as a negotiating stream.
+        let mut frames = FrameStream::spawn(writer(
+            "sleep 0.6; echo '/GstPipeline:pipeline0/GstFileSink:filesink0.GstPad:sink: caps = \
+             video/x-raw, format=(string)BGRx, width=(int)2, height=(int)2'; \
+             printf '%016d' 0 > \"$1\"; sleep 5",
+        ))
+        .unwrap();
+        let mut pokes = 0;
+        let size = frames.wait_ready(Duration::from_secs(5), || pokes += 1).unwrap();
+        assert_eq!(size, (2, 2));
+        assert!(pokes >= 2, "nudged while waiting: {pokes}");
+        assert_eq!(frames.seq(), 1);
+    }
+
+    #[test]
+    fn a_virtual_monitor_whose_writer_exits_first_fails_at_once() {
+        let mut frames = FrameStream::spawn(writer("exit 1")).unwrap();
+        let started = Instant::now();
+        let error = frames.wait_ready(Duration::from_secs(5), || {}).unwrap_err();
+        assert!(error.to_string().contains("ended before its first frame"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_virtual_monitor_without_a_frame_gives_up_at_the_timeout() {
+        let mut frames = FrameStream::spawn(writer("sleep 5")).unwrap();
+        let error = frames
+            .wait_ready(Duration::from_millis(600), || {})
+            .unwrap_err();
+        assert!(error.to_string().contains("no frame"), "{error}");
     }
 }
