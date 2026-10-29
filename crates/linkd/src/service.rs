@@ -27,6 +27,8 @@ pub fn active() -> bool {
 #[cfg(windows)]
 pub fn transfers_dir() -> Result<std::path::PathBuf, crate::error::ApiError> {
     use crate::error::ApiError;
+    let machine = trusted_dir()
+        .ok_or_else(|| ApiError::coded(503, "machine-dir-unsafe", "RealTimeX Link's ProgramData folder isn't safe to use"))?;
     let session = crate::helper::console_session()
         .ok_or_else(|| ApiError::coded(409, "no-console", "Nobody is at this computer's screen"))?;
     let user = win::session_user(session).ok_or_else(|| {
@@ -36,7 +38,7 @@ pub fn transfers_dir() -> Result<std::path::PathBuf, crate::error::ApiError> {
             "Files can be pasted once someone signs in on this computer",
         )
     })?;
-    let base = crate::unattended::machine_dir().join("transfers");
+    let base = machine.join("transfers");
     match win::create_protected_dir(&base, None) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -55,7 +57,9 @@ pub fn transfers_dir() -> Result<std::path::PathBuf, crate::error::ApiError> {
 /// random name in `%ProgramData%\RealTimeX Link\updates`.
 #[cfg(windows)]
 pub fn update_dir() -> std::io::Result<std::path::PathBuf> {
-    let base = crate::unattended::machine_dir().join("updates");
+    let base = trusted_dir()
+        .ok_or_else(|| std::io::Error::other("Link's ProgramData folder isn't safe to use"))?
+        .join("updates");
     match win::create_protected_dir(&base, None) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -91,19 +95,57 @@ pub fn run() {
     std::process::exit(2);
 }
 
-/// The service's log, next to its choice: it has no console.
+/// The folder the service may write in: set only once [`prepare_machine_dir`] made it trusted,
+/// and never again after it refused it (Review of !12: nothing is written through an unchecked
+/// folder).
+#[cfg(windows)]
+static TRUSTED_DIR: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+/// Link's ProgramData folder, when it is trusted.
+#[cfg(windows)]
+pub fn trusted_dir() -> Option<std::path::PathBuf> {
+    TRUSTED_DIR.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// Make the folder trusted before anything reads or writes there (win::secure_tree): true when
+/// it is. A choice found in a folder that wasn't already only SYSTEM's and administrators' is
+/// dropped, so the service starts with the setting off. Used by the service at every start and
+/// by the installer (`rtx-linkd secure-machine-dir`) before it writes there.
+#[cfg(windows)]
+pub fn prepare_machine_dir(dir: &std::path::Path) -> bool {
+    match win::secure_tree(dir, &["updates", "transfers"]) {
+        Ok(trust) => {
+            *TRUSTED_DIR.write().unwrap_or_else(|p| p.into_inner()) = Some(dir.to_path_buf());
+            if trust == win::Trust::Reset {
+                log_line("the folder wasn't only SYSTEM's and administrators': its choice was dropped (off)");
+            }
+            true
+        }
+        Err(error) => {
+            *TRUSTED_DIR.write().unwrap_or_else(|p| p.into_inner()) = None;
+            log_line(&format!("Link's ProgramData folder isn't safe, so nothing there is used: {error}"));
+            false
+        }
+    }
+}
+
+/// The service's log: in its trusted folder, else the debugger output (it has no console).
 #[cfg(windows)]
 fn log_line(line: &str) {
     use std::io::Write;
-    let dir = crate::unattended::machine_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("service.log"))
-    {
-        let _ = writeln!(file, "{} {line}", chrono_like_now());
+    let text = format!("{} {line}", chrono_like_now());
+    if let Some(dir) = trusted_dir() {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("service.log"))
+        {
+            let _ = writeln!(file, "{text}");
+            return;
+        }
     }
+    let message = win::wide(&format!("RealTimeX Link Service: {text}\n"));
+    unsafe { win::OutputDebugStringW(message.as_ptr()) };
 }
 
 /// Seconds since the epoch: enough to order the log without a time crate.
@@ -139,8 +181,6 @@ mod windows_service {
     const OWNER_NOT_ADMIN: &str = "owner-not-admin";
     /// Its ProgramData folder couldn't be made safe: nothing in it is trusted.
     const MACHINE_DIR_UNSAFE: &str = "machine-dir-unsafe";
-    /// Scratch folders under it, emptied when the service starts.
-    const SCRATCH: [&str; 2] = ["updates", "transfers"];
 
     struct Status(win::HANDLE);
     // SAFETY: a service status handle is used from any thread.
@@ -251,12 +291,12 @@ mod windows_service {
     }
 
     async fn serve(stop: Arc<Notify>) {
-        log_line("service started");
         let shared = Arc::new(Shared::default());
-        match win::secure_tree(&machine_dir(), &SCRATCH) {
-            Ok(()) => shared.safe.store(true, std::sync::atomic::Ordering::Relaxed),
-            Err(error) => log_line(&format!("ProgramData folder isn't safe, trusting nothing: {error}")),
+        // Before anything is read or written there, the log included.
+        if super::prepare_machine_dir(&machine_dir()) {
+            shared.safe.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        log_line("service started");
         tokio::spawn(pipe_server(shared.clone()));
         // The folder this process ran a daemon on: process-wide state (paths) is set once, so
         // another owner's folder needs a fresh process (the SCM restarts the service).
@@ -688,6 +728,88 @@ mod tests {
         assert!(made.success());
         assert!(win::secure_tree(&fake, &[]).is_err());
         let _ = std::fs::remove_dir(&fake);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rtx-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    const ENABLED: &[u8] =
+        br#"{"enabled":true,"ownerSid":"S-1-5-21-1-2-3-500","dataDir":"C:/Users/admin/AppData/Roaming/RealTimeX Link"}"#;
+
+    #[test]
+    fn a_choice_planted_in_an_untrusted_folder_is_dropped_and_a_trusted_one_kept() {
+        let root = scratch("provenance");
+        // Someone else made the folder first, writable by everyone, with an enabled choice.
+        let planted = root.join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("unattended.json"), ENABLED).unwrap();
+        let granted = crate::util::command(r"C:\Windows\System32\icacls.exe")
+            .arg(&planted)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(F)"])
+            .status()
+            .unwrap();
+        assert!(granted.success());
+        assert!(!win::is_trusted(&planted));
+        assert_eq!(win::secure_tree(&planted, &[]).unwrap(), win::Trust::Reset);
+        assert!(!planted.join("unattended.json").exists(), "an untrusted choice is dropped");
+        assert!(!crate::unattended::Config::load(&planted).enabled, "so it starts off");
+        // A folder that is already Link's keeps its choice across starts.
+        let trusted = root.join("trusted");
+        assert_eq!(win::secure_tree(&trusted, &[]).unwrap(), win::Trust::Kept);
+        std::fs::write(trusted.join("unattended.json"), ENABLED).unwrap();
+        assert!(win::is_trusted(&trusted));
+        assert_eq!(win::secure_tree(&trusted, &[]).unwrap(), win::Trust::Kept);
+        assert!(crate::unattended::Config::load(&trusted).enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The start-up path itself (prepare_machine_dir, then the log): nothing is written through
+    /// a planted link, on the refusal path or after a repair.
+    #[test]
+    fn startup_writes_nothing_through_a_planted_link() {
+        let root = scratch("startup");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("sentinel.txt"), b"before").unwrap();
+        // The folder itself is a junction: refused, and the log never reaches the target.
+        let junction = root.join("RealTimeX Link");
+        let made = crate::util::command(r"C:\Windows\System32\cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(!super::prepare_machine_dir(&junction));
+        assert!(super::trusted_dir().is_none());
+        super::log_line("after a refusal");
+        let entries: Vec<_> = std::fs::read_dir(&target).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("sentinel.txt")]);
+        assert_eq!(std::fs::read(target.join("sentinel.txt")).unwrap(), b"before");
+        std::fs::remove_dir(&junction).unwrap();
+        // A real folder whose service.log is a link to a file elsewhere: the link goes, and the
+        // log is written to a file of its own.
+        let dir = root.join("Link");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = target.join("sentinel.txt");
+        let linked = crate::util::command(r"C:\Windows\System32\cmd.exe")
+            .args(["/C", "mklink"])
+            .arg(dir.join("service.log"))
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(linked.success());
+        assert!(super::prepare_machine_dir(&dir));
+        super::log_line("after a repair");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"before", "the link's target is untouched");
+        let log = std::fs::read_to_string(dir.join("service.log")).unwrap();
+        assert!(log.contains("after a repair"));
+        *super::TRUSTED_DIR.write().unwrap() = None;
         let _ = std::fs::remove_dir_all(&root);
     }
 }

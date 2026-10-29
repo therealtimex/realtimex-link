@@ -95,16 +95,16 @@ Section "Install"
   ${EndIf}
   SetOutPath "$TEMP"
 
-  ; ProgramData\RealTimeX Link holds the service's choice (unattended.json): SYSTEM and
-  ; administrators write, users only read, nothing inherited from ProgramData (which lets users
-  ; create files).
-  CreateDirectory "$APPDATA\${APP}"
-  ; Owned by administrators (a folder another user made first is taken back), only these grants,
-  ; and everything in it inheriting them. The service checks and redoes this itself at every
-  ; start, and trusts nothing there when it can't (crates/linkd/src/service/win.rs secure_tree).
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /setowner *S-1-5-32-544 /T /C /L'
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX'
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}\*" /reset /T /C /L'
+  ; ProgramData\RealTimeX Link holds the service's choice (unattended.json). Before anything is
+  ; written there, rtx-linkd makes it trusted, as the service does at every start: no link,
+  ; administrators as owner, SYSTEM and administrators write, users read, nothing else; a choice
+  ; left in a folder that wasn't already like that is dropped. If it can't, nothing is written.
+  nsExec::ExecToLog '"$PLUGINSDIR\payload\rtx-linkd.exe" secure-machine-dir'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP "${APP} could not secure its folder in ProgramData (rtx-linkd: $0)."
+    Abort
+  ${EndIf}
   WriteUninstaller "$APPDATA\${APP}\Uninstall ${APP}.exe"
 
   ; The service: created, or pointed at this install when it exists; restarted if it fails.

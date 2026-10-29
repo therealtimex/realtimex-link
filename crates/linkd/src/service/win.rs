@@ -205,6 +205,17 @@ extern "system" {
         dacl: *mut c_void,
         sacl: *mut c_void,
     ) -> u32;
+    pub fn GetNamedSecurityInfoW(
+        name: *const u16,
+        kind: i32,
+        information: u32,
+        owner: *mut PSID,
+        group: *mut PSID,
+        dacl: *mut *mut c_void,
+        sacl: *mut *mut c_void,
+        descriptor: *mut *mut c_void,
+    ) -> u32;
+    pub fn GetAce(acl: *mut c_void, index: u32, ace: *mut *mut c_void) -> BOOL;
     pub fn GetSecurityDescriptorDacl(
         descriptor: *mut c_void,
         present: *mut BOOL,
@@ -245,6 +256,7 @@ extern "system" {
     pub fn FindClose(find: HANDLE) -> BOOL;
     pub fn CreateDirectoryW(path: *const u16, attributes: *const SECURITY_ATTRIBUTES) -> BOOL;
     pub fn GetNamedPipeClientProcessId(pipe: HANDLE, pid: *mut u32) -> BOOL;
+    pub fn OutputDebugStringW(text: *const u16);
 }
 
 #[link(name = "wtsapi32")]
@@ -607,12 +619,118 @@ fn is_reparse(path: &std::path::Path) -> bool {
 /// entry in it inheriting only that. Junctions and links planted in it are removed (the link,
 /// never what it points at); the scratch folders (`clear`) are emptied whole. Any failure is an
 /// error: the service then trusts nothing there.
-pub fn secure_tree(dir: &std::path::Path, clear: &[&str]) -> std::io::Result<()> {
+/// The access rights that let a principal change an object or what is in it.
+const WRITE_RIGHTS: u32 = 0x0000_0002 // FILE_WRITE_DATA / ADD_FILE
+    | 0x0000_0004 // FILE_APPEND_DATA / ADD_SUBDIRECTORY
+    | 0x0000_0010 // FILE_WRITE_EA
+    | 0x0000_0040 // FILE_DELETE_CHILD
+    | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x1000_0000 // GENERIC_ALL
+    | 0x4000_0000; // GENERIC_WRITE
+/// The only principals that may own or write Link's machine state: SYSTEM, administrators.
+const TRUSTED_SIDS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
+
+/// Whether only SYSTEM and administrators own and can write `path` (its inherited ACEs
+/// included): what it holds could only have come from them.
+pub fn is_trusted(path: &std::path::Path) -> bool {
+    if is_reparse(path) {
+        return false;
+    }
+    let name = wide(&path.to_string_lossy());
+    let (mut owner, mut dacl, mut descriptor): (PSID, *mut c_void, *mut c_void) =
+        (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return false;
+    }
+    let trusted = (|| {
+        let owner = sid_text(owner)?;
+        if !TRUSTED_SIDS.contains(&owner.as_str()) {
+            return Some(false);
+        }
+        // No DACL at all is full access for everyone.
+        if dacl.is_null() {
+            return Some(false);
+        }
+        // ACL: revision, padding, size (u16), then the ACE count (u16).
+        let count = unsafe { *(dacl.cast::<u8>().add(4).cast::<u16>()) };
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Some(false);
+            }
+            // ACE_HEADER { type: u8, flags: u8, size: u16 }, then the mask, then the SID.
+            let kind = unsafe { *ace.cast::<u8>() };
+            if kind != 0 {
+                // Only ACCESS_ALLOWED_ACE_TYPE grants; deny ACEs only take away.
+                continue;
+            }
+            let mask = unsafe { *(ace.cast::<u8>().add(4).cast::<u32>()) };
+            let sid = unsafe { ace.cast::<u8>().add(8) } as PSID;
+            if mask & WRITE_RIGHTS != 0 && !sid_text(sid).is_some_and(|s| TRUSTED_SIDS.contains(&s.as_str())) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    })()
+    .unwrap_or(false);
+    unsafe { LocalFree(descriptor) };
+    trusted
+}
+
+/// What [`secure_tree`] found: the folder was already only SYSTEM's and administrators', so
+/// its choice is theirs; or it wasn't, and the choice it held was dropped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Trust {
+    Kept,
+    Reset,
+}
+
+/// The files that authorise something: kept only from a tree that was already trusted.
+const AUTHORISING: [&str; 2] = ["unattended.json", "unattended.json.new"];
+
+pub fn secure_tree(dir: &std::path::Path, clear: &[&str]) -> std::io::Result<Trust> {
     if is_reparse(dir) {
         return Err(std::io::Error::other(format!("{} is a link", dir.display())));
     }
+    // Decided before anything changes: repairing the permissions must not bless what someone
+    // else left in the folder (Review of !12).
+    let trust = if !dir.exists() {
+        Trust::Kept
+    } else if is_trusted(dir)
+        && AUTHORISING
+            .iter()
+            .map(|name| dir.join(name))
+            .all(|file| !file.exists() || is_trusted(&file))
+    {
+        Trust::Kept
+    } else {
+        Trust::Reset
+    };
     std::fs::create_dir_all(dir)?;
     set_security(dir, Some(MACHINE_DIR_SDDL))?;
+    if trust == Trust::Reset {
+        for name in AUTHORISING {
+            let file = dir.join(name);
+            if file.exists() || is_reparse(&file) {
+                std::fs::remove_file(&file)?;
+            }
+        }
+    }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if is_reparse(&path) {
@@ -633,7 +751,7 @@ pub fn secure_tree(dir: &std::path::Path, clear: &[&str]) -> std::io::Result<()>
         }
         set_security(&path, None)?;
     }
-    Ok(())
+    Ok(trust)
 }
 
 /// Every entry under `dir`: no links, only inherited ACEs.

@@ -70,6 +70,14 @@ fn print_line(value: serde_json::Value) {
 fn main() {
     // Link's Windows service (service.rs): the Service Control Manager starts it, and it makes
     // its own runtime once the service is registered.
+    // The installer, elevated, before it writes in Link's ProgramData folder: the same check
+    // the service makes at every start (service.rs). Exit 1: nothing may be written there.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("secure-machine-dir") {
+        let safe = service::prepare_machine_dir(&unattended::machine_dir());
+        print_line(json!({ "secured": safe }));
+        std::process::exit(if safe { 0 } else { 1 });
+    }
     if std::env::args().skip(1).any(|arg| arg == "--service") {
         let _ = rustls::crypto::ring::default_provider().install_default();
         service::run();
