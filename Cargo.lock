@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-control"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3832,14 +3832,14 @@ dependencies = [
 
 [[package]]
 name = "rtx-glibc-compat"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "rtx-link"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3864,7 +3864,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-linkd"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3901,7 +3901,7 @@ dependencies = [
 
 [[package]]
 name = "rtx-screens"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
