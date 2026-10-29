@@ -161,6 +161,13 @@ impl Controller {
         let Some(key) = physical_key(code) else {
             return Ok(());
         };
+        if pressed
+            && cfg!(windows)
+            && secure_attention_chord(code, self.held_codes.iter().map(|held| held.code))
+        {
+            secure_attention();
+            return Ok(());
+        }
         if !pressed && !self.held_codes.iter().any(|held| held.code == key.code) {
             return Ok(());
         }
@@ -311,6 +318,10 @@ impl Controller {
                     .ok_or_else(|| anyhow!("keysym is required"))?
                     as u32;
                 let pressed = request["pressed"].as_bool().unwrap_or(false);
+                if pressed && cfg!(windows) && secure_attention_keysyms(keysym, &self.held_keys) {
+                    secure_attention();
+                    return Ok(json!({}));
+                }
                 self.input()?.keysym(keysym, pressed)?;
                 if pressed {
                     self.held_keys.insert(keysym);
@@ -442,6 +453,33 @@ impl Controller {
             other => bail!("Unknown op: {other}"),
         }
     }
+}
+
+/// Ctrl+Alt+Delete (realtimex-link#10): Delete going down while a Ctrl and an Alt are held.
+/// Windows never takes it from injected keys; Link's service sends it (SendSAS) instead.
+fn secure_attention_chord<'a>(code: &str, held: impl Iterator<Item = &'a str>) -> bool {
+    let (mut ctrl, mut alt) = (false, false);
+    for held in held {
+        ctrl |= matches!(held, "ControlLeft" | "ControlRight");
+        alt |= matches!(held, "AltLeft" | "AltRight");
+    }
+    code == "Delete" && ctrl && alt
+}
+
+/// The same chord from keysyms (a `keys` combo such as "ctrl+alt+delete").
+fn secure_attention_keysyms(keysym: u32, held: &BTreeSet<u32>) -> bool {
+    const DELETE: u32 = 0xffff;
+    let ctrl = held.contains(&0xffe3) || held.contains(&0xffe4);
+    let alt = held.contains(&0xffe9) || held.contains(&0xffea);
+    keysym == DELETE && ctrl && alt
+}
+
+/// Ask Link for the secure attention sequence: an event line, as the peer's are.
+fn secure_attention() {
+    write_line(
+        &mut std::io::stdout().lock(),
+        &json!({ "id": null, "event": "secure_attention" }),
+    );
 }
 
 /// Where a physical key goes: the platform's input, or a test's.
@@ -636,6 +674,8 @@ pub fn run() -> Result<()> {
                 Err(_) => break,
             },
         };
+        // The sign-in, lock or UAC screen may have taken input since the last request.
+        platform::follow_input_desktop();
         let line = match message {
             Msg::Line(line) => line,
             Msg::Eof => break,
@@ -778,6 +818,22 @@ mod tests {
             self.sent.push((key.code, pressed, repeat));
             Ok(())
         }
+    }
+
+    #[test]
+    fn ctrl_alt_delete_is_the_secure_attention_chord() {
+        assert!(secure_attention_chord("Delete", ["ControlLeft", "AltLeft"].into_iter()));
+        assert!(secure_attention_chord(
+            "Delete",
+            ["AltRight", "ShiftLeft", "ControlRight"].into_iter()
+        ));
+        assert!(!secure_attention_chord("Delete", ["ControlLeft"].into_iter()));
+        assert!(!secure_attention_chord("Delete", ["AltLeft"].into_iter()));
+        assert!(!secure_attention_chord("Backspace", ["ControlLeft", "AltLeft"].into_iter()));
+        let held: BTreeSet<u32> = [0xffe3, 0xffe9].into();
+        assert!(secure_attention_keysyms(0xffff, &held));
+        assert!(!secure_attention_keysyms(0xff08, &held));
+        assert!(!secure_attention_keysyms(0xffff, &[0xffe3].into()));
     }
 
     #[test]

@@ -378,6 +378,11 @@ impl Backend {
     }
 
     fn emit(&self, event: Value) {
+        // Ctrl+Alt+Delete from a viewer (realtimex-link#10): only the daemon can send it.
+        if event.get("event").and_then(Value::as_str) == Some("secure_attention") {
+            crate::secure_attention::send();
+            return;
+        }
         if event.get("event").and_then(Value::as_str) == Some("peer_state") {
             if let Some(session) = event.get("session").and_then(Value::as_u64) {
                 let mut inner = self.inner();

@@ -45,7 +45,10 @@ use crate::keys::{from_keysym, Key};
 use crate::platform::{Button, InputError, PasteGap, Shot};
 
 mod clipboard;
+mod desktop;
 mod keymap;
+
+pub use self::desktop::follow_input_desktop;
 
 /// Clipboard format of UTF-16 text (CF_UNICODETEXT).
 const CF_UNICODETEXT: u32 = 13;
