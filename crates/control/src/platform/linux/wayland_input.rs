@@ -344,6 +344,12 @@ impl WaylandInput {
         let node_id = rx
             .recv_timeout(STREAM_TIMEOUT)
             .map_err(|_| anyhow!("GNOME did not start the screen stream"))??;
+        // A virtual monitor exists only while something reads its stream: read it from the
+        // start, so input sent before the first screenshot has a monitor to land on.
+        let frames = match virtual_size {
+            Some(size) => Some(FrameStream::start(node_id, Some(size))?),
+            None => None,
+        };
 
         Ok(Self {
             session,
@@ -353,7 +359,7 @@ impl WaylandInput {
             clipboard_data: Arc::new(Mutex::new(HashMap::new())),
             clipboard_enabled: false,
             selection: Arc::new(Mutex::new(Selection::default())),
-            frames: None,
+            frames,
             virtual_size,
             last_frame: None,
         })
