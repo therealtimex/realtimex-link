@@ -180,16 +180,9 @@ mod session {
         Ok(primary)
     }
 
-    /// The helper, as SYSTEM in the console session. It can't inherit handles across sessions
-    /// (CreateProcessAsUser), so it opens named pipes this daemon created: `--pipes <name>`.
-    pub async fn spawn(binary: &Path) -> std::io::Result<Spawned> {
-        let session = super::console_session()
-            .ok_or_else(|| std::io::Error::other("no session has the console"))?;
+    /// Start `binary --pipes <name>` as SYSTEM in `session`, inheriting nothing.
+    fn start(binary: &Path, name: &str, session: u32) -> std::io::Result<Process> {
         let token = console_token(session)?;
-        let name = format!(r"\\.\pipe\RealTimeX-Link-Helper-{}", crate::util::uuid());
-        let input = pipe(&format!("{name}-in"), false)?;
-        let output = pipe(&format!("{name}-out"), true)?;
-        let errors = pipe(&format!("{name}-err"), true)?;
         let mut desktop = win::wide(r"winsta0\default");
         let mut startup: win::STARTUPINFOW = unsafe { std::mem::zeroed() };
         startup.cb = std::mem::size_of::<win::STARTUPINFOW>() as u32;
@@ -218,9 +211,22 @@ mod session {
             return Err(std::io::Error::last_os_error());
         }
         drop(Handle(information.hThread));
-        let process = Process {
+        Ok(Process {
             handle: Handle(information.hProcess),
-        };
+        })
+    }
+
+    /// The helper, as SYSTEM in the console session. It can't inherit handles across sessions
+    /// (CreateProcessAsUser), so it opens named pipes this daemon created: `--pipes <name>`.
+    pub async fn spawn(binary: &Path) -> std::io::Result<Spawned> {
+        let session = super::console_session()
+            .ok_or_else(|| std::io::Error::other("no session has the console"))?;
+        let name = format!(r"\\.\pipe\RealTimeX-Link-Helper-{}", crate::util::uuid());
+        let input = pipe(&format!("{name}-in"), false)?;
+        let output = pipe(&format!("{name}-out"), true)?;
+        let errors = pipe(&format!("{name}-err"), true)?;
+        // Before any await: the Win32 structures it uses aren't Send.
+        let process = start(binary, &name, session)?;
         let connected = tokio::time::timeout(CONNECT_TIMEOUT, async {
             input.connect().await?;
             output.connect().await?;
