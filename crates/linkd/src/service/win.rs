@@ -371,7 +371,8 @@ pub fn token_user(token: HANDLE) -> Option<String> {
 pub fn token_in_group(token: HANDLE, group: &Sid) -> bool {
     let member = |token: HANDLE| {
         let mut member: BOOL = 0;
-        unsafe { CheckTokenMembership(token, group.as_ptr(), &mut member) } != 0 && member != 0
+        let checked = unsafe { CheckTokenMembership(token, group.as_ptr(), &mut member) };
+        checked != 0 && member != 0
     };
     if member(token) {
         return true;

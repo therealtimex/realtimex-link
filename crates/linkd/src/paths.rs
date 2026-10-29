@@ -48,6 +48,7 @@ pub fn default_data_dir() -> PathBuf {
 /// the environment, which is SYSTEM's own (SD C3). Set once, before the daemon starts.
 static OWNER_HOME: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn serve_owner(home: PathBuf) {
     *OWNER_HOME.write().unwrap_or_else(|p| p.into_inner()) = Some(home);
 }

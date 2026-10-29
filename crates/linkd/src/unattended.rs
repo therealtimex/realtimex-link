@@ -8,6 +8,9 @@
 //! caller's own. `GET`/`POST /v1/unattended` answer the contract's body:
 //! `{supported, serviceInstalled, enabled, needsPermission, canChange, reason?, pending}`.
 
+// The service side (service.rs) uses most of this on Windows only.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -71,7 +74,7 @@ pub fn enabled_for(data_dir: &Path) -> bool {
 
 /// One request to the service's pipe, a JSON line.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase")]
+#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Request {
     /// The machine's state, and whether the caller may change it.
     Status { data_dir: PathBuf },
