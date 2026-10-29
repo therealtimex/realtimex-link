@@ -101,17 +101,22 @@ async fn run() {
         );
         return;
     }
-    // `install --check DESTINATION`: exit 0 when installing would replace what is there, 10
-    // when the installed Link is this version or newer (nothing would change).
+    // `install --check DESTINATION`: exit 0 when installing would replace what is there (nothing
+    // or older), 11 when this version is installed, 10 when a newer one is. Nothing changes.
     if args.first().map(String::as_str) == Some("install") && args.get(1).map(String::as_str) == Some("--check") {
         let Some(destination) = args.get(2) else {
             print_line(json!({ "error": "usage: rtx-linkd install --check DESTINATION" }));
             std::process::exit(2);
         };
         match install::would_replace(std::path::Path::new(destination)) {
-            Ok(replace) => {
-                print_line(json!({ "replace": replace }));
-                std::process::exit(if replace { 0 } else { 10 });
+            Ok(installed) => {
+                let (replace, code) = match installed {
+                    install::Installed::Older => (true, 0),
+                    install::Installed::Same => (false, 11),
+                    install::Installed::Newer => (false, 10),
+                };
+                print_line(json!({ "replace": replace, "installed": format!("{installed:?}").to_lowercase() }));
+                std::process::exit(code);
             }
             Err(error) => {
                 print_line(json!({ "error": format!("{error:#}") }));
@@ -189,11 +194,44 @@ async fn run() {
     print_line(
         json!({ "ready": true, "pid": std::process::id(), "port": daemon.port, "version": version }),
     );
+    hand_over_to_the_service(&daemon, data_dir_of(&args));
     tokio::select! {
         () = wait_for_stop() => {}
         () = daemon.shutdown.notified() => {}
     }
     daemon.stop().await;
+}
+
+fn data_dir_of(args: &[String]) -> PathBuf {
+    arg_value(args, "--data-dir").map_or_else(paths::default_data_dir, PathBuf::from)
+}
+
+/// While Start with this computer is on, the owner's own daemon is only a stand-in: one started
+/// while the service was stopped steps aside once the service is back and waiting for its folder
+/// (QA of !12; SD C4), so the sign-in and lock screens are reachable again.
+fn hand_over_to_the_service(daemon: &daemon::Daemon, data_dir: PathBuf) {
+    if !unattended::SUPPORTED {
+        return;
+    }
+    let shutdown = daemon.shutdown.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let request = unattended::Request::Status {
+                data_dir: data_dir.clone(),
+            };
+            let reply = tokio::task::spawn_blocking(move || unattended::ask(&request))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            if unattended::yields(reply.as_ref()) {
+                eprintln!("[unattended] Link's service runs this folder again: stepping aside");
+                shutdown.notify_one();
+                return;
+            }
+        }
+    });
 }
 
 #[cfg(unix)]

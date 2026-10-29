@@ -171,7 +171,7 @@ mod windows_service {
     use super::{log_line, ACTIVE};
     use crate::unattended::{
         machine_dir, Config, Reply, Request, OS_ADMIN_REQUIRED, PIPE_NAME,
-        PROFILE_UNAVAILABLE, SERVICE_NAME, STANDARD_ONLY,
+        OWNER_DAEMON_RUNNING, PROFILE_UNAVAILABLE, SERVICE_NAME, STANDARD_ONLY,
     };
 
     /// Who may use the pipe: SYSTEM and administrators fully, signed-in users to ask; never
@@ -336,8 +336,13 @@ mod windows_service {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     false
                 }
-                // Not running although on: try again now and then (a profile that comes back).
-                () = tokio::time::sleep(Duration::from_secs(60)), if daemon.is_none() && config.enabled => false,
+                // Not running although on: try again soon while the owner's daemon steps aside,
+                // else now and then (a profile that comes back).
+                () = tokio::time::sleep(if shared.idle().as_deref() == Some(OWNER_DAEMON_RUNNING) {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(60)
+                }), if daemon.is_none() && config.enabled => false,
             };
             if let Some(daemon) = daemon {
                 daemon.stop().await;
@@ -386,7 +391,7 @@ mod windows_service {
         crate::paths::serve_owner(home);
         // The owner's own daemon may still be letting go of the folder (it stops after
         // answering POST /v1/unattended).
-        for _ in 0..30 {
+        for _ in 0..5 {
             let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line: &str| log_line(line));
             let started = crate::daemon::start(crate::daemon::Options {
                 data_dir: folder.clone(),
@@ -413,8 +418,10 @@ mod windows_service {
                 }
             }
         }
-        log_line("the owner's own daemon kept the folder: idle until the next change");
-        shared.set_idle(Some(PROFILE_UNAVAILABLE));
+        // Started while the service was stopped: it steps aside when it next asks (main.rs
+        // hands_over), and the service tries again soon.
+        log_line("the owner's own daemon has the folder: waiting for it to step aside");
+        shared.set_idle(Some(OWNER_DAEMON_RUNNING));
         None
     }
 

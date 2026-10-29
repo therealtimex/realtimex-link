@@ -24,10 +24,25 @@ const VERSION_FILE: &str = "VERSION";
 /// Whether `run` would replace what is installed at `destination` (nothing installed, or an
 /// older version), without changing anything: the Windows installer asks first, so it stops
 /// Link's service only when files will be replaced (SD, realtimex-ai-app#2967).
-pub fn would_replace(destination: &Path) -> Result<bool> {
+pub fn would_replace(destination: &Path) -> Result<Installed> {
     let ours = env!("CARGO_PKG_VERSION");
-    Ok(installed_version(destination)?
-        .is_none_or(|installed| version_key(&installed) < version_key(ours)))
+    Ok(match installed_version(destination)? {
+        None => Installed::Older,
+        Some(installed) => match version_key(&installed).cmp(&version_key(ours)) {
+            std::cmp::Ordering::Less => Installed::Older,
+            std::cmp::Ordering::Equal => Installed::Same,
+            std::cmp::Ordering::Greater => Installed::Newer,
+        },
+    })
+}
+
+/// What is installed, against this rtx-linkd: nothing or older (replaced), this version (kept,
+/// with what a failed install left out completed), newer (left alone).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Installed {
+    Older,
+    Same,
+    Newer,
 }
 
 pub fn run(destination: &Path) -> Result<Value> {
@@ -543,7 +558,7 @@ mod tests {
     fn nothing_installed_is_replaced_and_the_check_changes_nothing() {
         let dir = std::env::temp_dir().join(format!("rtx-would-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(would_replace(&dir).unwrap());
+        assert_eq!(would_replace(&dir).unwrap(), Installed::Older);
         assert!(!dir.exists(), "asking creates nothing");
     }
 

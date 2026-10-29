@@ -107,6 +107,9 @@ pub const SERVICE_MISSING: &str = "service-missing";
 pub const STANDARD_ONLY: &str = "unattended-standard-only";
 /// On, but the owner's folder couldn't be reached at boot (a roaming profile, SD C6).
 pub const PROFILE_UNAVAILABLE: &str = "profile-unavailable";
+/// On, and the service is waiting for the owner's own daemon to let go of the folder (it was
+/// started while the service was stopped): that daemon steps aside (QA of !12).
+pub const OWNER_DAEMON_RUNNING: &str = "owner-daemon-running";
 
 impl Reply {
     pub fn refused(code: &str, error: impl Into<String>) -> Reply {
@@ -140,7 +143,11 @@ impl Reply {
 /// (its owner's profile was unavailable at boot, or the owner is no longer an administrator),
 /// or isn't there, the owner's own daemon runs as before.
 pub fn yields(reply: Option<&Reply>) -> bool {
-    reply.is_some_and(|reply| reply.enabled && reply.idle.is_none() && reply.code.is_none())
+    reply.is_some_and(|reply| {
+        reply.enabled
+            && reply.code.is_none()
+            && reply.idle.as_deref().is_none_or(|idle| idle == OWNER_DAEMON_RUNNING)
+    })
 }
 
 /// GET /v1/unattended's body (contract §6). Off where it isn't supported.
@@ -253,6 +260,9 @@ mod tests {
         assert!(!yields(Some(&Reply::default())));
         let idle = Reply { idle: Some(PROFILE_UNAVAILABLE.into()), ..running.clone() };
         assert!(!yields(Some(&idle)));
+        // The service waits for this very daemon's folder: it steps aside (QA of !12).
+        let waiting = Reply { idle: Some(OWNER_DAEMON_RUNNING.into()), ..running.clone() };
+        assert!(yields(Some(&waiting)));
         assert!(!yields(Some(&Reply::refused("io", "broken"))));
     }
 
