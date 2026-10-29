@@ -21,6 +21,15 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// for when the installed rtx-linkd can't say.
 const VERSION_FILE: &str = "VERSION";
 
+/// Whether `run` would replace what is installed at `destination` (nothing installed, or an
+/// older version), without changing anything: the Windows installer asks first, so it stops
+/// Link's service only when files will be replaced (SD, realtimex-ai-app#2967).
+pub fn would_replace(destination: &Path) -> Result<bool> {
+    let ours = env!("CARGO_PKG_VERSION");
+    Ok(installed_version(destination)?
+        .is_none_or(|installed| version_key(&installed) < version_key(ours)))
+}
+
 pub fn run(destination: &Path) -> Result<Value> {
     let ours = env!("CARGO_PKG_VERSION");
     let source = source()?;
@@ -529,6 +538,14 @@ fn copy(source: &Path, staging: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_installed_is_replaced_and_the_check_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("rtx-would-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(would_replace(&dir).unwrap());
+        assert!(!dir.exists(), "asking creates nothing");
+    }
 
     #[test]
     fn versions_compare_by_number() {

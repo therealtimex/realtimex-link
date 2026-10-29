@@ -101,6 +101,24 @@ async fn run() {
         );
         return;
     }
+    // `install --check DESTINATION`: exit 0 when installing would replace what is there, 10
+    // when the installed Link is this version or newer (nothing would change).
+    if args.first().map(String::as_str) == Some("install") && args.get(1).map(String::as_str) == Some("--check") {
+        let Some(destination) = args.get(2) else {
+            print_line(json!({ "error": "usage: rtx-linkd install --check DESTINATION" }));
+            std::process::exit(2);
+        };
+        match install::would_replace(std::path::Path::new(destination)) {
+            Ok(replace) => {
+                print_line(json!({ "replace": replace }));
+                std::process::exit(if replace { 0 } else { 10 });
+            }
+            Err(error) => {
+                print_line(json!({ "error": format!("{error:#}") }));
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(String::as_str) == Some("install") {
         let Some(destination) = args.get(1) else {
             print_line(json!({ "error": "usage: rtx-linkd install DESTINATION" }));

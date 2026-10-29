@@ -58,7 +58,7 @@ VIAddVersionKey "LegalCopyright" "Copyright © 2025 RealTimeX"
 
 Function .onInit
   ${IfNot} ${RunningX64}
-    MessageBox MB_ICONSTOP "${APP} needs 64-bit Windows."
+    MessageBox MB_ICONSTOP "${APP} needs 64-bit Windows." /SD IDOK
     Abort
   ${EndIf}
   SetRegView 64
@@ -78,19 +78,46 @@ Function StopService
   ${EndIf}
 FunctionEnd
 
+; With the installed Link this version or newer, nothing is replaced: only a missing service is
+; created, pointed at what is installed (SD, realtimex-ai-app#2967). An existing one is left as
+; it is, and so are its running sessions.
+Function EnsureService
+  nsExec::Exec '"$SYSDIR\sc.exe" query "${SERVICE}"'
+  Pop $0
+  ${If} $0 != 0
+    nsExec::ExecToLog '"$SYSDIR\sc.exe" create "${SERVICE}" binPath= "\"$INSTDIR\rtx-linkd.exe\" --service" start= auto obj= LocalSystem DisplayName= "${SERVICE}"'
+    nsExec::ExecToLog '"$SYSDIR\sc.exe" failure "${SERVICE}" reset= 86400 actions= restart/5000/restart/5000/restart/60000'
+    nsExec::ExecToLog '"$SYSDIR\sc.exe" start "${SERVICE}"'
+  ${EndIf}
+FunctionEnd
+
 Section "Install"
   SetShellVarContext all
   InitPluginsDir
-  Call StopService
   SetOutPath "$PLUGINSDIR\payload"
   File "${PAYLOAD}\rtx-linkd.exe"
   File "${PAYLOAD}\rtx-link.exe"
   File "${PAYLOAD}\rtx-control.exe"
+  ; Decide first (rtx-linkd install --check: 0 replaces, 10 is current), then stop the service
+  ; only when its files will be replaced: stopping it ends live remote sessions, even at the
+  ; sign-in screen.
+  nsExec::ExecToLog '"$PLUGINSDIR\payload\rtx-linkd.exe" install --check "$INSTDIR"'
+  Pop $0
+  ${If} $0 == 10
+    DetailPrint "${APP} is already this version or newer: nothing is replaced"
+    Call EnsureService
+    SetOutPath "$TEMP"
+    Return
+  ${ElseIf} $0 != 0
+    MessageBox MB_ICONSTOP "${APP} could not be installed (rtx-linkd install --check: $0)." /SD IDOK
+    Abort
+  ${EndIf}
+  Call StopService
   DetailPrint "Installing ${APP} ${VERSION}"
   nsExec::ExecToLog '"$PLUGINSDIR\payload\rtx-linkd.exe" install "$INSTDIR"'
   Pop $0
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "${APP} could not be installed (rtx-linkd install: $0)."
+    MessageBox MB_ICONSTOP "${APP} could not be installed (rtx-linkd install: $0)." /SD IDOK
     Abort
   ${EndIf}
   SetOutPath "$TEMP"
@@ -102,7 +129,7 @@ Section "Install"
   nsExec::ExecToLog '"$PLUGINSDIR\payload\rtx-linkd.exe" secure-machine-dir'
   Pop $0
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "${APP} could not secure its folder in ProgramData (rtx-linkd: $0)."
+    MessageBox MB_ICONSTOP "${APP} could not secure its folder in ProgramData (rtx-linkd: $0)." /SD IDOK
     Abort
   ${EndIf}
   WriteUninstaller "$APPDATA\${APP}\Uninstall ${APP}.exe"
