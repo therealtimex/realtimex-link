@@ -686,9 +686,10 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("keep.txt"), b"not Link's").unwrap();
         std::fs::write(dir.join("unattended.json"), b"{}").unwrap();
+        std::fs::write(dir.join("service.log"), b"old").unwrap();
         std::fs::create_dir_all(dir.join("updates").join("old")).unwrap();
         // Another user's explicit grants, on the folder and on a file in it.
-        for path in [&dir, &dir.join("unattended.json")] {
+        for path in [&dir, &dir.join("service.log")] {
             let granted = crate::util::command(r"C:\Windows\System32\icacls.exe")
                 .arg(path)
                 .args(["/grant", "*S-1-1-0:(F)"])
@@ -712,7 +713,9 @@ mod tests {
         assert!(!junction.exists(), "the junction is gone");
         assert!(elsewhere.join("keep.txt").exists(), "what it pointed at is untouched");
         assert!(!dir.join("updates").exists(), "scratch folders are emptied");
-        for path in [&dir, &dir.join("unattended.json")] {
+        // The folder wasn't trusted, so its choice is gone too.
+        assert!(!dir.join("unattended.json").exists());
+        for path in [&dir, &dir.join("service.log")] {
             let acl = icacls(path);
             assert!(!acl.contains("Everyone") && !acl.contains("S-1-1-0"), "{acl}");
             assert!(acl.contains("SYSTEM"), "{acl}");
