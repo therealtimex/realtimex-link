@@ -48,10 +48,13 @@ impl Child {
 }
 
 /// Start the helper: into the active console session under the service, else as a child.
-pub fn spawn(binary: &Path, local: impl FnOnce() -> std::io::Result<tokio::process::Child>) -> std::io::Result<Spawned> {
+pub async fn spawn(
+    binary: &Path,
+    local: impl FnOnce() -> std::io::Result<tokio::process::Child>,
+) -> std::io::Result<Spawned> {
     #[cfg(windows)]
     if crate::service::active() {
-        return session::spawn(binary);
+        return session::spawn(binary).await;
     }
     let _ = binary;
     let mut child = local()?;
@@ -81,11 +84,18 @@ pub fn console_session() -> Option<u32> {
 
 #[cfg(windows)]
 mod session {
-    use std::os::windows::io::{FromRawHandle, RawHandle};
     use std::path::Path;
+    use std::time::Duration;
+
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
     use super::{Child, Reader, Spawned, Writer};
     use crate::service::win::{self, Handle, HANDLE};
+
+    /// Only SYSTEM may open the helper's pipes: the helper runs as SYSTEM, nobody else does.
+    const HELPER_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)";
+    /// How long the helper has to open its pipes.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// A process started into another session, ended on drop.
     pub struct Process {
@@ -119,29 +129,19 @@ mod session {
         }
     }
 
-    /// An anonymous pipe: (the child's end, inheritable; ours, not).
-    fn pipe(child_reads: bool) -> std::io::Result<(Handle, Handle)> {
-        let attributes = win::SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<win::SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: 1,
-        };
-        let (mut read, mut write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
-        if unsafe { win::CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let (read, write) = (Handle(read), Handle(write));
-        let (child, ours) = if child_reads { (read, write) } else { (write, read) };
-        unsafe { win::SetHandleInformation(ours.0, win::HANDLE_FLAG_INHERIT, 0) };
-        Ok((child, ours))
-    }
-
-    /// Our end of a pipe as an async file.
-    fn file(handle: Handle) -> tokio::fs::File {
-        let raw = handle.0 as RawHandle;
-        std::mem::forget(handle);
-        // SAFETY: an owned handle, handed over whole.
-        tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_handle(raw) })
+    /// One of the helper's pipes, created here first (a name someone else made fails), one
+    /// instance, one way.
+    fn pipe(name: &str, inbound: bool) -> std::io::Result<NamedPipeServer> {
+        let mut security = win::Security::new(HELPER_PIPE_SDDL)?;
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .access_inbound(inbound)
+            .access_outbound(!inbound)
+            .reject_remote_clients(true);
+        // SAFETY: valid SECURITY_ATTRIBUTES, alive for the call.
+        unsafe { options.create_with_security_attributes_raw(name, security.attributes()) }
     }
 
     /// SYSTEM's own token, moved to the console session.
@@ -180,24 +180,23 @@ mod session {
         Ok(primary)
     }
 
-    pub fn spawn(binary: &Path) -> std::io::Result<Spawned> {
+    /// The helper, as SYSTEM in the console session. It can't inherit handles across sessions
+    /// (CreateProcessAsUser), so it opens named pipes this daemon created: `--pipes <name>`.
+    pub async fn spawn(binary: &Path) -> std::io::Result<Spawned> {
         let session = super::console_session()
             .ok_or_else(|| std::io::Error::other("no session has the console"))?;
         let token = console_token(session)?;
-        let (child_in, our_in) = pipe(true)?;
-        let (child_out, our_out) = pipe(false)?;
-        let (child_err, our_err) = pipe(false)?;
+        let name = format!(r"\\.\pipe\RealTimeX-Link-Helper-{}", crate::util::uuid());
+        let input = pipe(&format!("{name}-in"), false)?;
+        let output = pipe(&format!("{name}-out"), true)?;
+        let errors = pipe(&format!("{name}-err"), true)?;
         let mut desktop = win::wide(r"winsta0\default");
         let mut startup: win::STARTUPINFOW = unsafe { std::mem::zeroed() };
         startup.cb = std::mem::size_of::<win::STARTUPINFOW>() as u32;
         startup.lpDesktop = desktop.as_mut_ptr();
-        startup.dwFlags = win::STARTF_USESTDHANDLES;
-        startup.hStdInput = child_in.0;
-        startup.hStdOutput = child_out.0;
-        startup.hStdError = child_err.0;
         // An absolute path, never a PATH lookup as SYSTEM (SD C2).
         let application = win::wide(&binary.to_string_lossy());
-        let mut command_line = win::wide(&format!("\"{}\"", binary.display()));
+        let mut command_line = win::wide(&format!("\"{}\" --pipes {name}", binary.display()));
         let directory = binary.parent().map(|dir| win::wide(&dir.to_string_lossy()));
         let mut information: win::PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         let created = unsafe {
@@ -207,7 +206,7 @@ mod session {
                 command_line.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                1,
+                0,
                 win::CREATE_NO_WINDOW | win::CREATE_UNICODE_ENVIRONMENT,
                 std::ptr::null(),
                 directory.as_ref().map_or(std::ptr::null(), |dir| dir.as_ptr()),
@@ -219,15 +218,26 @@ mod session {
             return Err(std::io::Error::last_os_error());
         }
         drop(Handle(information.hThread));
-        // The child holds its ends now; closing ours lets its exit end our reads.
-        drop((child_in, child_out, child_err));
-        let stdin: Writer = Box::new(file(our_in));
-        let stdout: Reader = Box::new(file(our_out));
-        let stderr: Reader = Box::new(file(our_err));
+        let process = Process {
+            handle: Handle(information.hProcess),
+        };
+        let connected = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            input.connect().await?;
+            output.connect().await?;
+            errors.connect().await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await;
+        match connected {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(std::io::Error::other("the helper didn't open its pipes")),
+        }
+        let stdin: Writer = Box::new(input);
+        let stdout: Reader = Box::new(output);
+        let stderr: Reader = Box::new(errors);
         Ok(Spawned {
-            child: Child::Session(Process {
-                handle: Handle(information.hProcess),
-            }),
+            child: Child::Session(process),
             stdin,
             stdout,
             stderr: Some(stderr),

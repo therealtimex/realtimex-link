@@ -196,6 +196,21 @@ extern "system" {
         startup: *const STARTUPINFOW,
         information: *mut PROCESS_INFORMATION,
     ) -> BOOL;
+    pub fn SetNamedSecurityInfoW(
+        name: *const u16,
+        kind: i32,
+        information: u32,
+        owner: PSID,
+        group: PSID,
+        dacl: *mut c_void,
+        sacl: *mut c_void,
+    ) -> u32;
+    pub fn GetSecurityDescriptorDacl(
+        descriptor: *mut c_void,
+        present: *mut BOOL,
+        dacl: *mut *mut c_void,
+        defaulted: *mut BOOL,
+    ) -> BOOL;
     pub fn RegGetValueW(
         key: isize,
         subkey: *const u16,
@@ -229,6 +244,7 @@ extern "system" {
     pub fn FindFirstFileW(path: *const u16, data: *mut WIN32_FIND_DATAW) -> HANDLE;
     pub fn FindClose(find: HANDLE) -> BOOL;
     pub fn CreateDirectoryW(path: *const u16, attributes: *const SECURITY_ATTRIBUTES) -> BOOL;
+    pub fn GetNamedPipeClientProcessId(pipe: HANDLE, pid: *mut u32) -> BOOL;
 }
 
 #[link(name = "wtsapi32")]
@@ -486,6 +502,156 @@ pub fn account_is_admin(sid: &str) -> Option<bool> {
         .any(|&name| unsafe { from_wide(name) }.to_lowercase() == admins_name);
     unsafe { NetApiBufferFree(buffer.cast()) };
     Some(admin)
+}
+
+/// A security descriptor from SDDL, and attributes naming it, freed on drop.
+pub struct Security {
+    descriptor: *mut c_void,
+    attributes: SECURITY_ATTRIBUTES,
+}
+
+// SAFETY: only read by the calls it is passed to.
+unsafe impl Send for Security {}
+
+impl Security {
+    pub fn new(sddl: &str) -> std::io::Result<Security> {
+        let text = wide(sddl);
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Security {
+            descriptor,
+            attributes: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            },
+        })
+    }
+
+    pub fn attributes(&mut self) -> *mut c_void {
+        (&mut self.attributes as *mut SECURITY_ATTRIBUTES).cast()
+    }
+}
+
+impl Drop for Security {
+    fn drop(&mut self) {
+        unsafe { LocalFree(self.descriptor) };
+    }
+}
+
+const SE_FILE_OBJECT: i32 = 1;
+const OWNER_SECURITY_INFORMATION: u32 = 0x1;
+const DACL_SECURITY_INFORMATION: u32 = 0x4;
+const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
+/// Link's ProgramData folder: SYSTEM and administrators write, users read; nothing else.
+pub const MACHINE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)";
+
+/// Give `path` administrators as owner and exactly `sddl`'s DACL (protected), or, with None,
+/// no ACEs of its own so that it only inherits from its folder (what `icacls /reset` does).
+fn set_security(path: &std::path::Path, sddl: Option<&str>) -> std::io::Result<()> {
+    let admins = Sid::parse("S-1-5-32-544").ok_or_else(std::io::Error::last_os_error)?;
+    let security = Security::new(sddl.unwrap_or("D:"))?;
+    let (mut present, mut defaulted): (BOOL, BOOL) = (0, 0);
+    let mut dacl: *mut c_void = std::ptr::null_mut();
+    if unsafe {
+        GetSecurityDescriptorDacl(security.descriptor, &mut present, &mut dacl, &mut defaulted)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let protection = if sddl.is_some() {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let name = wide(&path.to_string_lossy());
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | protection,
+            admins.as_ptr(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+/// Whether a path is any reparse point (a junction, a link, a mount point).
+fn is_reparse(path: &std::path::Path) -> bool {
+    let text = wide(&path.to_string_lossy());
+    let attributes = unsafe { GetFileAttributesW(text.as_ptr()) };
+    attributes != INVALID_FILE_ATTRIBUTES && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Make Link's ProgramData folder trustworthy before the service reads or writes in it
+/// (Review of !12, SD C2): no reparse point, administrators as owner, exactly
+/// [`MACHINE_DIR_SDDL`] (an earlier owner's or another user's explicit grants go), and every
+/// entry in it inheriting only that. Junctions and links planted in it are removed (the link,
+/// never what it points at); the scratch folders (`clear`) are emptied whole. Any failure is an
+/// error: the service then trusts nothing there.
+pub fn secure_tree(dir: &std::path::Path, clear: &[&str]) -> std::io::Result<()> {
+    if is_reparse(dir) {
+        return Err(std::io::Error::other(format!("{} is a link", dir.display())));
+    }
+    std::fs::create_dir_all(dir)?;
+    set_security(dir, Some(MACHINE_DIR_SDDL))?;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if is_reparse(&path) {
+            // Removes the link itself: std doesn't follow it.
+            if std::fs::remove_dir(&path).is_err() {
+                std::fs::remove_file(&path)?;
+            }
+            continue;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        if path.is_dir() && name.as_deref().is_some_and(|n| clear.contains(&n)) {
+            // remove_dir_all doesn't follow junctions or links inside it either.
+            std::fs::remove_dir_all(&path)?;
+            continue;
+        }
+        if path.is_dir() {
+            secure_children(&path)?;
+        }
+        set_security(&path, None)?;
+    }
+    Ok(())
+}
+
+/// Every entry under `dir`: no links, only inherited ACEs.
+fn secure_children(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if is_reparse(&path) {
+            if std::fs::remove_dir(&path).is_err() {
+                std::fs::remove_file(&path)?;
+            }
+            continue;
+        }
+        if path.is_dir() {
+            secure_children(&path)?;
+        }
+        set_security(&path, None)?;
+    }
+    Ok(())
 }
 
 /// Create a folder with only SYSTEM and administrators in its DACL, not inherited from its

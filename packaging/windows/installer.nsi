@@ -99,7 +99,12 @@ Section "Install"
   ; administrators write, users only read, nothing inherited from ProgramData (which lets users
   ; create files).
   CreateDirectory "$APPDATA\${APP}"
+  ; Owned by administrators (a folder another user made first is taken back), only these grants,
+  ; and everything in it inheriting them. The service checks and redoes this itself at every
+  ; start, and trusts nothing there when it can't (crates/linkd/src/service/win.rs secure_tree).
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /setowner *S-1-5-32-544 /T /C /L'
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX'
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}\*" /reset /T /C /L'
   WriteUninstaller "$APPDATA\${APP}\Uninstall ${APP}.exe"
 
   ; The service: created, or pointed at this install when it exists; restarted if it fails.

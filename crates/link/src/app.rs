@@ -114,12 +114,23 @@ pub fn set_unattended(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context
                     (t("settings.startWithComputerOff"), true)
                 }
             }
+            // Not an administrator, or no service: the row reads Link again and says so
+            // (contract §6), without claiming nothing changed.
+            Err(error)
+                if error
+                    .downcast_ref::<crate::api::Refused>()
+                    .is_some_and(|refused| matches!(refused.status, 403 | 503)) =>
+            {
+                (String::new(), false)
+            }
             Err(_) => (t("settings.startWithComputerFailed"), false),
         };
         {
             let mut state = lock(&shared);
             state.unattended_pending = false;
-            state.notice = Some((notice.0, notice.1, Instant::now()));
+            if !notice.0.is_empty() {
+                state.notice = Some((notice.0, notice.1, Instant::now()));
+            }
         }
         let _ = refresh.send(());
         ctx.request_repaint();
@@ -1804,7 +1815,9 @@ impl LinkApp {
             return;
         }
         let mut on = field("enabled");
-        let can_change = field("canChange");
+        // A switch only where the person can act (contract §4): not for someone who isn't an
+        // administrator, and not while Keep running is off, unless a change is already applying.
+        let can_change = field("canChange") && (running || pending);
         let mut changed = false;
         // The label and its wrapping caption on the left, the switch (or badge) on the right,
         // top-aligned: the switch never moves to a line of its own (contract §2).
@@ -1833,7 +1846,7 @@ impl LinkApp {
                 badge(ui, &text, Tone::Neutral);
             }
         });
-        let status = if !can_change {
+        let status = if !field("canChange") {
             Some(t("settings.startWithComputerAdmin"))
         } else if !running {
             Some(t("settings.startWithComputerLinkOff"))

@@ -98,6 +98,21 @@ pub struct Api {
     pub version: String,
 }
 
+/// The daemon answered with an error: its status, and its message (what the error shows).
+#[derive(Debug)]
+pub struct Refused {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 impl Api {
     fn connect(dir: &Path) -> Result<Self> {
         let discovery: Value = serde_json::from_str(
@@ -191,7 +206,11 @@ impl Api {
                 .get("error")
                 .and_then(Value::as_str)
                 .map_or_else(|| t("errors.requestFailed"), str::to_string);
-            bail!("{message}");
+            return Err(Refused {
+                status: status.as_u16(),
+                message,
+            }
+            .into());
         }
         Ok(body)
     }

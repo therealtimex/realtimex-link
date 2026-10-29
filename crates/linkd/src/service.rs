@@ -137,6 +137,10 @@ mod windows_service {
     const PIPE_SDDL: &str = "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
     /// Why the service doesn't run the daemon although it is on.
     const OWNER_NOT_ADMIN: &str = "owner-not-admin";
+    /// Its ProgramData folder couldn't be made safe: nothing in it is trusted.
+    const MACHINE_DIR_UNSAFE: &str = "machine-dir-unsafe";
+    /// Scratch folders under it, emptied when the service starts.
+    const SCRATCH: [&str; 2] = ["updates", "transfers"];
 
     struct Status(win::HANDLE);
     // SAFETY: a service status handle is used from any thread.
@@ -229,6 +233,8 @@ mod windows_service {
     /// What the pipe and the supervisor share.
     #[derive(Default)]
     struct Shared {
+        /// The ProgramData folder was made safe when the service started (win::secure_tree).
+        safe: std::sync::atomic::AtomicBool,
         /// Why the daemon isn't running although it is on (Reply::idle).
         idle: Mutex<Option<String>>,
         /// unattended.json changed.
@@ -247,12 +253,20 @@ mod windows_service {
     async fn serve(stop: Arc<Notify>) {
         log_line("service started");
         let shared = Arc::new(Shared::default());
+        match win::secure_tree(&machine_dir(), &SCRATCH) {
+            Ok(()) => shared.safe.store(true, std::sync::atomic::Ordering::Relaxed),
+            Err(error) => log_line(&format!("ProgramData folder isn't safe, trusting nothing: {error}")),
+        }
         tokio::spawn(pipe_server(shared.clone()));
         // The folder this process ran a daemon on: process-wide state (paths) is set once, so
         // another owner's folder needs a fresh process (the SCM restarts the service).
         let mut served: Option<PathBuf> = None;
         loop {
-            let config = Config::load(&machine_dir());
+            let safe = shared.safe.load(std::sync::atomic::Ordering::Relaxed);
+            let config = if safe { Config::load(&machine_dir()) } else { Config::default() };
+            if !safe {
+                shared.set_idle(Some(MACHINE_DIR_UNSAFE));
+            }
             let daemon = if config.enabled {
                 if served.as_ref().is_some_and(|dir| !crate::paths::same_folder(dir, &config.data_dir, "windows")) {
                     log_line("another owner's folder: restarting the service");
@@ -260,7 +274,9 @@ mod windows_service {
                 }
                 start_owner_daemon(&config, &shared).await
             } else {
-                shared.set_idle(None);
+                if safe {
+                    shared.set_idle(None);
+                }
                 None
             };
             if daemon.is_some() {
@@ -445,6 +461,7 @@ mod windows_service {
     struct Caller {
         sid: String,
         admin: bool,
+        pid: u32,
     }
 
     /// The client's user and whether it is an administrator, from its token: impersonated
@@ -471,7 +488,11 @@ mod windows_service {
         let token = Handle(token);
         let sid = win::token_user(token.0)?;
         let admin = win::Sid::parse("S-1-5-32-544").is_some_and(|admins| win::token_in_group(token.0, &admins));
-        Some(Caller { sid, admin })
+        let mut pid = 0u32;
+        if unsafe { win::GetNamedPipeClientProcessId(handle, &mut pid) } == 0 {
+            return None;
+        }
+        Some(Caller { sid, admin, pid })
     }
 
     /// One request line in, one reply line out.
@@ -512,7 +533,33 @@ mod windows_service {
         line[..end].strip_suffix(b"\r").unwrap_or(&line[..end])
     }
 
+    /// Whether `pid` is the daemon holding `data_dir`'s lock (SD C5): linkd.json names it, and
+    /// the lock can't be taken.
+    fn holds_folder(data_dir: &std::path::Path, pid: u32) -> bool {
+        let named = std::fs::read(data_dir.join("linkd.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|discovery| discovery.get("pid").and_then(serde_json::Value::as_u64));
+        if named != Some(u64::from(pid)) {
+            return false;
+        }
+        match std::fs::File::open(data_dir.join("linkd.lock")) {
+            Ok(file) => file.try_lock().is_err(),
+            Err(_) => false,
+        }
+    }
+
     fn decide(request: &Request, caller: &Caller, shared: &Shared) -> Reply {
+        if !shared.safe.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Request::Status { .. } = request {
+                return Reply {
+                    can_change: caller.admin,
+                    idle: Some(MACHINE_DIR_UNSAFE.into()),
+                    ..Reply::default()
+                };
+            }
+            return Reply::refused(MACHINE_DIR_UNSAFE, "RealTimeX Link's ProgramData folder isn't safe to use");
+        }
         let config = Config::load(&machine_dir());
         match request {
             Request::Status { data_dir } => {
@@ -532,7 +579,9 @@ mod windows_service {
                     );
                 }
                 let standard = standard_folder(&caller.sid).map(|(_, folder)| folder);
-                if !standard.is_some_and(|folder| crate::paths::same_folder(&folder, data_dir, "windows")) {
+                if !standard.is_some_and(|folder| crate::paths::same_folder(&folder, data_dir, "windows"))
+                    || !holds_folder(data_dir, caller.pid)
+                {
                     return Reply::refused(
                         STANDARD_ONLY,
                         "Only this computer's own RealTimeX Link can start with it",
@@ -571,5 +620,74 @@ mod windows_service {
                 Reply { enabled: false, can_change: caller.admin, ..Reply::default() }
             }
         }
+    }
+}
+
+/// Windows CI (scripts/build.ps1 runs `service::`): the ProgramData folder is made safe whatever
+/// another user left in it (Review of !12).
+#[cfg(all(test, windows))]
+mod tests {
+
+
+    use super::win;
+
+    fn icacls(path: &std::path::Path) -> String {
+        let out = crate::util::command(r"C:\Windows\System32\icacls.exe").arg(path).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn a_planted_grant_junction_and_scratch_folder_are_undone() {
+        let root = std::env::temp_dir().join(format!("rtx-secure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("RealTimeX Link");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.txt"), b"not Link's").unwrap();
+        std::fs::write(dir.join("unattended.json"), b"{}").unwrap();
+        std::fs::create_dir_all(dir.join("updates").join("old")).unwrap();
+        // Another user's explicit grants, on the folder and on a file in it.
+        for path in [&dir, &dir.join("unattended.json")] {
+            let granted = crate::util::command(r"C:\Windows\System32\icacls.exe")
+                .arg(path)
+                .args(["/grant", "*S-1-1-0:(F)"])
+                .status()
+                .unwrap();
+            assert!(granted.success());
+        }
+        // A junction planted inside, pointing elsewhere.
+        let junction = dir.join("planted");
+        let made = crate::util::command(r"C:\Windows\System32\cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&elsewhere)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(icacls(&dir).contains("Everyone") || icacls(&dir).contains("S-1-1-0"));
+
+        win::secure_tree(&dir, &["updates", "transfers"]).unwrap();
+
+        assert!(!junction.exists(), "the junction is gone");
+        assert!(elsewhere.join("keep.txt").exists(), "what it pointed at is untouched");
+        assert!(!dir.join("updates").exists(), "scratch folders are emptied");
+        for path in [&dir, &dir.join("unattended.json")] {
+            let acl = icacls(path);
+            assert!(!acl.contains("Everyone") && !acl.contains("S-1-1-0"), "{acl}");
+            assert!(acl.contains("SYSTEM"), "{acl}");
+        }
+        // A link in place of the folder itself is refused, not followed.
+        let fake = root.join("fake");
+        let made = crate::util::command(r"C:\Windows\System32\cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&fake)
+            .arg(&elsewhere)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(win::secure_tree(&fake, &[]).is_err());
+        let _ = std::fs::remove_dir(&fake);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

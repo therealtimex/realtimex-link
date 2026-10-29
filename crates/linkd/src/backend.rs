@@ -450,6 +450,7 @@ impl Backend {
         let spawned = crate::helper::spawn(&binary, || {
             Self::spawn_helper(&binary).map_err(|error| std::io::Error::other(error.message))
         })
+        .await
         .map_err(|error| {
             ApiError::new(502, format!("Remote Control helper did not start: {error}"))
         })?;
