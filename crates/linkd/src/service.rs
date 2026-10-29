@@ -20,6 +20,65 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Where the service keeps a transfer's files for the person at the console (SD C2):
+/// `%ProgramData%\RealTimeX Link\transfers\<session>`, made by the service, SYSTEM and
+/// administrators only, plus read for that session's signed-in user so their apps can open
+/// pasted files. At the sign-in screen there is nobody to give them to.
+#[cfg(windows)]
+pub fn transfers_dir() -> Result<std::path::PathBuf, crate::error::ApiError> {
+    use crate::error::ApiError;
+    let session = crate::helper::console_session()
+        .ok_or_else(|| ApiError::coded(409, "no-console", "Nobody is at this computer's screen"))?;
+    let user = win::session_user(session).ok_or_else(|| {
+        ApiError::coded(
+            409,
+            "nobody-signed-in",
+            "Files can be pasted once someone signs in on this computer",
+        )
+    })?;
+    let base = crate::unattended::machine_dir().join("transfers");
+    match win::create_protected_dir(&base, None) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(ApiError::internal(error)),
+    }
+    // Named by session and user: a new sign-in on the same session gets a folder of its own.
+    let dir = base.join(format!("{session}-{user}"));
+    match win::create_protected_dir(&dir, Some(&user)) {
+        Ok(()) => Ok(dir),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(dir),
+        Err(error) => Err(ApiError::internal(error)),
+    }
+}
+
+/// A new folder for one update's download (SD C2): SYSTEM and administrators only, under a
+/// random name in `%ProgramData%\RealTimeX Link\updates`.
+#[cfg(windows)]
+pub fn update_dir() -> std::io::Result<std::path::PathBuf> {
+    let base = crate::unattended::machine_dir().join("updates");
+    match win::create_protected_dir(&base, None) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let dir = base.join(crate::util::uuid());
+    win::create_protected_dir(&dir, None)?;
+    Ok(dir)
+}
+
+/// Whether writing into `dir` as SYSTEM would follow a junction or symbolic link (SD C3).
+pub fn is_link(dir: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        win::is_link(dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
 /// Run as the Windows service: returns when the Service Control Manager stops it.
 #[cfg(windows)]
 pub fn run() {

@@ -236,13 +236,17 @@ async fn hello(State(state): State<Shared>, Body64(body): Body64) -> Answer {
 }
 
 async fn version(State(state): State<Shared>) -> Json<Value> {
-    // Start with this computer (realtimex-link#10) only where Link has a service for it.
-    // RealTimeX shows its setting only when this is listed, and never requires it.
+    Json(json!({ "protocol": PROTOCOL, "version": state.version, "features": features() }))
+}
+
+/// FEATURES, and Start with this computer (realtimex-link#10) only where Link has a service
+/// for it. RealTimeX shows its setting only when this is listed, and never requires it.
+fn features() -> Vec<&'static str> {
     let mut features = FEATURES.to_vec();
     if crate::unattended::SUPPORTED {
         features.push("unattended");
     }
-    Json(json!({ "protocol": PROTOCOL, "version": state.version, "features": features }))
+    features
 }
 
 async fn status(State(state): State<Shared>) -> Json<Value> {
@@ -964,6 +968,12 @@ async fn stop_session(State(state): State<Shared>) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_with_this_computer_is_listed_only_on_windows() {
+        assert_eq!(features().contains(&"unattended"), cfg!(windows));
+        assert!(features().starts_with(FEATURES));
+    }
 
     #[test]
     fn a_release_moves_only_to_an_instance() {

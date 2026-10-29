@@ -22,6 +22,13 @@ Unicode true
 
 !define APP "RealTimeX Link"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\RealTimeX Link"
+; Start with this computer (realtimex-link#10): Link's service, LocalSystem. It does nothing until
+; the setting is turned on (crates/linkd/src/service.rs).
+!define SERVICE "RealTimeX Link Service"
+; Lets services send Ctrl+Alt+Delete (SendSAS) for a viewer. Machine policy: the value it had is
+; kept in the uninstall key and put back on uninstall.
+!define POLICY_KEY "Software\Microsoft\Windows\CurrentVersion\Policies\System"
+!define SAS_VALUE "SoftwareSASGeneration"
 
 Name "${APP}"
 OutFile "${OUTFILE}"
@@ -62,9 +69,19 @@ Function OpenLink
   Exec '"$WINDIR\explorer.exe" "$INSTDIR\rtx-link.exe"'
 FunctionEnd
 
+; Stop the service before files are replaced (rtx-linkd install also stops Link's processes).
+Function StopService
+  nsExec::Exec '"$SYSDIR\sc.exe" stop "${SERVICE}"'
+  Pop $0
+  ${If} $0 == 0
+    Sleep 3000
+  ${EndIf}
+FunctionEnd
+
 Section "Install"
   SetShellVarContext all
   InitPluginsDir
+  Call StopService
   SetOutPath "$PLUGINSDIR\payload"
   File "${PAYLOAD}\rtx-linkd.exe"
   File "${PAYLOAD}\rtx-link.exe"
@@ -78,8 +95,44 @@ Section "Install"
   ${EndIf}
   SetOutPath "$TEMP"
 
+  ; ProgramData\RealTimeX Link holds the service's choice (unattended.json): SYSTEM and
+  ; administrators write, users only read, nothing inherited from ProgramData (which lets users
+  ; create files).
   CreateDirectory "$APPDATA\${APP}"
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX'
   WriteUninstaller "$APPDATA\${APP}\Uninstall ${APP}.exe"
+
+  ; The service: created, or pointed at this install when it exists; restarted if it fails.
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" create "${SERVICE}" binPath= "\"$INSTDIR\rtx-linkd.exe\" --service" start= auto obj= LocalSystem DisplayName= "${SERVICE}"'
+  Pop $0
+  ${If} $0 != 0
+    nsExec::ExecToLog '"$SYSDIR\sc.exe" config "${SERVICE}" binPath= "\"$INSTDIR\rtx-linkd.exe\" --service" start= auto obj= LocalSystem'
+  ${EndIf}
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" description "${SERVICE}" "Lets computers you allowed reach this one before anyone signs in, when Start with this computer is on."'
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" failure "${SERVICE}" reset= 86400 actions= restart/5000/restart/5000/restart/60000'
+
+  ; Ctrl+Alt+Delete from services, keeping what Ease of Access had. The first install records
+  ; the value it found ("none" when there was none).
+  ClearErrors
+  ReadRegStr $1 HKLM "${UNINSTALL_KEY}" "Previous${SAS_VALUE}"
+  ${If} ${Errors}
+    ClearErrors
+    ReadRegDWORD $2 HKLM "${POLICY_KEY}" "${SAS_VALUE}"
+    ${If} ${Errors}
+      StrCpy $1 "none"
+      StrCpy $2 0
+    ${Else}
+      StrCpy $1 $2
+    ${EndIf}
+    WriteRegStr HKLM "${UNINSTALL_KEY}" "Previous${SAS_VALUE}" $1
+  ${Else}
+    ReadRegDWORD $2 HKLM "${POLICY_KEY}" "${SAS_VALUE}"
+  ${EndIf}
+  IntOp $2 $2 | 1
+  WriteRegDWORD HKLM "${POLICY_KEY}" "${SAS_VALUE}" $2
+
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" start "${SERVICE}"'
+
   CreateShortCut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\rtx-link.exe" "" "$INSTDIR\rtx-link.exe" 0
 
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${APP}"
@@ -95,6 +148,20 @@ SectionEnd
 Section "Uninstall"
   SetShellVarContext all
   SetRegView 64
+  ; The service first: it would start the daemon again.
+  nsExec::Exec '"$SYSDIR\sc.exe" stop "${SERVICE}"'
+  Sleep 2000
+  nsExec::Exec '"$SYSDIR\sc.exe" delete "${SERVICE}"'
+  ; The SAS policy as it was before Link.
+  ClearErrors
+  ReadRegStr $1 HKLM "${UNINSTALL_KEY}" "Previous${SAS_VALUE}"
+  ${IfNot} ${Errors}
+    ${If} $1 == "none"
+      DeleteRegValue HKLM "${POLICY_KEY}" "${SAS_VALUE}"
+    ${Else}
+      WriteRegDWORD HKLM "${POLICY_KEY}" "${SAS_VALUE}" $1
+    ${EndIf}
+  ${EndIf}
   ; Stop Link (its window and icon, the daemon, the control helper) before removing it.
   nsExec::Exec 'taskkill /F /IM rtx-link.exe'
   nsExec::Exec 'taskkill /F /IM rtx-linkd.exe'
@@ -106,5 +173,9 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${APP}.lnk"
   DeleteRegKey HKLM "${UNINSTALL_KEY}"
   Delete "$APPDATA\${APP}\Uninstall ${APP}.exe"
+  Delete "$APPDATA\${APP}\unattended.json"
+  Delete "$APPDATA\${APP}\service.log"
+  RMDir /r "$APPDATA\${APP}\updates"
+  RMDir /r "$APPDATA\${APP}\transfers"
   RMDir "$APPDATA\${APP}"
 SectionEnd

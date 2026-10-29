@@ -137,6 +137,17 @@ impl Transfers {
         )
     }
 
+    /// Where a transfer's files wait. Under Link's service (SYSTEM) never the shared Windows
+    /// temp folder, which other users can write: a protected folder for the person at the
+    /// console (service.rs, SD C2).
+    fn temp(&self) -> Result<PathBuf, ApiError> {
+        #[cfg(windows)]
+        if crate::service::active() {
+            return crate::service::transfers_dir();
+        }
+        Ok(self.temp_dir.clone())
+    }
+
     fn open(&self) -> std::sync::MutexGuard<'_, HashMap<String, Open>> {
         self.open.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -205,10 +216,9 @@ impl Transfers {
                 "Too many transfers at once",
             ));
         }
-        fs::create_dir_all(&self.temp_dir).map_err(ApiError::internal)?;
-        let path = self
-            .temp_dir
-            .join(format!("{}-{}.part", std::process::id(), uuid()));
+        let temp = self.temp()?;
+        fs::create_dir_all(&temp).map_err(ApiError::internal)?;
+        let path = temp.join(format!("{}-{}.part", std::process::id(), uuid()));
         let file = create_private(&path).map_err(ApiError::internal)?;
         open.insert(
             key,
@@ -297,7 +307,7 @@ impl Transfers {
                     let mut groups = self.groups();
                     if !groups.contains_key(&group_key) {
                         self.prune_pasted();
-                        let dir = self.temp_dir.join("pasted").join(uuid());
+                        let dir = self.temp()?.join("pasted").join(uuid());
                         groups.insert(
                             group_key.clone(),
                             Group {
@@ -325,6 +335,14 @@ impl Transfers {
                     Ok(Ended::Stored)
                 }
                 _ => {
+                    // As SYSTEM, never write through a junction or link (SD C3).
+                    if crate::service::active() && crate::service::is_link(&self.downloads) {
+                        return Err(ApiError::coded(
+                            409,
+                            "downloads-unavailable",
+                            "Downloads on this computer can't be written to",
+                        ));
+                    }
                     fs::create_dir_all(&self.downloads).map_err(ApiError::internal)?;
                     let target = claim_free_path(&self.downloads, &name, &path)?;
                     let saved = target
@@ -366,7 +384,8 @@ impl Transfers {
 
     /// Earlier pasted files old enough to go.
     fn prune_pasted(&self) {
-        let Ok(entries) = fs::read_dir(self.temp_dir.join("pasted")) else {
+        let Ok(temp) = self.temp() else { return };
+        let Ok(entries) = fs::read_dir(temp.join("pasted")) else {
             return;
         };
         for entry in entries.flatten() {

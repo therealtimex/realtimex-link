@@ -39,6 +39,10 @@ pub struct Snapshot {
     pub status: Option<Value>,
     /// What RealTimeX shares through Link, and whether it runs (GET /v1/shared).
     pub shared: Option<Value>,
+    /// Start with this computer (GET /v1/unattended, realtimex-link#10), where Link supports it.
+    pub unattended: Option<Value>,
+    /// A change to it is on its way: the switch waits for Link to confirm it.
+    pub unattended_pending: bool,
     pub error: Option<String>,
     pub notice: Option<(String, bool, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
@@ -84,6 +88,38 @@ pub fn act(
         };
         if !notice.0.is_empty() {
             lock(&shared).notice = Some((notice.0, notice.1, Instant::now()));
+        }
+        let _ = refresh.send(());
+        ctx.request_repaint();
+    });
+}
+
+/// Start with this computer on or off (POST /v1/unattended). The switch stays as it was, and
+/// disabled, until Link answers; the next read shows what Link did.
+pub fn set_unattended(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context, on: bool) {
+    let (shared, refresh, ctx) = (shared.clone(), refresh.clone(), ctx.clone());
+    lock(&shared).unattended_pending = true;
+    std::thread::spawn(move || {
+        let api = lock(&shared).api.clone();
+        let result = match api {
+            Some(api) => api.post("/v1/unattended", json!({ "enabled": on })),
+            None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
+        };
+        let notice = match result {
+            Ok(answer) => {
+                lock(&shared).unattended = Some(answer);
+                if on {
+                    (t("settings.startWithComputerOn"), true)
+                } else {
+                    (t("settings.startWithComputerOff"), true)
+                }
+            }
+            Err(_) => (t("settings.startWithComputerFailed"), false),
+        };
+        {
+            let mut state = lock(&shared);
+            state.unattended_pending = false;
+            state.notice = Some((notice.0, notice.1, Instant::now()));
         }
         let _ = refresh.send(());
         ctx.request_repaint();
@@ -265,6 +301,11 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
                 }
             }
             let pushed = api.get("/v1/shared").ok();
+            // An older daemon has no such endpoint, and other systems don't support it: hidden.
+            let unattended = api
+                .get("/v1/unattended")
+                .ok()
+                .filter(|state| state["supported"] == Value::Bool(true));
             let overview = api.get("/v1/host/overview");
             let requests = api.get("/v1/host/connection-requests");
             let password = api.get("/v1/host/password");
@@ -280,6 +321,7 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
             state.account = account;
             state.update = update;
             state.shared = pushed;
+            state.unattended = unattended;
             match overview {
                 Ok(overview) => {
                     state.overview = Some(overview);
@@ -357,6 +399,8 @@ enum Confirm {
         name: String,
     },
     SignOut,
+    /// Start with this computer: its sign-in and lock screens become reachable.
+    StartWithComputer,
 }
 
 pub struct LinkApp {
@@ -1721,7 +1765,93 @@ impl LinkApp {
                 ui.add_space(4.0);
                 caption(ui, t("settings.realtimexNote"));
             }
+            // After the note, which doesn't cover it (contract §2).
+            self.start_with_computer_ui(ui, ctx);
         });
+    }
+
+    /// Start with this computer (realtimex-ai-app#2967 contract §1–§4): shown only where Link
+    /// supports it. A switch where the person can change it, a badge where they can't, and one
+    /// status line, the first that applies.
+    fn start_with_computer_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (state, pending, running, allow) = {
+            let shared = lock(&self.shared);
+            let Some(state) = shared.unattended.clone() else { return };
+            let running = shared
+                .status
+                .as_ref()
+                .and_then(|s| s.get("running"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let allow = shared
+                .overview
+                .as_ref()
+                .and_then(|o| o.get("allowIncoming"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            (state, shared.unattended_pending, running, allow)
+        };
+        let field = |name: &str| state.get(name).and_then(Value::as_bool).unwrap_or(false);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        let label = t("settings.startWithComputer");
+        if !field("serviceInstalled") {
+            ui.label(semibold(label.as_str()));
+            alert(ui, Tone::Warning, &t("settings.serviceMissingTitle"), |ui| {
+                ui.label(t("settings.serviceMissing"));
+            });
+            return;
+        }
+        let mut on = field("enabled");
+        let can_change = field("canChange");
+        let mut changed = false;
+        // The label and its wrapping caption on the left, the switch (or badge) on the right,
+        // top-aligned: the switch never moves to a line of its own (contract §2).
+        ui.horizontal_top(|ui| {
+            let side = if can_change {
+                2.2 * ui.spacing().interact_size.y
+            } else {
+                badge_width(ui, &t(if on { "link.on" } else { "link.off" }))
+            };
+            let text_width = (ui.available_width() - side - ui.spacing().item_spacing.x).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(text_width);
+                    ui.label(semibold(label.as_str()));
+                    caption(ui, t("settings.startWithComputerHelp"));
+                },
+            );
+            if can_change {
+                ui.add_enabled_ui(!pending, |ui| {
+                    changed = toggle(ui, &mut on, &label).changed();
+                });
+            } else {
+                let text = t(if on { "link.on" } else { "link.off" });
+                badge(ui, &text, Tone::Neutral);
+            }
+        });
+        let status = if !can_change {
+            Some(t("settings.startWithComputerAdmin"))
+        } else if !running {
+            Some(t("settings.startWithComputerLinkOff"))
+        } else if on && !allow {
+            Some(t("settings.startWithComputerRemoteOff"))
+        } else {
+            None
+        };
+        if let Some(status) = status {
+            caption(ui, status);
+        }
+        if changed {
+            if on {
+                self.confirm = Some(Confirm::StartWithComputer);
+            } else {
+                set_unattended(&self.shared, &self.refresh, ctx, false);
+            }
+        }
     }
 
     /// Changes that end someone's access ask first.
@@ -1736,6 +1866,7 @@ impl LinkApp {
             Confirm::StopSession(name) => ("stop", name.as_str()),
             Confirm::Remove { name, .. } => ("remove", name.as_str()),
             Confirm::SignOut => ("signOut", ""),
+            Confirm::StartWithComputer => ("startWithComputer", ""),
         };
         let part = |part: &str| tf(&format!("confirm.{which}.{part}"), &[("name", name)]);
         let message = match confirm {
@@ -1750,11 +1881,15 @@ impl LinkApp {
             ui.label(semibold(title).size(15.0));
             ui.label(message);
             ui.add_space(8.0);
+            // Turning something on isn't destructive: its button isn't red.
+            let destructive = !matches!(self.confirm, Some(Confirm::StartWithComputer));
             ui.horizontal(|ui| {
-                if ui
-                    .button(semibold(action).color(tone_colors(ui, Tone::Danger).2))
-                    .clicked()
-                {
+                let action = if destructive {
+                    semibold(action).color(tone_colors(ui, Tone::Danger).2)
+                } else {
+                    semibold(action)
+                };
+                if ui.button(action).clicked() {
                     confirmed = true;
                 }
                 let cancel = ui.button(t("common.cancel"));
@@ -1812,6 +1947,9 @@ impl LinkApp {
                     json!({}),
                     &t("account.signedOut"),
                 ),
+                Some(Confirm::StartWithComputer) => {
+                    set_unattended(&self.shared, &self.refresh, ctx, true);
+                }
                 None => {}
             }
         } else if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

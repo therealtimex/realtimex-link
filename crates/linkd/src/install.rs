@@ -242,7 +242,7 @@ fn others_running_script(paths: &[PathBuf]) -> String {
 
 #[cfg(windows)]
 fn platform_others_running(paths: &[PathBuf]) -> bool {
-    crate::util::command("powershell")
+    crate::util::command(crate::util::powershell())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -328,7 +328,7 @@ fn running(path: &Path) -> bool {
         "if (Get-Process | Where-Object {{ $_.Path -eq '{}' }}) {{ exit 0 }} else {{ exit 1 }}",
         powershell_path(path)
     );
-    crate::util::command("powershell")
+    crate::util::command(crate::util::powershell())
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Stdio::null())
         .status()
@@ -341,7 +341,7 @@ fn signal(path: &Path) {
         "Get-Process | Where-Object {{ $_.Path -eq '{}' }} | Stop-Process -Force",
         powershell_path(path)
     );
-    let _ = crate::util::command("powershell")
+    let _ = crate::util::command(crate::util::powershell())
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Stdio::null())
         .status();

@@ -228,6 +228,12 @@ extern "system" {
     pub fn GetFileAttributesW(path: *const u16) -> u32;
     pub fn FindFirstFileW(path: *const u16, data: *mut WIN32_FIND_DATAW) -> HANDLE;
     pub fn FindClose(find: HANDLE) -> BOOL;
+    pub fn CreateDirectoryW(path: *const u16, attributes: *const SECURITY_ATTRIBUTES) -> BOOL;
+}
+
+#[link(name = "wtsapi32")]
+extern "system" {
+    pub fn WTSQueryUserToken(session: u32, token: *mut HANDLE) -> BOOL;
 }
 
 #[link(name = "netapi32")]
@@ -479,6 +485,49 @@ pub fn account_is_admin(sid: &str) -> Option<bool> {
         .any(|&name| unsafe { from_wide(name) }.to_lowercase() == admins_name);
     unsafe { NetApiBufferFree(buffer.cast()) };
     Some(admin)
+}
+
+/// Create a folder with only SYSTEM and administrators in its DACL, not inherited from its
+/// parent, plus read for `reader` (a SID) when given: what files made in it inherit (SD C2).
+pub fn create_protected_dir(path: &std::path::Path, reader: Option<&str>) -> std::io::Result<()> {
+    let reader = reader.map_or(String::new(), |sid| format!("(A;OICI;FRFX;;;{sid})"));
+    let sddl = wide(&format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){reader}"));
+    let mut descriptor: *mut c_void = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let text = wide(&path.to_string_lossy());
+    let created = unsafe { CreateDirectoryW(text.as_ptr(), &attributes) } != 0;
+    let error = std::io::Error::last_os_error();
+    unsafe { LocalFree(descriptor) };
+    if created {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// The user signed in on a session, as a SID (None at the sign-in screen).
+pub fn session_user(session: u32) -> Option<String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { WTSQueryUserToken(session, &mut token) } == 0 {
+        return None;
+    }
+    let token = Handle(token);
+    token_user(token.0)
 }
 
 /// Whether a folder is a junction or a symbolic link (a OneDrive placeholder is fine): writes
