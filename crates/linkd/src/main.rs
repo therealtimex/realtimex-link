@@ -35,11 +35,13 @@ mod requests;
 mod router;
 mod secret_box;
 mod secure_attention;
+mod service;
 mod shared;
 mod signin;
 mod store;
 mod tailscale;
 mod transfers;
+mod unattended;
 mod update;
 mod util;
 mod webhooks;
@@ -50,6 +52,8 @@ use std::sync::Arc;
 use serde_json::json;
 
 const EXIT_ALREADY_RUNNING: i32 = 3;
+/// Link's service runs this folder's daemon (realtimex-link#10): callers use that one.
+const EXIT_SERVICE_RUNS_IT: i32 = 4;
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -62,8 +66,22 @@ fn print_line(value: serde_json::Value) {
     println!("{value}");
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Link's Windows service (service.rs): the Service Control Manager starts it, and it makes
+    // its own runtime once the service is registered.
+    if std::env::args().skip(1).any(|arg| arg == "--service") {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        service::run();
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the daemon's runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // TLS for the relay (relay.rs) with one crypto provider, chosen here.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -93,6 +111,20 @@ async fn main() {
     let port = arg_value(&args, "--port")
         .and_then(|p| p.parse().ok())
         .unwrap_or(host::DEFAULT_PORT);
+    // While Link's service runs this folder's daemon, a second one must not take its lock
+    // (SD C4): the window and RealTimeX attach to the service's through linkd.json.
+    if unattended::SUPPORTED {
+        let request = unattended::Request::Status {
+            data_dir: data_dir.clone(),
+        };
+        if unattended::yields(unattended::ask(&request).ok().flatten().as_ref()) {
+            print_line(json!({
+                "error": "RealTimeX Link's service runs this folder's daemon",
+                "code": "service-runs-it",
+            }));
+            std::process::exit(EXIT_SERVICE_RUNS_IT);
+        }
+    }
     let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line: &str| eprintln!("{line}"));
     let started = daemon::start(daemon::Options {
         data_dir,

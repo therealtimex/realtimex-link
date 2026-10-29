@@ -803,11 +803,16 @@ impl Host {
     /// Turned off through POST /v1/autostart, it stays off until the switch is turned on again.
     /// A copy with its own data folder (development, tests) leaves the login item alone.
     fn sync_login_item(&self) -> anyhow::Result<()> {
-        if !crate::paths::is_standard() {
+        // The service's daemon runs as SYSTEM: its HKCU isn't the owner's.
+        if !crate::paths::is_standard() || crate::service::active() {
             return Ok(());
         }
         let running = self.state().keep_running;
-        let opted_out = crate::autostart::opted_out(&self.store);
+        // While this folder starts with the computer, its login item stays (SD §1): the
+        // person's choice is kept and applies again once that is off.
+        let unattended = crate::paths::data_dir()
+            .is_some_and(|dir| crate::unattended::enabled_for(&dir));
+        let opted_out = crate::autostart::opted_out(&self.store) && !unattended;
         match crate::autostart::follow(running, opted_out)? {
             crate::autostart::Change::Add => {
                 (self.log)("[remote-control] RealTimeX Link starts at login");
@@ -818,6 +823,11 @@ impl Host {
             crate::autostart::Change::Keep => {}
         }
         Ok(())
+    }
+
+    /// Bring the login item in line now (POST /v1/unattended turning on).
+    pub fn follow_hosting_at_login_now(&self) {
+        self.follow_hosting_at_login();
     }
 
     fn follow_hosting_at_login(&self) {
