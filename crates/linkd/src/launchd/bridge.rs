@@ -61,8 +61,10 @@ fn console() -> Console {
         let key = |name: &std::ffi::CStr| CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), 0x0800_0100);
         let on_key = key(c"kCGSSessionOnConsoleKey");
         let secure_key = key(c"kCGSSessionSecureInputPID");
+        let locked_key = key(c"CGSSessionScreenIsLocked");
         let on = CFDictionaryGetValue(dictionary, on_key);
         let secure = CFDictionaryGetValue(dictionary, secure_key);
+        let locked = CFDictionaryGetValue(dictionary, locked_key);
         // A number (1) in the session dictionary, or a boolean: either counts.
         let number = |value: *const std::ffi::c_void| -> Option<i32> {
             if value.is_null() {
@@ -77,12 +79,17 @@ fn console() -> Console {
                 .then_some(out)
         };
         let on_console = number(on).is_some_and(|value| value != 0);
-        // At the login window SecurityAgent holds it (its password field), not loginwindow.
-        let secure_input = number(secure).is_some_and(|pid| {
-            pid > 0 && matches!(process_name(pid).as_deref(), Some("loginwindow" | "SecurityAgent"))
-        });
+        // The job posts only at the login window (this bridge is root's) or a locked screen
+        // (Addendum 6): an administrator's password dialog in an unlocked session also holds
+        // Secure Input through SecurityAgent, and stays on CGEventPost.
+        // SAFETY: a plain getter.
+        let login_window = libc::getuid() == 0;
+        let screen_locked = number(locked).is_some_and(|value| value != 0);
+        let secure_input = (login_window || screen_locked)
+            && number(secure).is_some_and(|pid| pid > 0 && process_path(pid).as_deref().is_some_and(login_ui));
         CFRelease(on_key);
         CFRelease(secure_key);
+        CFRelease(locked_key);
         CFRelease(dictionary);
         Console { on_console, secure_input }
     }
@@ -121,11 +128,19 @@ fn log(line: &str) {
     }
 }
 
-fn process_name(pid: i32) -> Option<String> {
-    let mut buffer = [0u8; 256];
-    // SAFETY: the buffer's size is passed.
-    let length = unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+fn process_path(pid: i32) -> Option<String> {
+    let mut buffer = [0u8; 4 * 1024];
+    // SAFETY: the buffer's size is passed (PROC_PIDPATHINFO_MAXSIZE).
+    let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     (length > 0).then(|| String::from_utf8_lossy(&buffer[..length as usize]).into_owned())
+}
+
+/// Whether a Secure Input holder is the login window's own UI, by its executable's path (I4,
+/// Addendum 6): loginwindow, or SecurityAgent (the login window's password field).
+pub fn login_ui(path: &str) -> bool {
+    path == "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+        || (path.starts_with("/System/Library/Frameworks/Security.framework/")
+            && path.ends_with("/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"))
 }
 
 pub fn run(args: &[String]) -> ! {
@@ -301,10 +316,19 @@ impl Helper {
         let mut to_helper = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
         let from_helper = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
         let daemon = UnixStream::from(ours);
-        // Helper → daemon, as it is.
+        // Helper → daemon, as it is. A job send that failed (a full channel) may have dropped a
+        // key-up: the job lets go of everything (Addendum 6).
         let mut to_daemon = daemon.try_clone()?;
+        let input_for_answers = input.clone();
         std::thread::spawn(move || {
-            let _ = std::io::copy(&mut BufReader::new(from_helper), &mut to_daemon);
+            for line in BufReader::new(from_helper).lines().map_while(Result::ok) {
+                if line.contains("\"input-unavailable\"") {
+                    release(&input_for_answers);
+                }
+                if writeln!(to_daemon, "{line}").is_err() {
+                    break;
+                }
+            }
         });
         // Daemon → helper, only what this session allows (M5).
         std::thread::spawn(move || {

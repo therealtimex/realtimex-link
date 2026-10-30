@@ -220,42 +220,52 @@ const FLAG_COMMAND: u64 = 0x0010_0000;
 const KEYCODE_V: u16 = 0x09;
 const KEYCODE_COMMAND: u16 = 0x37;
 
-/// Post on a worker, waiting at most this long (realtimex-link#11 I1): a post that hangs (as at
-/// the login window, where WindowServer drops them) fails the request instead of the loop.
+/// How long one CG input call may take on the worker (realtimex-link#11 I1).
 const POST_LIMIT: Duration = Duration::from_secs(2);
 
-fn post(event: CGEventRef) -> Result<()> {
+type Work = Box<dyn FnOnce() -> Result<()> + Send>;
+
+/// Run one CG input call on the worker: making the event, setting its fields and posting it,
+/// waiting at most [`POST_LIMIT`] (I1, Addendum 6). Under Secure Input (the login window)
+/// WindowServer may never answer, already when the event is made; the request then fails with
+/// `input-unavailable` instead of holding the loop.
+fn on_worker(work: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
     use std::sync::mpsc;
     use std::sync::{Mutex, OnceLock};
-    static POSTER: OnceLock<Mutex<mpsc::Sender<(usize, mpsc::SyncSender<()>)>>> = OnceLock::new();
-    if event.is_null() {
-        bail!("could not create the input event");
-    }
-    let poster = POSTER.get_or_init(|| {
-        let (send, receive) = mpsc::channel::<(usize, mpsc::SyncSender<()>)>();
+    static WORKER: OnceLock<Mutex<mpsc::Sender<(Work, mpsc::SyncSender<Result<()>>)>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (send, receive) = mpsc::channel::<(Work, mpsc::SyncSender<Result<()>>)>();
         std::thread::spawn(move || {
-            for (event, done) in receive {
-                // SAFETY: an event created for this post, released once posted.
-                unsafe {
-                    CGEventPost(HID_EVENT_TAP, event as CGEventRef);
-                    CFRelease(event as CGEventRef);
-                }
-                let _ = done.send(());
+            for (work, done) in receive {
+                let _ = done.send(work());
             }
         });
         Mutex::new(send)
     });
-    let (done, posted) = mpsc::sync_channel(1);
-    let sent = poster
+    let (done, finished) = mpsc::sync_channel(1);
+    let sent = worker
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .send((event as usize, done));
-    if sent.is_err() || posted.recv_timeout(POST_LIMIT).is_err() {
-        return Err(super::InputError {
+        .send((Box::new(work), done));
+    match (sent, finished.recv_timeout(POST_LIMIT)) {
+        (Ok(()), Ok(result)) => result,
+        _ => Err(super::InputError {
             code: "input-unavailable",
             message: "Input isn't getting through on this screen".into(),
         }
-        .into());
+        .into()),
+    }
+}
+
+/// Post an event the worker just made, and release it. Only on the worker.
+fn post(event: CGEventRef) -> Result<()> {
+    if event.is_null() {
+        bail!("could not create the input event");
+    }
+    // SAFETY: an event made for this post, released once posted.
+    unsafe {
+        CGEventPost(HID_EVENT_TAP, event);
+        CFRelease(event);
     }
     Ok(())
 }
@@ -511,11 +521,15 @@ impl Input {
             let kind = if kind == MOUSE_MOVED { MouseKind::Move } else { MouseKind::Drag };
             return self.job_mouse(kind, button);
         }
-        let event = unsafe { CGEventCreateMouseEvent(self.source, kind, self.position, button) };
-        if !event.is_null() {
-            unsafe { CGEventSetFlags(event, self.flags()) };
-        }
-        post(event)
+        let (source, position, flags) = (self.source as usize, self.position, self.flags());
+        on_worker(move || {
+            // SAFETY: the source lives as long as this Input; the event is posted and released.
+            let event = unsafe { CGEventCreateMouseEvent(source as CGEventSourceRef, kind, position, button) };
+            if !event.is_null() {
+                unsafe { CGEventSetFlags(event, flags) };
+            }
+            post(event)
+        })
     }
 
     pub fn button(&mut self, button: Button, pressed: bool) -> Result<()> {
@@ -538,21 +552,20 @@ impl Input {
         if self.via_job {
             return self.job_mouse(if pressed { MouseKind::Down } else { MouseKind::Up }, index);
         }
-        let event = unsafe {
-            CGEventCreateMouseEvent(
-                self.source,
-                if pressed { down } else { up },
-                self.position,
-                index,
-            )
-        };
-        if !event.is_null() {
-            unsafe {
-                CGEventSetIntegerValueField(event, FIELD_CLICK_STATE, self.click_state);
-                CGEventSetFlags(event, self.flags());
+        let (source, position, flags, clicks) = (self.source as usize, self.position, self.flags(), self.click_state);
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe {
+                CGEventCreateMouseEvent(source as CGEventSourceRef, if pressed { down } else { up }, position, index)
+            };
+            if !event.is_null() {
+                unsafe {
+                    CGEventSetIntegerValueField(event, FIELD_CLICK_STATE, clicks);
+                    CGEventSetFlags(event, flags);
+                }
             }
-        }
-        post(event)
+            post(event)
+        })
     }
 
     pub fn keysym(&mut self, keysym: u32, pressed: bool) -> Result<()> {
@@ -584,28 +597,29 @@ impl Input {
             return job::send(&job::key_events(code, character, shift && !shortcut, held, pressed));
         }
         let flags = self.flags() | if shift && !shortcut { FLAG_SHIFT } else { 0 };
-        let event = unsafe { CGEventCreateKeyboardEvent(self.source, code.unwrap_or(0), pressed) };
-        if event.is_null() {
-            bail!("could not create the key event");
+        if code.is_none() && !matches!(key, Key::Char(_)) {
+            bail!("{key:?} has no macOS key");
         }
-        unsafe {
-            match key {
-                // The exact character too, so typing doesn't depend on the keyboard layout.
-                Key::Char(c) if code.is_none() || !shortcut => {
-                    let mut units = [0u16; 2];
-                    let units = c.encode_utf16(&mut units);
-                    CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
-                }
-                Key::Char(_) => {}
-                _ if code.is_none() => {
-                    CFRelease(event);
-                    bail!("{key:?} has no macOS key");
-                }
-                _ => {}
+        let source = self.source as usize;
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe { CGEventCreateKeyboardEvent(source as CGEventSourceRef, code.unwrap_or(0), pressed) };
+            if event.is_null() {
+                bail!("could not create the key event");
             }
-            CGEventSetFlags(event, flags);
-        }
-        post(event)
+            unsafe {
+                // The exact character too, so typing doesn't depend on the keyboard layout.
+                if let Key::Char(c) = key {
+                    if code.is_none() || !shortcut {
+                        let mut units = [0u16; 2];
+                        let units = c.encode_utf16(&mut units);
+                        CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
+                    }
+                }
+                CGEventSetFlags(event, flags);
+            }
+            post(event)
+        })
     }
 
     /// A physical key by position (#2909). No Unicode string goes with it, so this Mac's own
@@ -631,17 +645,21 @@ impl Input {
                 flags: mask,
             }]);
         }
-        let event = unsafe { CGEventCreateKeyboardEvent(self.source, key.mac, pressed) };
-        if event.is_null() {
-            bail!("could not create the key event");
-        }
-        unsafe {
-            if repeat {
-                CGEventSetIntegerValueField(event, FIELD_KEYBOARD_AUTOREPEAT, 1);
+        let (source, code, flags) = (self.source as usize, key.mac, self.flags());
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe { CGEventCreateKeyboardEvent(source as CGEventSourceRef, code, pressed) };
+            if event.is_null() {
+                bail!("could not create the key event");
             }
-            CGEventSetFlags(event, self.flags());
-        }
-        post(event)
+            unsafe {
+                if repeat {
+                    CGEventSetIntegerValueField(event, FIELD_KEYBOARD_AUTOREPEAT, 1);
+                }
+                CGEventSetFlags(event, flags);
+            }
+            post(event)
+        })
     }
 
     pub fn scroll(&mut self, dx: i32, dy: i32) -> Result<()> {
@@ -650,10 +668,14 @@ impl Input {
             let clamp = |delta: i32| (-delta).clamp(-100, 100) as i16;
             return job::send(&[Event::Scroll { dy: clamp(dy), dx: clamp(dx) }]);
         }
-        let event = unsafe {
-            CGEventCreateScrollWheelEvent2(self.source, SCROLL_UNITS_LINE, 2, -dy, -dx, 0)
-        };
-        post(event)
+        let source = self.source as usize;
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe {
+                CGEventCreateScrollWheelEvent2(source as CGEventSourceRef, SCROLL_UNITS_LINE, 2, -dy, -dx, 0)
+            };
+            post(event)
+        })
     }
 
     /// The pasteboard's change count, and whether its content is this helper's own write.
@@ -738,16 +760,16 @@ impl Input {
             (KEYCODE_V, false),
             (KEYCODE_COMMAND, false),
         ] {
-            let event = unsafe { CGEventCreateKeyboardEvent(self.source, code, down) };
-            if !event.is_null() {
-                let event_flags = if code == KEYCODE_COMMAND && !down {
-                    self.flags()
-                } else {
-                    flags
-                };
-                unsafe { CGEventSetFlags(event, event_flags) };
-            }
-            post(event)?;
+            let event_flags = if code == KEYCODE_COMMAND && !down { self.flags() } else { flags };
+            let source = self.source as usize;
+            on_worker(move || {
+                // SAFETY: as in move_to.
+                let event = unsafe { CGEventCreateKeyboardEvent(source as CGEventSourceRef, code, down) };
+                if !event.is_null() {
+                    unsafe { CGEventSetFlags(event, event_flags) };
+                }
+                post(event)
+            })?;
         }
         self.gap.pasted();
         Ok(())

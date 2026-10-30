@@ -56,8 +56,19 @@ fn socketpair_datagram() -> Option<(OwnedFd, OwnedFd)> {
         if libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) != 0 {
             return None;
         }
+        // Room for a burst of events either way (a fast typist, a drag): 256 KiB.
+        let room: libc::c_int = 256 * 1024;
         for fd in fds {
             libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&room as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
         }
         Some((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])))
     }
