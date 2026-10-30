@@ -43,8 +43,8 @@ extern "C" {
     fn CFBooleanGetValue(boolean: *const std::ffi::c_void) -> bool;
 }
 
-/// This session's console state: whether it has the console, and whether loginwindow holds
-/// Secure Input (I4: the job posts then).
+/// This session's console state: whether it has the console, and whether the login window holds
+/// Secure Input (I4: the job posts then): loginwindow, or SecurityAgent for its password field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Console {
     pub on_console: bool,
@@ -77,8 +77,10 @@ fn console() -> Console {
                 .then_some(out)
         };
         let on_console = number(on).is_some_and(|value| value != 0);
-        let secure_input = number(secure)
-            .is_some_and(|pid| pid > 0 && process_name(pid).as_deref() == Some("loginwindow"));
+        // At the login window SecurityAgent holds it (its password field), not loginwindow.
+        let secure_input = number(secure).is_some_and(|pid| {
+            pid > 0 && matches!(process_name(pid).as_deref(), Some("loginwindow" | "SecurityAgent"))
+        });
         CFRelease(on_key);
         CFRelease(secure_key);
         CFRelease(dictionary);
@@ -176,6 +178,7 @@ fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
             }
             let next = console();
             if next != now {
+                log(&format!("console: on {}, secure input {}", next.on_console, next.secure_input));
                 now = next;
                 release(&input);
                 if send_status(&stream, now).is_err() {
