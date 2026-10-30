@@ -36,8 +36,11 @@ extern "C" {
     fn CFRelease(object: *const std::ffi::c_void);
     fn CFDictionaryGetValue(dictionary: *const std::ffi::c_void, key: *const std::ffi::c_void) -> *const std::ffi::c_void;
     fn CFStringCreateWithCString(allocator: *const std::ffi::c_void, text: *const libc::c_char, encoding: u32) -> *const std::ffi::c_void;
-    fn CFBooleanGetValue(boolean: *const std::ffi::c_void) -> bool;
     fn CFNumberGetValue(number: *const std::ffi::c_void, kind: isize, value: *mut std::ffi::c_void) -> bool;
+    fn CFGetTypeID(object: *const std::ffi::c_void) -> usize;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(boolean: *const std::ffi::c_void) -> bool;
 }
 
 /// This session's console state: whether it has the console, and whether loginwindow holds
@@ -60,12 +63,22 @@ fn console() -> Console {
         let secure_key = key(c"kCGSSessionSecureInputPID");
         let on = CFDictionaryGetValue(dictionary, on_key);
         let secure = CFDictionaryGetValue(dictionary, secure_key);
-        let on_console = !on.is_null() && CFBooleanGetValue(on);
-        let mut pid: i32 = 0;
-        // kCFNumberSInt32Type
-        let secure_input = !secure.is_null()
-            && CFNumberGetValue(secure, 3, (&mut pid as *mut i32).cast())
-            && process_name(pid).as_deref() == Some("loginwindow");
+        // A number (1) in the session dictionary, or a boolean: either counts.
+        let number = |value: *const std::ffi::c_void| -> Option<i32> {
+            if value.is_null() {
+                return None;
+            }
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                return Some(i32::from(CFBooleanGetValue(value)));
+            }
+            let mut out: i32 = 0;
+            // kCFNumberSInt32Type
+            (CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, 3, (&mut out as *mut i32).cast()))
+                .then_some(out)
+        };
+        let on_console = number(on).is_some_and(|value| value != 0);
+        let secure_input = number(secure)
+            .is_some_and(|pid| pid > 0 && process_name(pid).as_deref() == Some("loginwindow"));
         CFRelease(on_key);
         CFRelease(secure_key);
         CFRelease(dictionary);
@@ -112,13 +125,19 @@ fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
     send(&stream, &serde_json::to_value(&hello).unwrap_or_default())?;
     send_status(&stream, now)?;
     let helper: Arc<Mutex<Option<Helper>>> = Arc::new(Mutex::new(None));
+    // Until this connection ends: the console thread stops with it.
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
     // Console changes, every second (M5): reported, and the job releases on any change (I6).
     {
         let stream = stream.try_clone()?;
         let input = input.clone();
         let helper = helper.clone();
+        let alive = alive.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(1));
+            if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             let next = console();
             if next != now {
                 now = next;
@@ -175,6 +194,7 @@ fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
             _ => {}
         }
     }
+    alive.store(false, std::sync::atomic::Ordering::Relaxed);
     if let Some(old) = helper.lock().unwrap_or_else(|p| p.into_inner()).take() {
         old.end();
     }
