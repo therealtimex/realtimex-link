@@ -7,7 +7,7 @@
 //! - `post self|child <method> <keys>`: `hid`, `session`, `app-hid` (after NSApplication with
 //!   the accessory policy) or `iohid` (`IOHIDPostEvent`), typing `a` for each `a` in `<keys>`,
 //!   Backspace for each `b`, Escape for `e`, Return for `r` and keypad Enter for `n`; `iohid-click <x>,<y>` clicks;
-//! - `text`: the next line is typed through `IOHIDPostEvent` from the job and never echoed
+//! - `text [flags|global|device]`: the next line is typed through `IOHIDPostEvent` from the job and never echoed
 //!   (Addendum 3: a full password login).
 //!
 //! A child step runs as `--launchd probe-child …`; every step gets 3 s, then answers `hang`.
@@ -35,6 +35,8 @@ const NX_LMOUSEDOWN: u32 = 1;
 const NX_LMOUSEUP: u32 = 2;
 const NX_MOUSEMOVED: u32 = 5;
 const SET_CURSOR_POSITION: u32 = 2;
+const SET_GLOBAL_EVENT_FLAGS: u32 = 1;
+const NX_DEVICELSHIFTKEYMASK: u32 = 0x0000_0002;
 const HID_EVENT_TAP: u32 = 0;
 const SESSION_EVENT_TAP: u32 = 1;
 
@@ -116,7 +118,8 @@ pub fn serve(args: &[String]) -> ! {
             // `text`: the next line is typed through IOHIDPostEvent from this job, never echoed.
             let answer = if words.first().map(String::as_str) == Some("text") {
                 let text = lines.next().unwrap_or_default();
-                in_thread_with(move || match type_text(&text) {
+                let mode = words.get(1).cloned().unwrap_or_else(|| "global".into());
+                in_thread_with(move || match type_text(&text, &mode) {
                     Ok(count) => format!("typed {count}"),
                     Err(error) => format!("error: {error}"),
                 })
@@ -397,20 +400,38 @@ fn hid_click(connect: u32, at: IOGPoint) -> Result<(), String> {
 }
 
 /// Types printable ASCII by US-layout key codes, Shift as a held modifier.
-fn type_text(text: &str) -> Result<usize, String> {
+/// How Shift goes with a character (the first build lost it after the first one):
+/// - `flags`: only the key events' flags;
+/// - `global`: Shift's flags-changed events also set the global flags;
+/// - `device`: as `global`, with the left-Shift device bit and a short pause around each.
+fn type_text(text: &str, mode: &str) -> Result<usize, String> {
     let connect = hid_system()?;
     let mut shift_data = [0u8; 128];
     shift_data[8..10].copy_from_slice(&KEY_SHIFT.to_ne_bytes());
+    let held = match mode {
+        "device" => NX_SHIFTMASK | NX_DEVICELSHIFTKEYMASK,
+        _ => NX_SHIFTMASK,
+    };
+    let options = if mode == "flags" { 0 } else { SET_GLOBAL_EVENT_FLAGS };
+    let pause = || {
+        if mode == "device" {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    let origin = IOGPoint { x: 0, y: 0 };
     for c in text.chars() {
         let (code, shift) = us_key(c).ok_or_else(|| "a character with no US key".to_string())?;
-        let flags = if shift { NX_SHIFTMASK } else { 0 };
-        if shift {
-            hid_post(connect, NX_FLAGSCHANGED, IOGPoint { x: 0, y: 0 }, &shift_data, flags, 0)?;
+        let flags = if shift { held } else { 0 };
+        if shift && mode != "flags" {
+            hid_post(connect, NX_FLAGSCHANGED, origin, &shift_data, held, options)?;
+            pause();
         }
         hid_key(connect, code, c as u16, flags)?;
-        if shift {
-            hid_post(connect, NX_FLAGSCHANGED, IOGPoint { x: 0, y: 0 }, &shift_data, 0, 0)?;
+        if shift && mode != "flags" {
+            pause();
+            hid_post(connect, NX_FLAGSCHANGED, origin, &shift_data, 0, options)?;
         }
+        pause();
     }
     Ok(text.chars().count())
 }
