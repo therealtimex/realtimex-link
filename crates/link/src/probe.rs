@@ -5,8 +5,10 @@
 //! - `facts self|child`: uid, `launchctl procinfo`'s session lines, `CGSessionCopyCurrentDictionary` and the
 //!   AX / PostEvent / ListenEvent / ScreenCapture preflights, for this job or a child of it;
 //! - `post self|child <method> <keys>`: `hid`, `session`, `app-hid` (after NSApplication with
-//!   the accessory policy) or `iohid` (`IOHIDPostEvent`), typing `a` for each `a` in `<keys>`
-//!   and Backspace for each `b`.
+//!   the accessory policy) or `iohid` (`IOHIDPostEvent`), typing `a` for each `a` in `<keys>`,
+//!   Backspace for each `b`, Escape for `e` and Return for `r`; `iohid-click <x>,<y>` clicks;
+//! - `text`: the next line is typed through `IOHIDPostEvent` from the job and never echoed
+//!   (Addendum 3: a full password login).
 //!
 //! A child step runs as `--launchd probe-child …`; every step gets 3 s, then answers `hang`.
 
@@ -21,6 +23,17 @@ const LIMIT: Duration = Duration::from_secs(3);
 
 const KEY_A: u16 = 0x00;
 const KEY_DELETE: u16 = 0x33;
+const KEY_ESCAPE: u16 = 0x35;
+const KEY_RETURN: u16 = 0x24;
+const KEY_SHIFT: u16 = 0x38;
+const NX_SHIFTMASK: u32 = 0x0002_0000;
+const NX_KEYDOWN: u32 = 10;
+const NX_KEYUP: u32 = 11;
+const NX_FLAGSCHANGED: u32 = 12;
+const NX_LMOUSEDOWN: u32 = 1;
+const NX_LMOUSEUP: u32 = 2;
+const NX_MOUSEMOVED: u32 = 5;
+const SET_CURSOR_POSITION: u32 = 2;
 const HID_EVENT_TAP: u32 = 0;
 const SESSION_EVENT_TAP: u32 = 1;
 
@@ -96,9 +109,19 @@ pub fn serve(args: &[String]) -> ! {
         let Ok(mut out) = stream.try_clone() else {
             continue;
         };
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        let mut lines = BufReader::new(stream).lines().map_while(Result::ok);
+        while let Some(line) = lines.next() {
             let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
-            let answer = step(&words);
+            // `text`: the next line is typed through IOHIDPostEvent from this job, never echoed.
+            let answer = if words.first().map(String::as_str) == Some("text") {
+                let text = lines.next().unwrap_or_default();
+                in_thread_with(move || match type_text(&text) {
+                    Ok(count) => format!("typed {count}"),
+                    Err(error) => format!("error: {error}"),
+                })
+            } else {
+                step(&words)
+            };
             if writeln!(out, "{line}: {answer}").is_err() {
                 break;
             }
@@ -131,9 +154,13 @@ fn step(words: &[String]) -> String {
 }
 
 fn in_thread(words: Vec<String>) -> String {
+    in_thread_with(move || run(&words))
+}
+
+fn in_thread_with(work: impl FnOnce() -> String + Send + 'static) -> String {
     let (send, receive) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = send.send(run(&words));
+        let _ = send.send(work());
     });
     // A hung post stays on its thread; the probe answers and goes on.
     receive.recv_timeout(LIMIT).unwrap_or_else(|_| "hang".into())
@@ -233,7 +260,12 @@ unsafe fn describe(object: *const c_void) -> String {
 }
 
 fn post(method: &str, keys: &str) -> Result<(), String> {
-    let codes = keys.chars().map(|key| if key == 'b' { KEY_DELETE } else { KEY_A });
+    let codes = keys.chars().map(|key| match key {
+        'b' => KEY_DELETE,
+        'e' => KEY_ESCAPE,
+        'r' => KEY_RETURN,
+        _ => KEY_A,
+    });
     match method {
         "hid" => codes.for_each(|code| cg_key(HID_EVENT_TAP, code)),
         "session" => codes.for_each(|code| cg_key(SESSION_EVENT_TAP, code)),
@@ -244,8 +276,16 @@ fn post(method: &str, keys: &str) -> Result<(), String> {
         "iohid" => {
             let connect = hid_system()?;
             for code in codes {
-                hid_key(connect, code)?;
+                hid_key(connect, code, 0)?;
             }
+        }
+        // `post self iohid-click <x>,<y>`: move there and click the left button.
+        "iohid-click" => {
+            let (x, y) = keys
+                .split_once(',')
+                .and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)))
+                .ok_or_else(|| "iohid-click takes <x>,<y>".to_string())?;
+            hid_click(hid_system()?, IOGPoint { x, y })?;
         }
         other => return Err(format!("unknown method {other}")),
     }
@@ -296,51 +336,87 @@ fn hid_system() -> Result<u32, String> {
     }
 }
 
-fn hid_key(connect: u32, code: u16) -> Result<(), String> {
+fn hid_key(connect: u32, code: u16, flags: u32) -> Result<(), String> {
     // NXEventData's key member: origCharSet, repeat, charSet, charCode, keyCode, origCharCode,
     // then reserved words, in a union padded well past its size here.
     let mut data = [0u8; 128];
     data[8..10].copy_from_slice(&code.to_ne_bytes());
-    for kind in [10u32, 11] {
-        // NX_KEYDOWN, NX_KEYUP; kNXEventDataVersion is 2.
-        // SAFETY: data outlives the call and is larger than NXEventData.
-        let status = unsafe {
-            IOHIDPostEvent(
-                connect,
-                kind,
-                IOGPoint { x: 0, y: 0 },
-                data.as_ptr().cast(),
-                2,
-                0,
-                0,
-            )
-        };
-        if status != 0 {
-            return Err(format!("IOHIDPostEvent: {status:#x}"));
-        }
+    for kind in [NX_KEYDOWN, NX_KEYUP] {
+        hid_post(connect, kind, IOGPoint { x: 0, y: 0 }, &data, flags, 0)?;
     }
     Ok(())
 }
 
-/// The audit session and launchd domain lines of `launchctl procinfo` (needs root).
-fn procinfo(pid: u32) -> String {
-    let out = std::process::Command::new("/bin/launchctl")
-        .args(["procinfo", &pid.to_string()])
-        .output();
-    let Ok(out) = out else {
-        return "procinfo ?".into();
+fn hid_post(
+    connect: u32,
+    kind: u32,
+    location: IOGPoint,
+    data: &[u8; 128],
+    flags: u32,
+    options: u32,
+) -> Result<(), String> {
+    // kNXEventDataVersion is 2.
+    // SAFETY: data outlives the call and is larger than NXEventData.
+    let status =
+        unsafe { IOHIDPostEvent(connect, kind, location, data.as_ptr().cast(), 2, flags, options) };
+    if status != 0 {
+        return Err(format!("IOHIDPostEvent({kind}): {status:#x}"));
+    }
+    Ok(())
+}
+
+fn hid_click(connect: u32, at: IOGPoint) -> Result<(), String> {
+    let none = [0u8; 128];
+    hid_post(connect, NX_MOUSEMOVED, at, &none, 0, SET_CURSOR_POSITION)?;
+    std::thread::sleep(Duration::from_millis(50));
+    // NXEventData's mouse member: subx, suby, eventNum, click (i32), pressure, buttonNumber.
+    let mut data = [0u8; 128];
+    data[4..8].copy_from_slice(&1i32.to_ne_bytes());
+    for (kind, pressure) in [(NX_LMOUSEDOWN, 255u8), (NX_LMOUSEUP, 0)] {
+        data[8] = pressure;
+        hid_post(connect, kind, at, &data, 0, 0)?;
+    }
+    Ok(())
+}
+
+/// Types printable ASCII by US-layout key codes, Shift as a held modifier.
+fn type_text(text: &str) -> Result<usize, String> {
+    let connect = hid_system()?;
+    let mut shift_data = [0u8; 128];
+    shift_data[8..10].copy_from_slice(&KEY_SHIFT.to_ne_bytes());
+    for c in text.chars() {
+        let (code, shift) = us_key(c).ok_or_else(|| "a character with no US key".to_string())?;
+        let flags = if shift { NX_SHIFTMASK } else { 0 };
+        if shift {
+            hid_post(connect, NX_FLAGSCHANGED, IOGPoint { x: 0, y: 0 }, &shift_data, flags, 0)?;
+        }
+        hid_key(connect, code, flags)?;
+        if shift {
+            hid_post(connect, NX_FLAGSCHANGED, IOGPoint { x: 0, y: 0 }, &shift_data, 0, 0)?;
+        }
+    }
+    Ok(text.chars().count())
+}
+
+/// kVK_ANSI_* for a character on the US layout, and whether it needs Shift.
+fn us_key(c: char) -> Option<(u16, bool)> {
+    const PLAIN: &str = "asdfhgzxcv\0bqweryt123465=97-80]ou[ip\0lj'k;\\,/nm.\0 `";
+    const SHIFTED: [(char, char); 21] = [
+        ('~', '`'), ('!', '1'), ('@', '2'), ('#', '3'), ('$', '4'), ('%', '5'), ('^', '6'),
+        ('&', '7'), ('*', '8'), ('(', '9'), (')', '0'), ('_', '-'), ('+', '='), ('{', '['),
+        ('}', ']'), ('|', '\\'), (':', ';'), ('"', '\''), ('<', ','), ('>', '.'), ('?', '/'),
+    ];
+    let (base, shift) = match c {
+        'A'..='Z' => (c.to_ascii_lowercase(), true),
+        _ => SHIFTED
+            .iter()
+            .find(|(shifted, _)| *shifted == c)
+            .map_or((c, false), |&(_, base)| (base, true)),
     };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| {
-            line.starts_with("session id")
-                || line.starts_with("domain =")
-                || line.starts_with("responsible")
-                || line.starts_with("uid")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    PLAIN
+        .chars()
+        .position(|key| key == base && key != '\0')
+        .map(|code| (code as u16, shift))
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
