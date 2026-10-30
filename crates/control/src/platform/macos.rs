@@ -191,6 +191,8 @@ pub fn request_control_permission(name: &str) -> Result<()> {
 
 /// kCGEventSourceStatePrivate: a source with its own state, apart from the hardware's.
 const EVENT_SOURCE_STATE_PRIVATE: i32 = -1;
+/// kCGEventSourceStateHIDSystemState: the hardware's state.
+const EVENT_SOURCE_STATE_HID_SYSTEM: i32 = 1;
 const HID_EVENT_TAP: u32 = 0;
 const MOUSE_MOVED: u32 = 5;
 const SCROLL_UNITS_LINE: u32 = 1;
@@ -386,10 +388,14 @@ impl Input {
                  Security → Accessibility → turn on RealTimeX (or the terminal running it)"
             );
         }
-        let source = unsafe { CGEventSourceCreate(EVENT_SOURCE_STATE_PRIVATE) };
-        if source.is_null() {
-            bail!("could not create the input event source");
-        }
+        // At the login window (realtimex-link#11, as root under launchd) a private source can't
+        // be made: the HID system's state is used there, and with neither, events go without a
+        // source (CGEventCreate*Event takes NULL).
+        let source = [EVENT_SOURCE_STATE_PRIVATE, EVENT_SOURCE_STATE_HID_SYSTEM]
+            .into_iter()
+            .map(|state| unsafe { CGEventSourceCreate(state) })
+            .find(|source| !source.is_null())
+            .unwrap_or(std::ptr::null_mut());
         let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
         Ok(Self {
             source,
@@ -819,7 +825,9 @@ impl Drop for Input {
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
             self.restore_clipboard();
         }
-        unsafe { CFRelease(self.source) };
+        if !self.source.is_null() {
+            unsafe { CFRelease(self.source) };
+        }
     }
 }
 
