@@ -309,6 +309,8 @@ impl Supervisor {
 
     /// One connection: its peer checked (M4), then one request line.
     fn answer(&self, stream: UnixStream) {
+        // An accepted socket keeps the listener's non-blocking mode on macOS.
+        let _ = stream.set_nonblocking(false);
         let Ok(peer) = os::peer(stream.as_raw_fd()) else { return };
         let allowed = sign::requirement(&self.team, &sign::PEER_IDENTIFIERS)
             .is_some_and(|requirement| sign::peer_satisfies(&peer.token, &requirement));
@@ -360,6 +362,8 @@ impl Supervisor {
                 &Reply::refused("bad-request", "Turning on goes through the administrator's prompt"),
             ),
             Request::Bridge { version, on_console } => {
+                // The hello's timeout isn't the daemon's to keep.
+                let _ = stream.set_read_timeout(None);
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 let Some(bridges) = state.bridges.as_ref() else {
                     // No daemon to give it to: the bridge tries again.

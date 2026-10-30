@@ -76,6 +76,11 @@ pub fn start(fd: RawFd) {
 fn register(connection: OwnedFd, hello: &[u8]) {
     let hello: serde_json::Value = serde_json::from_slice(hello).unwrap_or_default();
     let stream = UnixStream::from(connection);
+    // Socket options go with the socket: the supervisor's 10 s read timeout for the hello (and a
+    // non-blocking listener's accepts) would end this bridge's reads.
+    if stream.set_read_timeout(None).is_err() || stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let Ok(writer) = stream.try_clone() else { return };
     let bridge = Arc::new(Bridge {
         id: NEXT.fetch_add(1, Ordering::Relaxed),
