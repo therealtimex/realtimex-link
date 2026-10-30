@@ -43,7 +43,7 @@ pub fn send(events: &[Event]) -> anyhow::Result<()> {
         .ok_or_else(|| unavailable("Input at the login window isn't available in this session"))?;
     for event in events {
         let bytes = event.encode();
-        // SAFETY: one datagram on a SOCK_SEQPACKET socket this process owns.
+        // SAFETY: one datagram on the SOCK_DGRAM socketpair this process owns.
         let sent = unsafe { libc::send(channel.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0) };
         if sent != bytes.len() as isize {
             return Err(unavailable("The login window's input didn't answer"));

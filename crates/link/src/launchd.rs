@@ -49,11 +49,11 @@ fn checked_in_socket() -> Option<RawFd> {
     }
 }
 
-fn socketpair_seqpacket() -> Option<(OwnedFd, OwnedFd)> {
+fn socketpair_datagram() -> Option<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
     // SAFETY: two out fds; both close on exec until the one intended exec (C1).
     unsafe {
-        if libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) != 0 {
+        if libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) != 0 {
             return None;
         }
         for fd in fds {
@@ -88,7 +88,7 @@ pub fn run(role: &str, rest: &[String]) -> ! {
             }
         },
         "session" => {
-            if let Some((ours, theirs)) = socketpair_seqpacket() {
+            if let Some((ours, theirs)) = socketpair_datagram() {
                 handed = Some(theirs.as_raw_fd());
                 command.args(["--input-fd", "3"]);
                 channel = Some(ours);

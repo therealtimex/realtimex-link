@@ -52,7 +52,13 @@ pub fn groups_of(user: &User) -> Vec<libc::gid_t> {
     if status < 0 {
         return vec![user.gid];
     }
-    groups[..count.max(0) as usize].iter().map(|&group| group as libc::gid_t).collect()
+    // setgroups takes at most NGROUPS_MAX (16) on macOS; the primary group comes first. Groups
+    // beyond it still apply through the directory service's membership checks.
+    groups[..count.max(0) as usize]
+        .iter()
+        .map(|&group| group as libc::gid_t)
+        .take(libc::NGROUPS_MAX as usize)
+        .collect()
 }
 
 extern "C" {

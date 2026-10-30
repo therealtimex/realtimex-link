@@ -199,7 +199,7 @@ fn send_status(stream: &UnixStream, console: Console) -> std::io::Result<()> {
 fn release(input: &Option<OwnedFd>) {
     if let Some(input) = input {
         let message = jobinput::Event::Release.encode();
-        // SAFETY: a datagram on a SOCK_SEQPACKET socket this process holds.
+        // SAFETY: a datagram on the SOCK_DGRAM socketpair this process holds.
         unsafe { libc::send(input.as_raw_fd(), message.as_ptr().cast(), message.len(), 0) };
     }
 }

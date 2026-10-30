@@ -1,5 +1,5 @@
 //! What rtx-control sends the login-window job (realtimex-link#11, Addendum 5): input already
-//! translated, as fixed-size datagrams on the SOCK_SEQPACKET channel the job made. rtx-control
+//! translated, as fixed-size datagrams on the SOCK_DGRAM socketpair the job made. rtx-control
 //! encodes them (one translator: I2, I5); the job (rtx-link `--launchd session`) decodes,
 //! checks (C2) and posts them with IOHIDPostEvent. No kind carries text or clipboard data.
 //! Shared by rtx-control, rtx-link and rtx-linkd (`#[path]`); data only.

@@ -269,11 +269,9 @@ pub fn serve(channel: OwnedFd) -> bool {
     };
     let mut buffer = [0u8; jobinput::SIZE + 1];
     loop {
-        // SAFETY: a SOCK_SEQPACKET socket this process owns; one datagram per call, and a
-        // bigger one shows as a longer length (MSG_TRUNC).
-        let read = unsafe {
-            libc::recv(channel.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), libc::MSG_TRUNC)
-        };
+        // SAFETY: a SOCK_DGRAM socketpair this process owns; one datagram per call, and a
+        // bigger one fills the buffer past SIZE (and is refused).
+        let read = unsafe { libc::recv(channel.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
         if read <= 0 {
             poster.release();
             return true;
