@@ -21,6 +21,7 @@ mod dib;
 mod error;
 mod file_browse;
 mod files;
+mod helper;
 mod host;
 mod identity;
 mod install;
@@ -34,11 +35,14 @@ mod relay;
 mod requests;
 mod router;
 mod secret_box;
+mod secure_attention;
+mod service;
 mod shared;
 mod signin;
 mod store;
 mod tailscale;
 mod transfers;
+mod unattended;
 mod update;
 mod util;
 mod webhooks;
@@ -49,6 +53,8 @@ use std::sync::Arc;
 use serde_json::json;
 
 const EXIT_ALREADY_RUNNING: i32 = 3;
+/// Link's service runs this folder's daemon (realtimex-link#10): callers use that one.
+const EXIT_SERVICE_RUNS_IT: i32 = 4;
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -61,8 +67,30 @@ fn print_line(value: serde_json::Value) {
     println!("{value}");
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Link's Windows service (service.rs): the Service Control Manager starts it, and it makes
+    // its own runtime once the service is registered.
+    // The installer, elevated, before it writes in Link's ProgramData folder: the same check
+    // the service makes at every start (service.rs). Exit 1: nothing may be written there.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("secure-machine-dir") {
+        let safe = service::prepare_machine_dir(&unattended::machine_dir());
+        print_line(json!({ "secured": safe }));
+        std::process::exit(if safe { 0 } else { 1 });
+    }
+    if std::env::args().skip(1).any(|arg| arg == "--service") {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        service::run();
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the daemon's runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // TLS for the relay (relay.rs) with one crypto provider, chosen here.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -72,6 +100,29 @@ async fn main() {
             json!({ "tool": "rtx-linkd", "version": version, "protocol": local_api::PROTOCOL }),
         );
         return;
+    }
+    // `install --check DESTINATION`: exit 0 when installing would replace what is there (nothing
+    // or older), 11 when this version is installed, 10 when a newer one is. Nothing changes.
+    if args.first().map(String::as_str) == Some("install") && args.get(1).map(String::as_str) == Some("--check") {
+        let Some(destination) = args.get(2) else {
+            print_line(json!({ "error": "usage: rtx-linkd install --check DESTINATION" }));
+            std::process::exit(2);
+        };
+        match install::would_replace(std::path::Path::new(destination)) {
+            Ok(installed) => {
+                let (replace, code) = match installed {
+                    install::Installed::Older => (true, 0),
+                    install::Installed::Same => (false, 11),
+                    install::Installed::Newer => (false, 10),
+                };
+                print_line(json!({ "replace": replace, "installed": format!("{installed:?}").to_lowercase() }));
+                std::process::exit(code);
+            }
+            Err(error) => {
+                print_line(json!({ "error": format!("{error:#}") }));
+                std::process::exit(1);
+            }
+        }
     }
     if args.first().map(String::as_str) == Some("install") {
         let Some(destination) = args.get(1) else {
@@ -92,6 +143,20 @@ async fn main() {
     let port = arg_value(&args, "--port")
         .and_then(|p| p.parse().ok())
         .unwrap_or(host::DEFAULT_PORT);
+    // While Link's service runs this folder's daemon, a second one must not take its lock
+    // (SD C4): the window and RealTimeX attach to the service's through linkd.json.
+    if unattended::SUPPORTED {
+        let request = unattended::Request::Status {
+            data_dir: data_dir.clone(),
+        };
+        if unattended::yields(unattended::ask(&request).ok().flatten().as_ref()) {
+            print_line(json!({
+                "error": "RealTimeX Link's service runs this folder's daemon",
+                "code": "service-runs-it",
+            }));
+            std::process::exit(EXIT_SERVICE_RUNS_IT);
+        }
+    }
     let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line: &str| eprintln!("{line}"));
     let started = daemon::start(daemon::Options {
         data_dir,
@@ -129,11 +194,44 @@ async fn main() {
     print_line(
         json!({ "ready": true, "pid": std::process::id(), "port": daemon.port, "version": version }),
     );
+    hand_over_to_the_service(&daemon, data_dir_of(&args));
     tokio::select! {
         () = wait_for_stop() => {}
         () = daemon.shutdown.notified() => {}
     }
     daemon.stop().await;
+}
+
+fn data_dir_of(args: &[String]) -> PathBuf {
+    arg_value(args, "--data-dir").map_or_else(paths::default_data_dir, PathBuf::from)
+}
+
+/// While Start with this computer is on, the owner's own daemon is only a stand-in: one started
+/// while the service was stopped steps aside once the service is back and waiting for its folder
+/// (QA of !12; SD C4), so the sign-in and lock screens are reachable again.
+fn hand_over_to_the_service(daemon: &daemon::Daemon, data_dir: PathBuf) {
+    if !unattended::SUPPORTED {
+        return;
+    }
+    let shutdown = daemon.shutdown.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let request = unattended::Request::Status {
+                data_dir: data_dir.clone(),
+            };
+            let reply = tokio::task::spawn_blocking(move || unattended::ask(&request))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            if unattended::yields(reply.as_ref()) {
+                eprintln!("[unattended] Link's service runs this folder again: stepping aside");
+                shutdown.notify_one();
+                return;
+            }
+        }
+    });
 }
 
 #[cfg(unix)]

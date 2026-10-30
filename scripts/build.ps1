@@ -62,6 +62,8 @@ Run cargo build --release --locked --target $Target -p rtx-control
 # asks for them.
 if ($env:LINK_TEST_KEYS -eq '1') {
   Run cargo test --release --locked --target $Target -p rtx-control '--' platform::windows::keymap platform::windows::clipboard codes::
+  # Link's service (realtimex-link#10): its ProgramData folder made safe, the pipe and body rules.
+  Run cargo test --release --locked --target $Target -p rtx-linkd '--' service:: unattended::
 }
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 $built = Join-Path $targetDir "$Target\release"

@@ -16,13 +16,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::error::ApiError;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REDETECT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the service checks which session has the console.
+const CONSOLE_CHECK: Duration = Duration::from_secs(1);
 const IDLE_STOP: Duration = Duration::from_secs(5 * 60);
 /// "Someone is using this computer" (#2670): an open live view, or real use this recently.
 const IN_USE_WINDOW: Duration = Duration::from_secs(60);
@@ -290,7 +292,7 @@ fn helper_error(message: &Value, fallback: &str) -> ApiError {
 type Pending = HashMap<u64, oneshot::Sender<Result<Value, ApiError>>>;
 
 struct Running {
-    child: Child,
+    child: crate::helper::Child,
     generation: u64,
 }
 
@@ -314,7 +316,7 @@ pub struct Backend {
     events: broadcast::Sender<Value>,
     start_lock: tokio::sync::Mutex<()>,
     /// The running helper's stdin (generation, pipe); one writer at a time.
-    stdin: tokio::sync::Mutex<Option<(u64, ChildStdin)>>,
+    stdin: tokio::sync::Mutex<Option<(u64, crate::helper::Writer)>>,
 }
 
 impl Backend {
@@ -378,6 +380,11 @@ impl Backend {
     }
 
     fn emit(&self, event: Value) {
+        // Ctrl+Alt+Delete from a viewer (realtimex-link#10): only the daemon can send it.
+        if event.get("event").and_then(Value::as_str) == Some("secure_attention") {
+            crate::secure_attention::send();
+            return;
+        }
         if event.get("event").and_then(Value::as_str) == Some("peer_state") {
             if let Some(session) = event.get("session").and_then(Value::as_u64) {
                 let mut inner = self.inner();
@@ -440,17 +447,25 @@ impl Backend {
         let Some(binary) = detected.binary else {
             return Err(ApiError::new(501, detected.reason.unwrap_or_default()));
         };
-        let mut child = Self::spawn_helper(&binary)?;
+        let spawned = crate::helper::spawn(&binary, || {
+            Self::spawn_helper(&binary).map_err(|error| std::io::Error::other(error.message))
+        })
+        .await
+        .map_err(|error| {
+            ApiError::new(502, format!("Remote Control helper did not start: {error}"))
+        })?;
+        let crate::helper::Spawned {
+            child,
+            stdin,
+            stdout,
+            stderr,
+            session,
+        } = spawned;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ApiError::new(502, "Remote Control helper has no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ApiError::new(502, "Remote Control helper has no stdout"))?;
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(session) = session {
+            self.follow_console(generation, session);
+        }
+        if let Some(stderr) = stderr {
             let weak = Arc::downgrade(self);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
@@ -565,7 +580,10 @@ impl Backend {
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, reply);
         let written = match self.stdin.lock().await.as_mut() {
-            Some((_, stdin)) => stdin.write_all(text.as_bytes()).await.is_ok(),
+            // Flushed: under the service the pipe is an async file that buffers writes.
+            Some((_, stdin)) => {
+                stdin.write_all(text.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
+            }
             None => false,
         };
         if !written {
@@ -748,6 +766,27 @@ impl Backend {
         Ok(())
     }
 
+    /// Under the service, end the helper once another session takes the console (sign-in, user
+    /// switch, log off): the next request starts one in that session.
+    fn follow_console(self: &Arc<Self>, generation: u64, session: u32) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CONSOLE_CHECK).await;
+                let Some(backend) = weak.upgrade() else { return };
+                let current = backend.inner().running.as_ref().map(|r| r.generation);
+                if current != Some(generation) {
+                    return;
+                }
+                if crate::helper::console_session() != Some(session) {
+                    eprintln!("[remote-control] another session has the console: ending the helper");
+                    backend.dispose();
+                    return;
+                }
+            }
+        });
+    }
+
     /// Kill the helper now; its live views end.
     pub fn dispose(&self) {
         let (running, peers) = {
@@ -760,7 +799,7 @@ impl Backend {
             )
         };
         if let Some(mut running) = running {
-            let _ = running.child.start_kill();
+            running.child.start_kill();
         }
         for session in peers {
             self.emit(json!({ "event": "peer_state", "session": session, "state": "closed" }));
@@ -770,18 +809,18 @@ impl Backend {
 
 /// Reap a helper whose stdout closed, and say so when it exited because its screen capture
 /// stalled (the log otherwise shows only that it exited).
-async fn report_exit(mut child: Child) {
+async fn report_exit(mut child: crate::helper::Child) {
     let waited = tokio::time::timeout(EXIT_REAP, child.wait()).await;
-    let status = match waited {
-        Ok(status) => status,
+    let code = match waited {
+        Ok(code) => code,
         // It closed stdout but keeps running: it is no use any more.
         Err(_) => {
-            let _ = child.start_kill();
+            child.start_kill();
             child.wait().await
         }
     };
-    if let Ok(status) = status {
-        if status.code() == Some(CONTROL_EXIT_CAPTURE_STALLED) {
+    if let Some(code) = code {
+        if code == CONTROL_EXIT_CAPTURE_STALLED {
             eprintln!(
                 "[remote-control] helper exited: its screen capture stalled; the next request starts a new one"
             );

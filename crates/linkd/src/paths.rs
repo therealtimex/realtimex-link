@@ -38,9 +38,37 @@ pub fn default_data_dir() -> PathBuf {
     let home = home_dir();
     PathBuf::from(default_data_dir_for(
         std::env::consts::OS,
-        &|name| std::env::var(name).ok(),
+        &|name| user_env(name),
         &home,
     ))
+}
+
+/// The home of the user this daemon serves when Link's service runs it as SYSTEM
+/// (realtimex-link#10): taken from the owner's SID in ProfileList (unattended.rs), never from
+/// the environment, which is SYSTEM's own (SD C3). Set once, before the daemon starts.
+static OWNER_HOME: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn serve_owner(home: PathBuf) {
+    *OWNER_HOME.write().unwrap_or_else(|p| p.into_inner()) = Some(home);
+}
+
+fn owner_home() -> Option<PathBuf> {
+    OWNER_HOME.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// A variable of the served user's environment: SYSTEM's %APPDATA% names nothing of the
+/// owner's, so under the service only the owner's home counts.
+fn user_env(name: &str) -> Option<String> {
+    if name == "APPDATA" && owner_home().is_some() {
+        return None;
+    }
+    std::env::var(name).ok()
+}
+
+/// The folder this daemon runs on, once it started.
+pub fn data_dir() -> Option<PathBuf> {
+    DATA_DIR.get().cloned()
 }
 
 /// The folder this daemon runs on, set once at start (daemon.rs).
@@ -57,11 +85,7 @@ pub fn remember(dir: &Path) {
 pub fn is_standard() -> bool {
     let standard = PathBuf::from(default_data_dir_for(
         std::env::consts::OS,
-        &|name| {
-            (name != "RTX_LINK_DATA_DIR")
-                .then(|| std::env::var(name).ok())
-                .flatten()
-        },
+        &|name| (name != "RTX_LINK_DATA_DIR").then(|| user_env(name)).flatten(),
         &home_dir(),
     ));
     DATA_DIR
@@ -139,6 +163,9 @@ pub fn running_installed() -> bool {
 }
 
 pub fn home_dir() -> String {
+    if let Some(home) = owner_home() {
+        return home.to_string_lossy().into_owned();
+    }
     let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var(name).unwrap_or_default()
 }

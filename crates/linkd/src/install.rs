@@ -21,6 +21,30 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// for when the installed rtx-linkd can't say.
 const VERSION_FILE: &str = "VERSION";
 
+/// Whether `run` would replace what is installed at `destination` (nothing installed, or an
+/// older version), without changing anything: the Windows installer asks first, so it stops
+/// Link's service only when files will be replaced (SD, realtimex-ai-app#2967).
+pub fn would_replace(destination: &Path) -> Result<Installed> {
+    let ours = env!("CARGO_PKG_VERSION");
+    Ok(match installed_version(destination)? {
+        None => Installed::Older,
+        Some(installed) => match version_key(&installed).cmp(&version_key(ours)) {
+            std::cmp::Ordering::Less => Installed::Older,
+            std::cmp::Ordering::Equal => Installed::Same,
+            std::cmp::Ordering::Greater => Installed::Newer,
+        },
+    })
+}
+
+/// What is installed, against this rtx-linkd: nothing or older (replaced), this version (kept,
+/// with what a failed install left out completed), newer (left alone).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Installed {
+    Older,
+    Same,
+    Newer,
+}
+
 pub fn run(destination: &Path) -> Result<Value> {
     let ours = env!("CARGO_PKG_VERSION");
     let source = source()?;
@@ -242,7 +266,7 @@ fn others_running_script(paths: &[PathBuf]) -> String {
 
 #[cfg(windows)]
 fn platform_others_running(paths: &[PathBuf]) -> bool {
-    crate::util::command("powershell")
+    crate::util::command(crate::util::powershell())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -328,7 +352,7 @@ fn running(path: &Path) -> bool {
         "if (Get-Process | Where-Object {{ $_.Path -eq '{}' }}) {{ exit 0 }} else {{ exit 1 }}",
         powershell_path(path)
     );
-    crate::util::command("powershell")
+    crate::util::command(crate::util::powershell())
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Stdio::null())
         .status()
@@ -341,7 +365,7 @@ fn signal(path: &Path) {
         "Get-Process | Where-Object {{ $_.Path -eq '{}' }} | Stop-Process -Force",
         powershell_path(path)
     );
-    let _ = crate::util::command("powershell")
+    let _ = crate::util::command(crate::util::powershell())
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(Stdio::null())
         .status();
@@ -529,6 +553,14 @@ fn copy(source: &Path, staging: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_installed_is_replaced_and_the_check_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("rtx-would-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(would_replace(&dir).unwrap(), Installed::Older);
+        assert!(!dir.exists(), "asking creates nothing");
+    }
 
     #[test]
     fn versions_compare_by_number() {

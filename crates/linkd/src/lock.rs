@@ -113,6 +113,47 @@ pub fn alive(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Whether `pid` is still a running RealTimeX Link window or tray (rtx-link), not just any
+/// process: under Link's service the daemon outlives a sign-out, and Windows soon gives a gone
+/// window's pid to another process (QA of !12: a helper's conhost took it, and no window could
+/// open again). Elsewhere a daemon ends with its session, so a live pid is enough.
+#[cfg(windows)]
+pub fn link_app_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if !alive(pid) {
+        return false;
+    }
+    let mut name = [0u16; 1024];
+    let mut size = name.len() as u32;
+    // SAFETY: the handle is checked and closed; the buffer and its size are this function's.
+    let read = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let read = QueryFullProcessImageNameW(handle, 0, name.as_mut_ptr(), &mut size) != 0;
+        CloseHandle(handle);
+        read
+    };
+    read && is_link_app(&String::from_utf16_lossy(&name[..size as usize]))
+}
+
+#[cfg(not(windows))]
+pub fn link_app_alive(pid: u32) -> bool {
+    alive(pid)
+}
+
+/// An image path that is rtx-link's.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_link_app(path: &str) -> bool {
+    path.rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("rtx-link.exe") || name == "rtx-link")
+}
+
 #[cfg(windows)]
 pub fn alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
@@ -139,6 +180,15 @@ pub fn alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_rtx_link_is_a_link_window() {
+        assert!(is_link_app(r"C:\Program Files\RealTimeX Link\rtx-link.exe"));
+        assert!(is_link_app(r"C:\PROGRAM FILES\REALTIMEX LINK\RTX-LINK.EXE"));
+        assert!(!is_link_app(r"C:\Windows\System32\conhost.exe"));
+        assert!(!is_link_app(r"C:\Program Files\RealTimeX Link\rtx-linkd.exe"));
+        assert!(is_link_app("/usr/bin/rtx-link"));
+    }
 
     #[test]
     fn one_owner_at_a_time_and_the_lock_is_free_again_after_it() {

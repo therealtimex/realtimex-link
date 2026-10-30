@@ -79,6 +79,20 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
     command
 }
 
+/// Windows PowerShell by its full path: never found through PATH, which another user could
+/// put first for a process running as SYSTEM (SD C2). Elsewhere, the name.
+pub fn powershell() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        std::path::PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from("powershell")
+    }
+}
+
 /// `command`, for tokio.
 pub fn tokio_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
     #[allow(unused_mut)]

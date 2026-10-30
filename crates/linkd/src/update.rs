@@ -34,7 +34,9 @@ const FIRST_CHECK: Duration = Duration::from_secs(60);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// RTX_LINK_UPDATE_REPOSITORY points at another repository (testing).
+/// RTX_LINK_UPDATE_REPOSITORY points at another repository (testing). Only the process's own
+/// environment or the constant: never anything from the store, which the owner can write and
+/// which Link's service reads as SYSTEM (realtimex-link#10, SD C2).
 fn repository() -> String {
     std::env::var("RTX_LINK_UPDATE_REPOSITORY")
         .ok()
@@ -215,9 +217,7 @@ impl Updater {
         if actual != expected {
             bail!("{name}: SHA-256 {actual}, but the release lists {expected}");
         }
-        let dir = std::env::temp_dir().join(format!("realtimex-link-update-{}", release.version));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        let dir = download_dir(&release.version)?;
         let file = dir.join(name);
         std::fs::write(&file, &bytes)?;
         lock(&self.state).busy = Some("installing");
@@ -520,6 +520,19 @@ if ($c) {
     }
 }
 
+/// A fresh folder for a download. Under Link's service (SYSTEM) never the shared temp folder,
+/// whose fixed name another user could claim first: a protected one of its own (SD C2).
+fn download_dir(version: &str) -> Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    if crate::service::active() {
+        return Ok(crate::service::update_dir()?);
+    }
+    let dir = std::env::temp_dir().join(format!("realtimex-link-update-{version}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -527,7 +540,7 @@ mod platform {
 
     fn signature(path: &Path) -> Option<Signature> {
         // util::command: no console flashing up.
-        let output = crate::util::command("powershell.exe")
+        let output = crate::util::command(crate::util::powershell())
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -550,6 +563,20 @@ mod platform {
         if !authenticode::same_publisher(&ours, &theirs) {
             bail!("the downloaded installer isn't signed by the same publisher");
         }
+        // Link's service (SYSTEM) runs the installer itself, silently: no UAC prompt, and the
+        // installer stops and starts the service around the update.
+        if crate::service::active() {
+            use std::os::windows::process::CommandExt;
+            crate::util::command(setup)
+                .arg("/S")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW: outlives the service it stops.
+                .creation_flags(0x0000_0200 | 0x0800_0000)
+                .spawn()?;
+            return Ok(json!({ "started": true }));
+        }
         // The installer asks for administrator and stops this Link itself; it installs where
         // RealTimeX looks for Link, and the helper starts that one again afterwards.
         let installed = crate::paths::install_dirs_for(
@@ -559,7 +586,7 @@ mod platform {
         );
         let app = Path::new(&installed[0]).join("rtx-link.exe");
         use std::os::windows::process::CommandExt;
-        crate::util::command("powershell.exe")
+        crate::util::command(crate::util::powershell())
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -589,6 +616,15 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The update source takes nothing from the store (SD C2): repository() has no store to
+    /// read, and with no override it is Link's own.
+    #[test]
+    fn the_update_source_is_links_own_unless_the_environment_says_otherwise() {
+        if std::env::var_os("RTX_LINK_UPDATE_REPOSITORY").is_none() {
+            assert_eq!(repository(), DEFAULT_REPOSITORY);
+        }
+    }
 
     #[test]
     fn releases_parse() {

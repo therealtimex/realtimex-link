@@ -120,9 +120,16 @@ pub use macos::{
 mod windows;
 #[cfg(windows)]
 pub use self::windows::{
-    control_permissions, permission_owner, request_control_permission, screenshot_needs_input,
-    Input,
+    control_permissions, follow_input_desktop, permission_owner, request_control_permission,
+    screenshot_needs_input, Input,
 };
+
+/// Windows moves the control thread to the desktop receiving input (sign-in, lock and UAC
+/// screens, realtimex-link#10); other systems have one desktop per session.
+#[cfg(not(windows))]
+pub fn follow_input_desktop() -> Option<String> {
+    None
+}
 
 #[cfg(target_os = "linux")]
 mod linux;

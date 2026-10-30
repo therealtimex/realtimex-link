@@ -40,10 +40,21 @@ struct Cli {
     /// and keyboard input on this platform.
     #[arg(long)]
     check: bool,
+    /// Windows, under Link's service (realtimex-link#10): speak over these named pipes
+    /// (`<name>-in`, `-out`, `-err`) instead of stdin/stdout/stderr. A helper started into
+    /// another session can't inherit the service's handles.
+    #[arg(long, value_name = "NAME")]
+    pipes: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
+    if let Some(name) = &cli.pipes {
+        if let Err(error) = use_pipes(name) {
+            eprintln!("error: the service's pipes: {error}");
+            std::process::exit(1);
+        }
+    }
     if cli.check {
         println!("{}", check_report());
         std::process::exit(if platform::INPUT_AVAILABLE { 0 } else { 1 });
@@ -57,6 +68,44 @@ fn main() {
         };
         std::process::exit(code);
     }
+}
+
+/// Make the service's pipes this process's standard handles: std reads and writes through
+/// whatever GetStdHandle returns, so the control loop needs no change.
+#[cfg(windows)]
+fn use_pipes(name: &str) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::IntoRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+    }
+    const STD_INPUT: u32 = -10i32 as u32;
+    const STD_OUTPUT: u32 = -11i32 as u32;
+    const STD_ERROR: u32 = -12i32 as u32;
+    let open = |suffix: &str, write: bool| {
+        std::fs::OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .open(format!("{name}-{suffix}"))
+    };
+    for (which, suffix, write) in [
+        (STD_INPUT, "in", false),
+        (STD_OUTPUT, "out", true),
+        (STD_ERROR, "err", true),
+    ] {
+        let handle = open(suffix, write)?.into_raw_handle();
+        // SAFETY: an open handle this process keeps for its whole life.
+        if unsafe { SetStdHandle(which, handle) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn use_pipes(_name: &str) -> std::io::Result<()> {
+    Err(std::io::Error::other("only Link's Windows service uses pipes"))
 }
 
 fn check_report() -> serde_json::Value {

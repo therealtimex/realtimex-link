@@ -25,6 +25,12 @@ control other computers from.
   skipped. A view's held keys are released when it closes, loses control, sends a batch that fails
   or is refused, or sends nothing for 30 s; macOS and Windows post the viewer's repeats, X11 and
   Wayland repeat on their own. The HTTP `actions` endpoint takes `keys` combos only.
+  **Start with this computer** (0.3.0, realtimex-link#10, Windows): Link's service (`rtx-linkd
+  --service`, LocalSystem, installed by the installer) runs its owner's daemon from boot while
+  `POST /v1/unattended {enabled:true}` is on, so allowed computers connect at the sign-in and lock
+  screens and through UAC prompts; the helper follows the console session and the input desktop,
+  and Ctrl+Alt+Delete is sent with SendSAS. Turning it on needs a local administrator (no UAC
+  prompt). With a roaming or redirected profile it waits until the profile is local at boot.
   **Headless GNOME Wayland** (0.2.6, realtimex-link#9): with no monitor attached, the session
   records a 1920×1080 virtual monitor (Mutter's `RecordVirtual`) instead of the primary one, and
   it goes away when the session stops. GNOME refuses remote sessions while the screen is locked

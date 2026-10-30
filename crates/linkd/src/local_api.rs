@@ -81,6 +81,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/autostart", get(autostart).post(set_autostart))
+        .route("/v1/unattended", get(unattended).post(set_unattended))
         .route("/v1/appearance", get(appearance).post(set_appearance))
         .route("/v1/window/open", post(open_window))
         .route("/v1/running", get(running).post(set_running))
@@ -235,7 +236,17 @@ async fn hello(State(state): State<Shared>, Body64(body): Body64) -> Answer {
 }
 
 async fn version(State(state): State<Shared>) -> Json<Value> {
-    Json(json!({ "protocol": PROTOCOL, "version": state.version, "features": FEATURES }))
+    Json(json!({ "protocol": PROTOCOL, "version": state.version, "features": features() }))
+}
+
+/// FEATURES, and Start with this computer (realtimex-link#10) only where Link has a service
+/// for it. RealTimeX shows its setting only when this is listed, and never requires it.
+fn features() -> Vec<&'static str> {
+    let mut features = FEATURES.to_vec();
+    if crate::unattended::SUPPORTED {
+        features.push("unattended");
+    }
+    features
 }
 
 async fn status(State(state): State<Shared>) -> Json<Value> {
@@ -317,11 +328,11 @@ async fn open_window(State(state): State<Shared>, Body64(body): Body64) -> Answe
     };
     let background = body.get("background").and_then(Value::as_bool) == Some(true);
     let mut roles = state.window.lock().unwrap_or_else(|p| p.into_inner());
-    let (owner, show) = claim(&mut roles, role, pid, background, crate::lock::alive);
+    let (owner, show) = claim(&mut roles, role, pid, background, crate::lock::link_app_alive);
     if show {
         state.show_window.fetch_add(1, Ordering::Relaxed);
     }
-    let tray = roles.get("tray").copied().is_some_and(crate::lock::alive);
+    let tray = roles.get("tray").copied().is_some_and(crate::lock::link_app_alive);
     Ok(Json(json!({ "owner": owner, "tray": tray })))
 }
 
@@ -684,8 +695,12 @@ async fn use_realtimex(State(state): State<Shared>) -> Answer {
 /// item (instance.rs): another answers enabled and available false, defaultInstance false.
 async fn autostart(State(state): State<Shared>) -> Answer {
     let standard = crate::paths::is_standard();
+    // Under Link's service the daemon is SYSTEM, whose HKCU isn't the owner's: the owner's login
+    // item was made sure of when Start with this computer was turned on, and stays while it is
+    // (SD §1; QA of !12).
+    let enabled = crate::service::active() || crate::autostart::enabled();
     Ok(Json(json!({
-        "enabled": standard && crate::autostart::enabled(),
+        "enabled": standard && enabled,
         "available": standard && crate::autostart::available(),
         "optedOut": state.host.start_at_login_opted_out(),
         "defaultInstance": standard,
@@ -701,6 +716,89 @@ async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Ans
         .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
     state.host.set_start_at_login(on)?;
     autostart(State(state)).await
+}
+
+/// Start with this computer (unattended.rs; realtimex-ai-app#2967 contract §6): `{supported,
+/// serviceInstalled, enabled, needsPermission, canChange, reason?, pending}`, asked of the
+/// service, which decides whether the caller may change it.
+async fn unattended(State(_state): State<Shared>) -> Answer {
+    use crate::unattended::{body, Request, SUPPORTED};
+    // Only this computer's own Link can start with it (SD C5): another instance (a development
+    // RealTimeX's) has no row, as with starting at login (Product/UX review of !12).
+    if !SUPPORTED || !crate::paths::is_standard() {
+        return Ok(Json(body(false, None)));
+    }
+    let data_dir = crate::paths::data_dir().unwrap_or_default();
+    let reply = ask_service(Request::Status { data_dir }).await?;
+    Ok(Json(body(true, reply.as_ref())))
+}
+
+/// { enabled: bool }. On: the service checks that the caller is an administrator and that this
+/// is their standard folder, then runs this daemon from boot; this one stops so the service's
+/// takes its folder (it keeps the login item first, SD §1). Off: the service stops running it,
+/// and the owner's own daemon starts again at the next window, tray or RealTimeX start.
+/// 403 os-admin-required, 409 unattended-standard-only, 503 service-missing.
+async fn set_unattended(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    use crate::unattended::{Request, SERVICE_MISSING, STANDARD_ONLY, SUPPORTED};
+    let on = body
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
+    if !SUPPORTED {
+        return Err(ApiError::coded(
+            404,
+            "unsupported",
+            "Starting with this computer isn't available here",
+        ));
+    }
+    if !crate::paths::is_standard() {
+        return Err(ApiError::coded(
+            409,
+            STANDARD_ONLY,
+            "Only this computer's own RealTimeX Link can start with it",
+        ));
+    }
+    let data_dir = crate::paths::data_dir().unwrap_or_default();
+    let request = if on {
+        Request::Enable { data_dir }
+    } else {
+        Request::Disable { data_dir }
+    };
+    let reply = ask_service(request)
+        .await?
+        .ok_or_else(|| {
+            ApiError::coded(
+                503,
+                SERVICE_MISSING,
+                "RealTimeX Link's background service isn't installed",
+            )
+        })?
+        .into_result()?;
+    if on && !crate::service::active() {
+        state.host.follow_hosting_at_login_now();
+        // Make way: the service's daemon takes this folder once this one let go of it (C4).
+        let shutdown = state.shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            shutdown.notify_one();
+        });
+    }
+    Ok(Json(crate::unattended::body(true, Some(&reply))))
+}
+
+/// The service's answer, or None when it isn't there.
+async fn ask_service(
+    request: crate::unattended::Request,
+) -> Result<Option<crate::unattended::Reply>, ApiError> {
+    tokio::task::spawn_blocking(move || crate::unattended::ask(&request))
+        .await
+        .map_err(|error| ApiError::new(500, error.to_string()))?
+        .map_err(|error| {
+            ApiError::new(
+                500,
+                format!("RealTimeX Link's service didn't answer: {error:#}"),
+            )
+        })
 }
 
 async fn appearance(State(state): State<Shared>) -> Answer {
@@ -878,6 +976,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn start_with_this_computer_is_listed_only_on_windows() {
+        assert_eq!(features().contains(&"unattended"), cfg!(windows));
+        assert!(features().starts_with(FEATURES));
+    }
+
+    #[test]
     fn a_release_moves_only_to_an_instance() {
         assert!(!moves_to_instance(&json!({ "installId": "x" })).unwrap());
         assert!(moves_to_instance(&json!({ "movesTo": "instance" })).unwrap());
@@ -904,6 +1008,19 @@ mod tests {
         roles.insert("window".into(), 9);
         assert_eq!(claim(&mut roles, "window", 6, true, alive), (true, false));
         assert_eq!(roles["window"], 6);
+    }
+
+    /// QA of !12: the service's daemon outlives a sign-out, and the gone window's pid went to
+    /// another process. Only a pid that is still Link's window counts, so the next sign-in's
+    /// login item and window open.
+    #[test]
+    fn a_window_pid_reused_by_another_process_doesnt_block_the_next_window() {
+        let mut roles = std::collections::HashMap::new();
+        // 14976 was the window; now it's a conhost: alive, but not rtx-link.
+        let still_link = |pid: u32| pid != 14976;
+        roles.insert("window".to_string(), 14976);
+        assert_eq!(claim(&mut roles, "window", 15120, true, still_link), (true, false));
+        assert_eq!(roles["window"], 15120);
     }
 
     #[test]
