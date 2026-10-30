@@ -53,9 +53,6 @@ struct Cli {
     /// inherited from the session bridge, for the requests the daemon marks `via:job`.
     #[arg(long, value_name = "FD")]
     input_fd: Option<i32>,
-    /// Spike S2b (realtimex-link#11), removed before Review.
-    #[arg(long, value_name = "DIR", hide = true)]
-    capture_probe: Option<String>,
 }
 
 fn main() {
@@ -66,12 +63,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-    #[cfg(target_os = "macos")]
-    if let Some(dir) = &cli.capture_probe {
-        platform::macos_capture_probe(dir);
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = &cli.capture_probe;
     #[cfg(target_os = "macos")]
     if let Some(fd) = cli.input_fd {
         platform::macos_job_channel(fd);

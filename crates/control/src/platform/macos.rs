@@ -21,9 +21,28 @@ use crate::platform::{Button, ClipboardContent, PasteGap};
 /// The login-window job's input (realtimex-link#11, Addendum 5).
 #[path = "macos_job.rs"]
 pub mod job;
-/// Spike S2b (realtimex-link#11), removed before Review.
-#[path = "macos_probe.rs"]
-pub mod probe;
+/// The lock screen's picture (realtimex-link#11, Addendum 8).
+#[path = "macos_locked.rs"]
+mod locked;
+
+/// The main display, at most `max_width` wide: ScreenCaptureKit, or CGDisplayCreateImage while
+/// the session is locked (ScreenCaptureKit's picture is blank then; S2b).
+pub fn capture_display(max_width: u32) -> Result<super::Shot> {
+    if locked::screen_locked() {
+        locked::screenshot(max_width)
+    } else {
+        rtx_screens::capture_display(max_width)
+    }
+}
+
+/// A live-view frame, the same way.
+pub fn capture_display_frame(max_width: u32) -> Result<super::Frame> {
+    if locked::screen_locked() {
+        locked::frame(max_width)
+    } else {
+        rtx_screens::capture_display_frame(max_width)
+    }
+}
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
@@ -568,11 +587,11 @@ impl Input {
 
     /// Screenshots don't go through input on macOS (see `screenshot_needs_input`).
     pub fn screenshot(&mut self, max_width: u32, _live: bool) -> Result<crate::platform::Shot> {
-        capture_bounded(move || super::capture_display(max_width))
+        capture_bounded(move || capture_display(max_width))
     }
 
     pub fn frame(&mut self, max_width: u32) -> Result<crate::platform::Frame> {
-        capture_bounded(move || super::capture_display_frame(max_width))
+        capture_bounded(move || capture_display_frame(max_width))
     }
 
     pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {

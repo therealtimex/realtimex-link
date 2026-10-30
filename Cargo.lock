@@ -3814,7 +3814,6 @@ name = "rtx-control"
 version = "0.3.0"
 dependencies = [
  "anyhow",
- "block2 0.6.2",
  "clap",
  "if-addrs",
  "libc",
