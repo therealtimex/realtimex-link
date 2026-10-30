@@ -419,6 +419,27 @@ fn us_key(c: char) -> Option<(u16, bool)> {
         .map(|code| (code as u16, shift))
 }
 
+/// The audit session and launchd domain lines of `launchctl procinfo` (needs root).
+fn procinfo(pid: u32) -> String {
+    let out = std::process::Command::new("/bin/launchctl")
+        .args(["procinfo", &pid.to_string()])
+        .output();
+    let Ok(out) = out else {
+        return "procinfo ?".into();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("session id")
+                || line.starts_with("domain =")
+                || line.starts_with("responsible")
+                || line.starts_with("uid")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|arg| arg == name)
