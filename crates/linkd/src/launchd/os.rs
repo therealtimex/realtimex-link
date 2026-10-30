@@ -38,6 +38,9 @@ pub fn user(uid: u32) -> Option<User> {
     })
 }
 
+/// <sys/syslimits.h>: the most groups setgroups takes on macOS.
+const NGROUPS_MAX: usize = 16;
+
 /// Every group `user` is in, for the owner's daemon (initgroups, done before the fork).
 pub fn groups_of(user: &User) -> Vec<libc::gid_t> {
     let Ok(name) = CString::new(user.name.clone()) else {
@@ -57,7 +60,7 @@ pub fn groups_of(user: &User) -> Vec<libc::gid_t> {
     groups[..count.max(0) as usize]
         .iter()
         .map(|&group| group as libc::gid_t)
-        .take(libc::NGROUPS_MAX as usize)
+        .take(NGROUPS_MAX)
         .collect()
 }
 
