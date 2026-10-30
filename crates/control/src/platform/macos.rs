@@ -21,6 +21,9 @@ use crate::platform::{Button, ClipboardContent, PasteGap};
 /// The login-window job's input (realtimex-link#11, Addendum 5).
 #[path = "macos_job.rs"]
 pub mod job;
+/// Spike S2b (realtimex-link#11), removed before Review.
+#[path = "macos_probe.rs"]
+pub mod probe;
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
@@ -254,6 +257,71 @@ fn on_worker(work: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
             message: "Input isn't getting through on this screen".into(),
         }
         .into()),
+    }
+}
+
+/// How long one capture may take (realtimex-link#11 C5), and how soon after one that timed out
+/// the next is tried.
+const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
+const CAPTURE_RETRY: Duration = Duration::from_secs(2);
+
+type CaptureWork = Box<dyn FnOnce() + Send>;
+
+/// Run one capture (a screenshot, a stream's start or frame) on the capture worker, waiting at
+/// most [`CAPTURE_LIMIT`] (C5, Addendum 8). At a locked screen a capture may not answer: the
+/// request then answers `capture-unavailable` and the helper stays (input still works there).
+/// Only one capture is in flight, so a stuck one leaves no thread per attempt behind, and after
+/// a timeout the next try waits [`CAPTURE_RETRY`].
+pub fn capture_bounded<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static WORKER: OnceLock<Mutex<mpsc::Sender<CaptureWork>>> = OnceLock::new();
+    static BUSY: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    static LAST_TIMEOUT: Mutex<Option<Instant>> = Mutex::new(None);
+    let unavailable = || -> anyhow::Error {
+        super::InputError {
+            code: "capture-unavailable",
+            message: "The screen can't be captured right now".into(),
+        }
+        .into()
+    };
+    if LAST_TIMEOUT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some_and(|at| at.elapsed() < CAPTURE_RETRY)
+    {
+        return Err(unavailable());
+    }
+    let busy = BUSY.get_or_init(|| Arc::new(AtomicBool::new(false))).clone();
+    if busy.swap(true, Ordering::SeqCst) {
+        return Err(unavailable());
+    }
+    let worker = WORKER.get_or_init(|| {
+        let (send, receive) = mpsc::channel::<CaptureWork>();
+        std::thread::spawn(move || {
+            for work in receive {
+                work();
+            }
+        });
+        Mutex::new(send)
+    });
+    let (done, answer) = mpsc::sync_channel(1);
+    let finished = busy.clone();
+    let job: CaptureWork = Box::new(move || {
+        let _ = done.send(work());
+        finished.store(false, Ordering::SeqCst);
+    });
+    if worker.lock().unwrap_or_else(|p| p.into_inner()).send(job).is_err() {
+        busy.store(false, Ordering::SeqCst);
+        return Err(unavailable());
+    }
+    match answer.recv_timeout(CAPTURE_LIMIT) {
+        Ok(result) => result,
+        Err(_) => {
+            *LAST_TIMEOUT.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+            Err(unavailable())
+        }
     }
 }
 
@@ -498,11 +566,11 @@ impl Input {
 
     /// Screenshots don't go through input on macOS (see `screenshot_needs_input`).
     pub fn screenshot(&mut self, max_width: u32, _live: bool) -> Result<crate::platform::Shot> {
-        super::capture_display(max_width)
+        capture_bounded(move || super::capture_display(max_width))
     }
 
     pub fn frame(&mut self, max_width: u32) -> Result<crate::platform::Frame> {
-        super::capture_display_frame(max_width)
+        capture_bounded(move || super::capture_display_frame(max_width))
     }
 
     pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {

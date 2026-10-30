@@ -213,7 +213,7 @@ impl Controller {
         let shot = if platform::screenshot_needs_input() {
             self.input()?.screenshot(max_width, live)?
         } else {
-            platform::capture_display(max_width)?
+            capture(max_width)?
         };
         // A live view's smaller frames say their own size with each click (`space`).
         if !live {
@@ -726,6 +726,30 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// A screenshot of the display: on macOS within C5's limit (realtimex-link#11).
+fn capture(max_width: u32) -> Result<platform::Shot> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::capture_bounded(move || platform::capture_display(max_width))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        platform::capture_display(max_width)
+    }
+}
+
+/// A live-view frame: on macOS within C5's limit too.
+fn capture_frame(max_width: u32) -> Result<platform::Frame> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::capture_bounded(move || platform::capture_display_frame(max_width))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        platform::capture_display_frame(max_width)
+    }
+}
+
 fn response(id: Value, result: Result<Value>) -> Value {
     match result {
         Ok(Value::Object(mut fields)) => {
@@ -754,7 +778,7 @@ impl Controller {
                 let frame = if platform::screenshot_needs_input() {
                     self.input().and_then(|input| input.frame(max_width))
                 } else {
-                    platform::capture_display_frame(max_width)
+                    capture_frame(max_width)
                 };
                 let _ = reply.send(peer::SessionIn::Frame(frame));
             }

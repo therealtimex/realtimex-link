@@ -74,7 +74,23 @@ fn socketpair_datagram() -> Option<(OwnedFd, OwnedFd)> {
     }
 }
 
+/// Spike S2b (realtimex-link#11), removed before Review: rtx-control's capture probe, as this
+/// job's child so TCC credits RealTimeX Link.
+fn probe_capture() -> ! {
+    let exe = std::env::current_exe().ok();
+    let control = exe.as_ref().and_then(|exe| exe.parent().map(|dir| dir.join("rtx-control")));
+    let dir = format!("{}/Library/Logs/RealTimeX Link/probe", std::env::var("HOME").unwrap_or_default());
+    let code = control
+        .and_then(|control| std::process::Command::new(control).args(["--capture-probe", &dir]).status().ok())
+        .and_then(|status| status.code())
+        .unwrap_or(1);
+    std::process::exit(code);
+}
+
 pub fn run(role: &str, rest: &[String]) -> ! {
+    if role == "probe-capture" {
+        probe_capture();
+    }
     let Some(linkd) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("rtx-linkd")))

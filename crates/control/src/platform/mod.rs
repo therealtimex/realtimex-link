@@ -112,9 +112,15 @@ pub const INPUT_AVAILABLE: bool = cfg!(any(target_os = "macos", windows, target_
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    control_permissions, permission_owner, request_control_permission, screenshot_needs_input,
-    Input,
+    capture_bounded, control_permissions, permission_owner, request_control_permission,
+    screenshot_needs_input, Input,
 };
+
+/// Spike S2b (realtimex-link#11), removed before Review.
+#[cfg(target_os = "macos")]
+pub fn macos_capture_probe(dir: &str) -> ! {
+    macos::probe::run(dir)
+}
 
 /// macOS, under Link's supervisor (realtimex-link#11): the login-window job's channel.
 #[cfg(target_os = "macos")]
