@@ -20,6 +20,8 @@ mod icon;
 mod instance;
 #[cfg(target_os = "macos")]
 mod launchd;
+#[cfg(target_os = "macos")]
+mod probe;
 mod theme;
 mod tray;
 

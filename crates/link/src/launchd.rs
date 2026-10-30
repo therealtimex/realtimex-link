@@ -18,6 +18,11 @@ extern "C" fn pass_on(signal: libc::c_int) {
 }
 
 pub fn run(role: &str, rest: &[String]) -> ! {
+    match role {
+        "probe" => crate::probe::serve(rest),
+        "probe-child" => crate::probe::child(rest),
+        _ => {}
+    }
     let Some(linkd) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("rtx-linkd")))
