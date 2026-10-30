@@ -213,7 +213,7 @@ impl Supervisor {
             .current_dir("/")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         // SAFETY: only async-signal-safe calls between fork and exec: dup2, fcntl, setgroups,
         // setgid, setuid, getuid. The owner's groups were looked up before the fork.
         unsafe {
@@ -240,6 +240,15 @@ impl Supervisor {
         };
         drop(theirs);
         DAEMON.store(child.id() as i32, Ordering::Relaxed);
+        // Its log lines (it logs nothing typed: I7) into this one.
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    log(&format!("daemon: {}", line.chars().take(400).collect::<String>()));
+                }
+            });
+        }
         // Its first line: ready, or why not (main.rs).
         let first = child.stdout.take().map(|mut stdout| {
             let mut line = Vec::new();

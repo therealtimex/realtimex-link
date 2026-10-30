@@ -86,6 +86,39 @@ fn console() -> Console {
     }
 }
 
+/// The bridge's log (launchd gives it no stderr): `/Library/Logs/RealTimeX Link/session.log` at
+/// the login window (root), `~/Library/Logs/RealTimeX Link/session.log` in a user's session.
+/// Nothing typed goes here (I7): only what the bridge did.
+fn log(line: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    // SAFETY: a plain getter.
+    let root = unsafe { libc::getuid() } == 0;
+    let dir = if root {
+        std::path::PathBuf::from("/Library/Logs/RealTimeX Link")
+    } else {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Library/Logs/RealTimeX Link")
+    };
+    if root {
+        if os::root_dir(&dir, 0o755).is_err() {
+            return;
+        }
+    } else if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o644)
+        .open(dir.join("session.log"))
+    {
+        let _ = writeln!(file, "{seconds} [{}] {line}", std::process::id());
+    }
+}
+
 fn process_name(pid: i32) -> Option<String> {
     let mut buffer = [0u8; 256];
     // SAFETY: the buffer's size is passed.
@@ -105,9 +138,11 @@ pub fn run(args: &[String]) -> ! {
         let _ = os::set_cloexec(input.as_raw_fd(), true);
     }
     let input = Arc::new(input);
+    log(&format!("started (input channel: {})", input.is_some()));
     loop {
-        if let Err(error) = serve(&input) {
-            eprintln!("bridge: {error}");
+        match serve(&input) {
+            Ok(()) => log("the connection to the owner's daemon closed"),
+            Err(error) => log(&format!("connection: {error}")),
         }
         // No supervisor yet, or no owner's daemon: try again.
         std::thread::sleep(Duration::from_secs(3));
@@ -124,6 +159,7 @@ fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
     };
     send(&stream, &serde_json::to_value(&hello).unwrap_or_default())?;
     send_status(&stream, now)?;
+    log(&format!("hello sent (on console: {}, secure input: {})", now.on_console, now.secure_input));
     let helper: Arc<Mutex<Option<Helper>>> = Arc::new(Mutex::new(None));
     // Until this connection ends: the console thread stops with it.
     let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -175,10 +211,14 @@ fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
                 }
                 match Helper::start(session, input) {
                     Ok((started, theirs)) => {
-                        os::send_fd(stream.as_raw_fd(), theirs.as_raw_fd(), b"{\"op\":\"started\"}")?;
+                        log(&format!("helper started for a {session:?} session"));
+                        os::send_fd(stream.as_raw_fd(), theirs.as_raw_fd(), b"{\"op\":\"started\"}\n")?;
                         *slot = Some(started);
                     }
-                    Err(error) => send(&stream, &serde_json::json!({"op": "failed", "error": error.to_string()}))?,
+                    Err(error) => {
+                        log(&format!("the helper didn't start: {error}"));
+                        send(&stream, &serde_json::json!({"op": "failed", "error": error.to_string()}))?
+                    }
                 }
             }
             Some("stop") => {
@@ -188,6 +228,7 @@ fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
                 release(input);
             }
             Some("exit") => {
+                log("another version: exiting so launchd starts the new copy");
                 release(input);
                 std::process::exit(1);
             }

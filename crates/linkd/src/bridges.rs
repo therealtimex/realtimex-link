@@ -63,7 +63,7 @@ pub fn start(fd: RawFd) {
     std::thread::spawn(move || loop {
         match os::recv_with_fd(fd) {
             Ok(Some((Some(connection), hello))) => register(connection, &hello),
-            Ok(Some((None, _))) => {}
+            Ok(Some((None, _))) => eprintln!("[unattended] a message from the supervisor without a connection"),
             // The supervisor is gone: so is the reason to run.
             Ok(None) | Err(_) => {
                 eprintln!("[unattended] the supervisor closed its connection: stopping");
@@ -102,6 +102,10 @@ fn register(connection: OwnedFd, hello: &[u8]) {
             return;
         }
     }
+    eprintln!(
+        "[unattended] a bridge for uid {} (login window: {}, version {})",
+        bridge.uid, bridge.login_window, bridge.version
+    );
     bridges().push(bridge.clone());
     std::thread::spawn(move || read(bridge, stream));
 }
@@ -116,7 +120,11 @@ fn read(bridge: Arc<Bridge>, stream: UnixStream) {
                 fds.extend(fd);
                 buffer.extend_from_slice(&bytes);
             }
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("[unattended] the bridge for uid {}: {error}", bridge.uid);
+                break;
+            }
         }
         while let Some(end) = buffer.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buffer.drain(..=end).collect();
@@ -148,6 +156,7 @@ fn read(bridge: Arc<Bridge>, stream: UnixStream) {
             }
         }
     }
+    eprintln!("[unattended] the bridge for uid {} went away", bridge.uid);
     bridges().retain(|other| other.id != bridge.id);
     if let Some(waiting) = bridge.waiting.lock().unwrap_or_else(|p| p.into_inner()).take() {
         let _ = waiting.send(Err("the session's bridge went away".into()));
