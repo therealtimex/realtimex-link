@@ -8,8 +8,6 @@ use rtx_glibc_compat as _;
 
 mod actions;
 mod artifacts;
-#[cfg(target_os = "macos")]
-mod authorize;
 mod autostart;
 mod backend;
 #[cfg(target_os = "macos")]

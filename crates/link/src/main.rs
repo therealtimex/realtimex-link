@@ -18,6 +18,9 @@ mod i18n;
 #[cfg(target_os = "linux")]
 mod icon;
 mod instance;
+// The administrator prompt for Start with this computer (#11), as Link.app's own executable.
+#[cfg(target_os = "macos")]
+mod authorize;
 // The login-window job's input (#11); its state is tested on every platform.
 #[cfg(any(target_os = "macos", test))]
 mod job;
@@ -31,6 +34,9 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "macos")]
     {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("--authorize-unattended") {
+            authorize::run(&args[1..]);
+        }
         if args.first().map(String::as_str) == Some("--launchd") {
             let role = args.get(1).cloned().unwrap_or_default();
             launchd::run(&role, &args[2.min(args.len())..]);

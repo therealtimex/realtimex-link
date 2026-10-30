@@ -44,7 +44,7 @@ pub struct Snapshot {
     /// A change to it is on its way: the switch waits for Link to confirm it.
     pub unattended_pending: bool,
     pub error: Option<String>,
-    pub notice: Option<(String, bool, Instant)>,
+    pub notice: Option<(String, Tone, Instant)>,
     /// The daemon's showWindow count when last read: another rtx-link asked this one to show.
     pub show_window: Option<u64>,
     /// Check whether RealTimeX still owns Link with the next account read (the window opened).
@@ -83,8 +83,8 @@ pub fn act(
             None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
         };
         let notice = match result {
-            Ok(_) => (done, true),
-            Err(error) => (error.to_string(), false),
+            Ok(_) => (done, Tone::Success),
+            Err(error) => (error.to_string(), Tone::Danger),
         };
         if !notice.0.is_empty() {
             lock(&shared).notice = Some((notice.0, notice.1, Instant::now()));
@@ -109,21 +109,29 @@ pub fn set_unattended(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context
             Ok(answer) => {
                 lock(&shared).unattended = Some(answer);
                 if on {
-                    (t("settings.startWithComputerOn"), true)
+                    (t("settings.startWithComputerOn"), Tone::Success)
                 } else {
-                    (t("settings.startWithComputerOff"), true)
+                    (t("settings.startWithComputerOff"), Tone::Success)
                 }
             }
-            // Not an administrator, or no service: the row reads Link again and says so
-            // (contract §6), without claiming nothing changed.
-            Err(error)
-                if error
-                    .downcast_ref::<crate::api::Refused>()
-                    .is_some_and(|refused| matches!(refused.status, 403 | 503)) =>
-            {
-                (String::new(), false)
+            Err(error) => {
+                let refused = error.downcast_ref::<crate::api::Refused>();
+                match refused.and_then(|refused| refused.code.as_deref()) {
+                    // macOS: the administrator cancelled the password prompt (contract §6).
+                    Some("admin-cancelled") => (t("settings.startWithComputerAdminCancelled"), Tone::Info),
+                    // macOS: the jobs were turned off in System Settings › Login Items.
+                    Some("login-items-disabled") => (t("settings.startWithComputerLoginItems"), Tone::Warning),
+                    // Another prompt is already open: the row says so while it waits.
+                    Some("pending") => (String::new(), Tone::Info),
+                    // Not an administrator, or no service: the row reads Link again and says so
+                    // (contract §6), without claiming nothing changed.
+                    Some("os-admin-required" | "service-missing") => (String::new(), Tone::Danger),
+                    _ if refused.is_some_and(|refused| refused.code.is_none() && matches!(refused.status, 403 | 503)) => {
+                        (String::new(), Tone::Danger)
+                    }
+                    _ => (t("settings.startWithComputerFailed"), Tone::Danger),
+                }
             }
-            Err(_) => (t("settings.startWithComputerFailed"), false),
         };
         {
             let mut state = lock(&shared);
@@ -154,7 +162,7 @@ pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) 
                 }
             }
             Err(error) => {
-                lock(&shared).notice = Some((error.to_string(), false, Instant::now()));
+                lock(&shared).notice = Some((error.to_string(), Tone::Danger, Instant::now()));
             }
         }
         let _ = refresh.send(());
@@ -919,13 +927,8 @@ impl eframe::App for LinkApp {
                 // The views end early (no daemon, Settings); the focus scroll below still runs.
                 'content: {
                     ui.spacing_mut().item_spacing.y = 10.0;
-                    if let Some((message, ok, _)) = &notice {
-                        alert(
-                            ui,
-                            if *ok { Tone::Success } else { Tone::Danger },
-                            message,
-                            |_| {},
-                        );
+                    if let Some((message, tone, _)) = &notice {
+                        alert(ui, *tone, message, |_| {});
                     }
                     let Some(overview) = overview.as_ref() else {
                         match &error {
@@ -1183,7 +1186,7 @@ impl LinkApp {
                 Ok(url) if !url.is_empty() => desktop::open_url(&url),
                 Ok(_) => {}
                 Err(error) => {
-                    lock(&shared).notice = Some((error.to_string(), false, Instant::now()));
+                    lock(&shared).notice = Some((error.to_string(), Tone::Danger, Instant::now()));
                 }
             }
             let _ = refresh.send(());
@@ -1409,7 +1412,7 @@ impl LinkApp {
                     if ui.button(t("common.copy")).clicked() {
                         ctx.copy_text(app_id.clone());
                         lock(&self.shared).notice =
-                            Some((t("host.appIdCopied"), true, Instant::now()));
+                            Some((t("host.appIdCopied"), Tone::Success, Instant::now()));
                     }
                 });
             });
@@ -1463,7 +1466,7 @@ impl LinkApp {
                             if ui.button(t("common.copy")).clicked() {
                                 ctx.copy_text(password.to_string());
                                 lock(&self.shared).notice =
-                                    Some((t("password.copied"), true, Instant::now()));
+                                    Some((t("password.copied"), Tone::Success, Instant::now()));
                             }
                             if ui
                                 .button(if self.show_password {
@@ -1804,7 +1807,17 @@ impl LinkApp {
                 .and_then(|o| o.get("allowIncoming"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            (state, shared.unattended_pending, running, allow)
+            // This window's own request, or Link's (macOS: its administrator prompt, opened from
+            // here or from RealTimeX) still open.
+            let pending = shared.unattended_pending || state["pending"] == Value::Bool(true);
+            (state, pending, running, allow)
+        };
+        // macOS has its own caption and confirm (contract §3): a login window, a Mac password,
+        // and an administrator's prompt next.
+        let help = if cfg!(target_os = "macos") {
+            "settings.startWithComputerHelpMac"
+        } else {
+            "settings.startWithComputerHelp"
         };
         let field = |name: &str| state.get(name).and_then(Value::as_bool).unwrap_or(false);
         ui.add_space(8.0);
@@ -1814,7 +1827,7 @@ impl LinkApp {
         if !field("serviceInstalled") {
             // What it would do, then why it can't (prototype v3): no switch, no badge.
             ui.label(semibold(label.as_str()));
-            caption(ui, t("settings.startWithComputerHelp"));
+            caption(ui, t(help));
             alert(ui, Tone::Warning, &t("settings.serviceMissingTitle"), |ui| {
                 ui.label(t("settings.serviceMissing"));
             });
@@ -1840,7 +1853,7 @@ impl LinkApp {
                 |ui| {
                     ui.set_width(text_width);
                     ui.label(semibold(label.as_str()));
-                    caption(ui, t("settings.startWithComputerHelp"));
+                    caption(ui, t(help));
                 },
             );
             if can_change {
@@ -1858,7 +1871,10 @@ impl LinkApp {
                 badge(ui, &text, Tone::Neutral);
             }
         });
-        let status = if !field("canChange") {
+        // Waiting for the administrator's password comes first (contract §4).
+        let status = if cfg!(target_os = "macos") && pending {
+            Some(t("settings.startWithComputerWaitingAdmin"))
+        } else if !field("canChange") {
             Some(t("settings.startWithComputerAdmin"))
         } else if !running {
             Some(t("settings.startWithComputerLinkOff"))
@@ -1897,6 +1913,7 @@ impl LinkApp {
         let part = |part: &str| tf(&format!("confirm.{which}.{part}"), &[("name", name)]);
         let message = match confirm {
             Confirm::TurnOffLink => part(&keep_running_copy("message")),
+            Confirm::StartWithComputer if cfg!(target_os = "macos") => part("messageMac"),
             _ => part("message"),
         };
         let (title, action) = (part("title"), part("action"));

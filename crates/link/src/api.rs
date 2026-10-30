@@ -102,6 +102,8 @@ pub struct Api {
 #[derive(Debug)]
 pub struct Refused {
     pub status: u16,
+    /// The answer's `code`, when it has one (`admin-cancelled`, `login-items-disabled`…).
+    pub code: Option<String>,
     pub message: String,
 }
 
@@ -208,6 +210,7 @@ impl Api {
                 .map_or_else(|| t("errors.requestFailed"), str::to_string);
             return Err(Refused {
                 status: status.as_u16(),
+                code: body.get("code").and_then(Value::as_str).map(str::to_string),
                 message,
             }
             .into());

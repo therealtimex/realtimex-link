@@ -762,7 +762,7 @@ async fn set_unattended(State(state): State<Shared>, Body64(body): Body64) -> An
     // macOS (#11 M6): on is one administrator prompt and the root step, not a socket request.
     #[cfg(target_os = "macos")]
     if on {
-        let reply = enable_on_macos(data_dir).await?;
+        let reply = enable_on_macos(&state, data_dir).await?;
         state.host.follow_hosting_at_login_now();
         let shutdown = state.shutdown.clone();
         tokio::spawn(async move {
@@ -801,12 +801,14 @@ async fn set_unattended(State(state): State<Shared>, Body64(body): Body64) -> An
 }
 
 /// macOS (#11 M6 *On*): checked as this user (the installed, signed Link; this daemon holds its
-/// standard folder), then one administrator prompt runs this bundle's
-/// `rtx-linkd unattended-apply` as root. `pending` is true while the prompt is open.
+/// standard folder), then Link.app's own executable asks for an administrator
+/// (`rtx-link --authorize-unattended`, so the prompt names RealTimeX Link and speaks Link's
+/// language) and runs this bundle's `rtx-linkd unattended-apply` as root. `pending` is true
+/// while the prompt is open.
 #[cfg(target_os = "macos")]
-async fn enable_on_macos(data_dir: std::path::PathBuf) -> Result<crate::unattended::Reply, ApiError> {
+async fn enable_on_macos(state: &Shared, data_dir: std::path::PathBuf) -> Result<crate::unattended::Reply, ApiError> {
     use std::sync::atomic::Ordering;
-    use crate::unattended::{Reply, PENDING, STANDARD_ONLY};
+    use crate::unattended::{Reply, ADMIN_PROMPT_UNAVAILABLE, PENDING, STANDARD_ONLY};
     let exe = std::env::current_exe().map_err(ApiError::internal)?;
     if !exe.starts_with("/Applications/RealTimeX Link.app") {
         return Err(ApiError::coded(
@@ -815,32 +817,38 @@ async fn enable_on_macos(data_dir: std::path::PathBuf) -> Result<crate::unattend
             "Only RealTimeX Link installed in Applications can start with this computer",
         ));
     }
+    let Some(link) = crate::autostart::app_binary() else {
+        return Err(ApiError::coded(503, ADMIN_PROMPT_UNAVAILABLE, "RealTimeX Link's app isn't next to rtx-linkd"));
+    };
     if PENDING.swap(true, Ordering::SeqCst) {
         return Err(ApiError::coded(409, "pending", "The administrator prompt is already open"));
     }
     // SAFETY: a plain getter.
     let uid = unsafe { libc::getuid() };
-    let args = vec![
-        "unattended-apply".to_string(),
-        "--owner-uid".to_string(),
-        uid.to_string(),
-        "--data-dir".to_string(),
-        data_dir.to_string_lossy().into_owned(),
-    ];
-    let prompt = "RealTimeX Link wants to start with this computer, so the computers you allowed \
-                  can connect at the login window.";
-    let result = tokio::task::spawn_blocking(move || crate::authorize::run_as_admin(&exe, &args, prompt)).await;
+    let language = state.host.language();
+    let output = tokio::process::Command::new(&link)
+        .arg("--authorize-unattended")
+        .args(["--owner-uid", &uid.to_string()])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--language", &language])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
     PENDING.store(false, Ordering::SeqCst);
-    let line = match result.map_err(|error| ApiError::new(500, error.to_string()))? {
-        Ok(line) => line,
-        Err(refusal) => return Err(Reply::refused(refusal.code, refusal.message).into_result().unwrap_err()),
-    };
+    let output = output.map_err(|error| ApiError::coded(503, ADMIN_PROMPT_UNAVAILABLE, error.to_string()))?;
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .unwrap_or_default();
     if line.get("ok") == Some(&Value::Bool(true)) {
         return Ok(Reply { enabled: true, can_change: true, ..Reply::default() });
     }
     let message = line.get("error").and_then(Value::as_str).unwrap_or("The root step failed").to_string();
     let code = line.get("code").and_then(Value::as_str).unwrap_or("io").to_string();
-    Err(ApiError::coded(if code == "io" { 500 } else { 409 }, &code, message))
+    Err(Reply::refused(&code, message).into_result().unwrap_err())
 }
 
 /// The service's answer, or None when it isn't there.
