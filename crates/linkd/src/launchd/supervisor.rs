@@ -351,9 +351,19 @@ impl Supervisor {
                     return;
                 }
                 log(&format!("turned off by uid {}", peer.uid));
-                self.stop_daemon();
-                reply(&stream, &Reply { enabled: false, can_change: true, ..Reply::default() });
-                drop(stream);
+                let off = Reply { enabled: false, can_change: true, ..Reply::default() };
+                // The owner's daemon asking for itself (POST /v1/unattended) needs the answer before
+                // it stops, or its caller gets none; anyone else hears once it has stopped (C4).
+                if peer.pid() as i32 == DAEMON.load(Ordering::Relaxed) {
+                    reply(&stream, &off);
+                    drop(stream);
+                    std::thread::sleep(Duration::from_millis(500));
+                    self.stop_daemon();
+                } else {
+                    self.stop_daemon();
+                    reply(&stream, &off);
+                    drop(stream);
+                }
                 apply::remove_everything();
                 std::process::exit(0);
             }
