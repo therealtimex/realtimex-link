@@ -43,8 +43,9 @@ pub fn install_root_copy(team: &str) -> Result<()> {
             .args(["-R", "-h", "root:wheel"])
             .arg(&staged)
             .status()?;
+        // chmod refuses -R with -h; without -H or -L it doesn't follow links anyway.
         let locked = std::process::Command::new("/bin/chmod")
-            .args(["-R", "-h", "go-w"])
+            .args(["-R", "go-w"])
             .arg(&staged)
             .status()?;
         if !owned.success() || !locked.success() {
