@@ -239,14 +239,12 @@ impl Poster {
         for code in std::mem::take(&mut self.held_keys) {
             self.key(NX_KEYUP, code, 0, 0, 0);
         }
-        for (button, held) in self.held_buttons.iter_mut().enumerate() {
-            if std::mem::take(held) {
-                let kind = [NX_LMOUSEUP, NX_RMOUSEUP, NX_OMOUSEUP][button];
-                let at = self.position;
-                let mut data = [0u8; 128];
-                data[9] = button as u8;
-                self.post(kind, at, &data, 0, 0);
-            }
+        let held = std::mem::take(&mut self.held_buttons);
+        for (button, _) in held.iter().enumerate().filter(|(_, &down)| down) {
+            let kind = [NX_LMOUSEUP, NX_RMOUSEUP, NX_OMOUSEUP][button];
+            let mut data = [0u8; 128];
+            data[9] = button as u8;
+            self.post(kind, self.position, &data, 0, 0);
         }
         self.flags = 0;
         self.key(NX_FLAGSCHANGED, 0, 0, 0, 0);

@@ -143,15 +143,14 @@ mod tests {
             let associated = text.find("<key>AssociatedBundleIdentifiers</key>").unwrap();
             assert!(associated > text.find("<key>ProgramArguments</key>").unwrap());
             assert!(value_after(&text, "AssociatedBundleIdentifiers").starts_with("<string>co.realtimex.ai</string>"));
-            assert!(value_after(&text, "KeepAlive").contains("<key>SuccessfulExit</key>\n    <false/>"));
+            assert!(text.contains("<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>"));
         }
     }
 
     #[test]
     fn the_supervisor_has_its_socket_and_a_fixed_path() {
         let text = service(&root_program());
-        let sockets = value_after(&text, "Sockets");
-        assert!(sockets.contains("<key>Listeners</key>"));
+        assert!(text.contains("<key>Sockets</key>\n  <dict>\n    <key>Listeners</key>"));
         assert!(text.contains("<string>/var/run/ai.realtimex.link.sock</string>"));
         // 0666 in decimal.
         assert!(text.contains("<key>SockPathMode</key>\n      <integer>438</integer>"));

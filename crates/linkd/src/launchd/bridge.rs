@@ -219,7 +219,8 @@ impl Helper {
         let (ours, theirs) = os::socketpair(libc::SOCK_STREAM)?;
         let mut command = crate::util::command(control);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        if let Some(fd) = input.as_ref().as_ref().map(AsRawFd::as_raw_fd) {
+        let channel: &Option<OwnedFd> = input;
+        if let Some(fd) = channel.as_ref().map(AsRawFd::as_raw_fd) {
             // The one intended exec that gets the channel (C1): it is fd 3 in rtx-control.
             command.arg("--input-fd").arg("3");
             // SAFETY: dup2 and fcntl only, between fork and exec.
