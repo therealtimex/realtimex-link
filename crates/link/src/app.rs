@@ -94,6 +94,46 @@ pub fn act(
     });
 }
 
+/// What a change of Start with this computer says (contract §6): its answer, or for no answer,
+/// what Link said afterwards (`now`: enabled, pending). Empty: nothing to say, the row shows it.
+fn unattended_notice(on: bool, answered: &anyhow::Result<()>, now: Option<(bool, bool)>) -> (String, Tone) {
+    let error = match answered {
+        Ok(()) => {
+            let key = if on { "settings.startWithComputerOn" } else { "settings.startWithComputerOff" };
+            return (t(key), Tone::Success);
+        }
+        Err(error) => error,
+    };
+    let refused = error.downcast_ref::<crate::api::Refused>();
+    match refused.and_then(|refused| refused.code.as_deref()) {
+        // macOS: the administrator cancelled the password prompt.
+        Some("admin-cancelled") => (t("settings.startWithComputerAdminCancelled"), Tone::Info),
+        // macOS: the jobs were turned off in System Settings › Login Items.
+        Some("login-items-disabled") => (t("settings.startWithComputerLoginItems"), Tone::Warning),
+        // Another prompt is already open: the row says so while it waits.
+        Some("pending") => (String::new(), Tone::Info),
+        // Not an administrator, or no service: the row reads Link again and says so, without
+        // claiming nothing changed.
+        Some("os-admin-required" | "service-missing") => (String::new(), Tone::Danger),
+        _ if refused.is_some_and(|refused| refused.code.is_none() && matches!(refused.status, 403 | 503)) => {
+            (String::new(), Tone::Danger)
+        }
+        Some(_) => (t("settings.startWithComputerFailed"), Tone::Danger),
+        // No answer: Link's state decides.
+        None => match now {
+            Some((enabled, _)) if enabled == on => {
+                let key = if on { "settings.startWithComputerOn" } else { "settings.startWithComputerOff" };
+                (t(key), Tone::Success)
+            }
+            // Still waiting for the password: the row's status says so.
+            Some((_, true)) => (String::new(), Tone::Info),
+            Some(_) => (t("settings.startWithComputerFailed"), Tone::Danger),
+            // Link didn't answer that either: the row reads it again; nothing is claimed.
+            None => (String::new(), Tone::Danger),
+        },
+    }
+}
+
 /// Start with this computer on or off (POST /v1/unattended). The switch stays as it was, and
 /// disabled, until Link answers; the next read shows what Link did.
 pub fn set_unattended(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context, on: bool) {
@@ -101,38 +141,33 @@ pub fn set_unattended(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context
     lock(&shared).unattended_pending = true;
     std::thread::spawn(move || {
         let api = lock(&shared).api.clone();
-        let result = match api {
-            Some(api) => api.post("/v1/unattended", json!({ "enabled": on })),
+        let result = match &api {
+            // macOS asks for an administrator's password first: the answer may take minutes
+            // (Review of !13: the usual 8 s gave up on it).
+            Some(api) => api.post_waiting("/v1/unattended", json!({ "enabled": on }), crate::api::ADMIN_PROMPT_TIMEOUT),
             None => Err(anyhow::anyhow!(t("errors.serviceNotRunning"))),
         };
-        let notice = match result {
+        let answered = match result {
             Ok(answer) => {
                 lock(&shared).unattended = Some(answer);
-                if on {
-                    (t("settings.startWithComputerOn"), Tone::Success)
-                } else {
-                    (t("settings.startWithComputerOff"), Tone::Success)
-                }
+                Ok(())
             }
-            Err(error) => {
-                let refused = error.downcast_ref::<crate::api::Refused>();
-                match refused.and_then(|refused| refused.code.as_deref()) {
-                    // macOS: the administrator cancelled the password prompt (contract §6).
-                    Some("admin-cancelled") => (t("settings.startWithComputerAdminCancelled"), Tone::Info),
-                    // macOS: the jobs were turned off in System Settings › Login Items.
-                    Some("login-items-disabled") => (t("settings.startWithComputerLoginItems"), Tone::Warning),
-                    // Another prompt is already open: the row says so while it waits.
-                    Some("pending") => (String::new(), Tone::Info),
-                    // Not an administrator, or no service: the row reads Link again and says so
-                    // (contract §6), without claiming nothing changed.
-                    Some("os-admin-required" | "service-missing") => (String::new(), Tone::Danger),
-                    _ if refused.is_some_and(|refused| refused.code.is_none() && matches!(refused.status, 403 | 503)) => {
-                        (String::new(), Tone::Danger)
-                    }
-                    _ => (t("settings.startWithComputerFailed"), Tone::Danger),
-                }
-            }
+            Err(error) => Err(error),
         };
+        // No answer at all (Link went away, or it took longer than allowed): what Link now
+        // says decides, never "nothing was changed" unread.
+        let now = match (&answered, &api) {
+            (Err(error), Some(api)) if error.downcast_ref::<crate::api::Refused>().is_none() => {
+                api.get("/v1/unattended").ok().map(|state| {
+                    let enabled = state["enabled"] == Value::Bool(true);
+                    let pending = state["pending"] == Value::Bool(true);
+                    lock(&shared).unattended = Some(state);
+                    (enabled, pending)
+                })
+            }
+            _ => None,
+        };
+        let notice = unattended_notice(on, &answered, now);
         {
             let mut state = lock(&shared);
             state.unattended_pending = false;
@@ -2002,5 +2037,44 @@ impl LinkApp {
             }
             self.confirm = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(status: u16, code: Option<&str>) -> anyhow::Result<()> {
+        Err(crate::api::Refused { status, code: code.map(str::to_string), message: String::new() }.into())
+    }
+
+    /// Review of !13: every outcome of turning it on says the contract's thing, and no answer
+    /// never claims nothing changed without Link's word.
+    #[test]
+    fn each_outcome_of_turning_it_on_says_what_happened() {
+        assert_eq!(unattended_notice(true, &Ok(()), None), (t("settings.startWithComputerOn"), Tone::Success));
+        assert_eq!(
+            unattended_notice(true, &refused(409, Some("admin-cancelled")), None),
+            (t("settings.startWithComputerAdminCancelled"), Tone::Info)
+        );
+        assert_eq!(
+            unattended_notice(true, &refused(409, Some("login-items-disabled")), None),
+            (t("settings.startWithComputerLoginItems"), Tone::Warning)
+        );
+        assert_eq!(unattended_notice(true, &refused(409, Some("pending")), None).0, "");
+        assert_eq!(unattended_notice(true, &refused(403, Some("os-admin-required")), None).0, "");
+        assert_eq!(
+            unattended_notice(true, &refused(500, Some("io")), None),
+            (t("settings.startWithComputerFailed"), Tone::Danger)
+        );
+        // No answer: Link's state decides.
+        let lost: anyhow::Result<()> = Err(anyhow::anyhow!("timed out"));
+        assert_eq!(unattended_notice(true, &lost, Some((true, false))).1, Tone::Success);
+        assert_eq!(unattended_notice(true, &lost, Some((false, true))).0, "");
+        assert_eq!(
+            unattended_notice(true, &lost, Some((false, false))),
+            (t("settings.startWithComputerFailed"), Tone::Danger)
+        );
+        assert_eq!(unattended_notice(true, &lost, None).0, "");
     }
 }
