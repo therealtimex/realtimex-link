@@ -427,7 +427,8 @@ mod tests {
             poster.sink.0,
             [
                 Nx::Key { kind: NX_KEYUP, code: 0x12, char_code: 0, orig_char_code: 0, flags: 0 },
-                Nx::Mouse { kind: NX_RMOUSEUP, x: 1, y: 1, button: 1, click_state: 0, pressure: 0, flags: 0 },
+                // Where the mouse is now (the budget's moves went to 10, 10).
+                Nx::Mouse { kind: NX_RMOUSEUP, x: 10, y: 10, button: 1, click_state: 0, pressure: 0, flags: 0 },
                 Nx::Key { kind: NX_FLAGSCHANGED, code: 0, char_code: 0, orig_char_code: 0, flags: 0 },
             ]
         );
