@@ -708,7 +708,12 @@ pub enum Trust {
 /// The files that authorise something: kept only from a tree that was already trusted.
 const AUTHORISING: [&str; 2] = ["unattended.json", "unattended.json.new"];
 
-pub fn secure_tree(dir: &std::path::Path, clear: &[&str]) -> std::io::Result<Trust> {
+/// Make `dir` trusted. Its `scratch` folders (live transfers and update downloads, kept with
+/// their per-session reader ACEs) are left as they are in a tree that was already trusted, and
+/// removed only from one that wasn't, or when one of them isn't trusted itself: the installer
+/// runs this while the service is serving, and the service while its own setup may be running
+/// from `updates` (Review of !12). [`sweep_stale`] removes what is no longer used.
+pub fn secure_tree(dir: &std::path::Path, scratch: &[&str]) -> std::io::Result<Trust> {
     if is_reparse(dir) {
         return Err(std::io::Error::other(format!("{} is a link", dir.display())));
     }
@@ -746,9 +751,11 @@ pub fn secure_tree(dir: &std::path::Path, clear: &[&str]) -> std::io::Result<Tru
             continue;
         }
         let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
-        if path.is_dir() && name.as_deref().is_some_and(|n| clear.contains(&n)) {
-            // remove_dir_all doesn't follow junctions or links inside it either.
-            std::fs::remove_dir_all(&path)?;
+        if path.is_dir() && name.as_deref().is_some_and(|n| scratch.contains(&n)) {
+            if trust == Trust::Reset || !is_trusted(&path) {
+                // remove_dir_all doesn't follow junctions or links inside it either.
+                std::fs::remove_dir_all(&path)?;
+            }
             continue;
         }
         if path.is_dir() {
@@ -757,6 +764,26 @@ pub fn secure_tree(dir: &std::path::Path, clear: &[&str]) -> std::io::Result<Tru
         set_security(&path, None)?;
     }
     Ok(trust)
+}
+
+/// Remove what in `dir`'s `scratch` folders hasn't changed for `age`: a transfer or a download
+/// of a service that has since stopped. Best effort: what is in use stays.
+pub fn sweep_stale(dir: &std::path::Path, scratch: &[&str], age: std::time::Duration) {
+    for name in scratch {
+        let Ok(entries) = std::fs::read_dir(dir.join(name)) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= age);
+            if stale && !is_reparse(&path) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
 }
 
 /// Every entry under `dir`: no links, only inherited ACEs.

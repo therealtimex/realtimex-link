@@ -113,7 +113,7 @@ pub fn trusted_dir() -> Option<std::path::PathBuf> {
 /// by the installer (`rtx-linkd secure-machine-dir`) before it writes there.
 #[cfg(windows)]
 pub fn prepare_machine_dir(dir: &std::path::Path) -> bool {
-    match win::secure_tree(dir, &["updates", "transfers"]) {
+    match win::secure_tree(dir, &SCRATCH) {
         Ok(trust) => {
             *TRUSTED_DIR.write().unwrap_or_else(|p| p.into_inner()) = Some(dir.to_path_buf());
             if trust == win::Trust::Reset {
@@ -126,6 +126,24 @@ pub fn prepare_machine_dir(dir: &std::path::Path) -> bool {
             log_line(&format!("Link's ProgramData folder isn't safe, so nothing there is used: {error}"));
             false
         }
+    }
+}
+
+/// The folders whose contents the service makes and only it uses: transfers and update downloads.
+#[cfg(windows)]
+const SCRATCH: [&str; 2] = ["updates", "transfers"];
+
+/// How long a transfer or download is kept after it last changed, once the service that made it
+/// stopped: a pasted file stays openable for a day.
+#[cfg(windows)]
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// At the service's start, after [`prepare_machine_dir`]: what an earlier service left behind
+/// and no longer uses. Never from the installer, which runs while the service serves.
+#[cfg(windows)]
+fn sweep_machine_dir() {
+    if let Some(dir) = trusted_dir() {
+        win::sweep_stale(&dir, &SCRATCH, STALE_AFTER);
     }
 }
 
@@ -295,6 +313,7 @@ mod windows_service {
         // Before anything is read or written there, the log included.
         if super::prepare_machine_dir(&machine_dir()) {
             shared.safe.store(true, std::sync::atomic::Ordering::Relaxed);
+            super::sweep_machine_dir();
         }
         log_line("service started");
         tokio::spawn(pipe_server(shared.clone()));
@@ -719,7 +738,7 @@ mod tests {
 
         assert!(!junction.exists(), "the junction is gone");
         assert!(elsewhere.join("keep.txt").exists(), "what it pointed at is untouched");
-        assert!(!dir.join("updates").exists(), "scratch folders are emptied");
+        assert!(!dir.join("updates").exists(), "an untrusted tree's scratch folders are emptied");
         // The folder wasn't trusted, so its choice is gone too.
         assert!(!dir.join("unattended.json").exists());
         for path in [&dir, &dir.join("service.log")] {
@@ -843,6 +862,56 @@ mod tests {
         let log = std::fs::read_to_string(dir.join("service.log")).unwrap();
         assert!(log.contains("after a repair"));
         *super::TRUSTED_DIR.write().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A trusted tree keeps a live transfer, its reader's access and a running download when it
+    /// is secured again (the installer over this version, the service at its start); only what
+    /// is stale is swept (Review of !12).
+    #[test]
+    fn a_trusted_tree_keeps_live_transfers_and_downloads() {
+        let root = scratch("live");
+        let dir = root.join("RealTimeX Link");
+        assert_eq!(win::secure_tree(&dir, &super::SCRATCH).unwrap(), win::Trust::Kept);
+        let reader = "S-1-5-32-545";
+        let transfers = dir.join("transfers");
+        win::create_protected_dir(&transfers, None).unwrap();
+        let live = transfers.join("2-reader");
+        win::create_protected_dir(&live, Some(reader)).unwrap();
+        std::fs::write(live.join("pasted.txt"), b"live").unwrap();
+        let download = dir.join("updates").join("now");
+        win::create_protected_dir(&dir.join("updates"), None).unwrap();
+        win::create_protected_dir(&download, None).unwrap();
+        std::fs::write(download.join("setup.exe"), b"setup").unwrap();
+        // Held open, as a transfer being written is.
+        let open = std::fs::OpenOptions::new().append(true).open(live.join("pasted.txt")).unwrap();
+        let before = icacls(&live);
+        assert!(before.contains("Users") || before.contains(reader), "{before}");
+
+        assert_eq!(win::secure_tree(&dir, &super::SCRATCH).unwrap(), win::Trust::Kept);
+        assert_eq!(std::fs::read(live.join("pasted.txt")).unwrap(), b"live");
+        assert_eq!(icacls(&live), before, "the reader keeps access");
+        assert!(download.join("setup.exe").exists());
+        drop(open);
+
+        // Fresh entries outlive a sweep; with no age left, everything goes.
+        win::sweep_stale(&dir, &super::SCRATCH, std::time::Duration::from_secs(3600));
+        assert!(live.exists() && download.exists());
+        win::sweep_stale(&dir, &super::SCRATCH, std::time::Duration::ZERO);
+        assert!(!live.exists() && !download.exists());
+        assert!(transfers.exists(), "the folders themselves stay");
+
+        // A scratch folder that isn't trusted itself goes, even in a trusted tree.
+        let updates = dir.join("updates");
+        std::fs::create_dir_all(updates.join("planted")).unwrap();
+        let granted = crate::util::command(r"C:\Windows\System32\icacls.exe")
+            .arg(&updates)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(F)"])
+            .status()
+            .unwrap();
+        assert!(granted.success());
+        assert_eq!(win::secure_tree(&dir, &super::SCRATCH).unwrap(), win::Trust::Kept);
+        assert!(!updates.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
