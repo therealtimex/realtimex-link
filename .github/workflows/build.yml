@@ -129,7 +129,8 @@ jobs:
       - name: Test macOS unattended access
         if: matrix.name == 'macos-x86_64'
         timeout-minutes: 15
-        run: cargo test --locked -p rtx-linkd -- launchd:: unattended:: autostart::
+        run: |
+          cargo test --locked -p rtx-linkd -- launchd:: unattended:: autostart::
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh
