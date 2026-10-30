@@ -6,7 +6,7 @@
 //!   AX / PostEvent / ListenEvent / ScreenCapture preflights, for this job or a child of it;
 //! - `post self|child <method> <keys>`: `hid`, `session`, `app-hid` (after NSApplication with
 //!   the accessory policy) or `iohid` (`IOHIDPostEvent`), typing `a` for each `a` in `<keys>`,
-//!   Backspace for each `b`, Escape for `e` and Return for `r`; `iohid-click <x>,<y>` clicks;
+//!   Backspace for each `b`, Escape for `e`, Return for `r` and keypad Enter for `n`; `iohid-click <x>,<y>` clicks;
 //! - `text`: the next line is typed through `IOHIDPostEvent` from the job and never echoed
 //!   (Addendum 3: a full password login).
 //!
@@ -25,6 +25,7 @@ const KEY_A: u16 = 0x00;
 const KEY_DELETE: u16 = 0x33;
 const KEY_ESCAPE: u16 = 0x35;
 const KEY_RETURN: u16 = 0x24;
+const KEY_ENTER: u16 = 0x4c;
 const KEY_SHIFT: u16 = 0x38;
 const NX_SHIFTMASK: u32 = 0x0002_0000;
 const NX_KEYDOWN: u32 = 10;
@@ -264,6 +265,7 @@ fn post(method: &str, keys: &str) -> Result<(), String> {
         'b' => KEY_DELETE,
         'e' => KEY_ESCAPE,
         'r' => KEY_RETURN,
+        'n' => KEY_ENTER,
         _ => KEY_A,
     });
     match method {
@@ -276,7 +278,7 @@ fn post(method: &str, keys: &str) -> Result<(), String> {
         "iohid" => {
             let connect = hid_system()?;
             for code in codes {
-                hid_key(connect, code, 0)?;
+                hid_key(connect, code, char_code(code), 0)?;
             }
         }
         // `post self iohid-click <x>,<y>`: move there and click the left button.
@@ -336,15 +338,30 @@ fn hid_system() -> Result<u32, String> {
     }
 }
 
-fn hid_key(connect: u32, code: u16, flags: u32) -> Result<(), String> {
+fn hid_key(connect: u32, code: u16, char_code: u16, flags: u32) -> Result<(), String> {
     // NXEventData's key member: origCharSet, repeat, charSet, charCode, keyCode, origCharCode,
-    // then reserved words, in a union padded well past its size here.
+    // then reserved words, in a union padded well past its size here. The character code too:
+    // loginwindow acts on Return by it.
     let mut data = [0u8; 128];
+    data[6..8].copy_from_slice(&char_code.to_ne_bytes());
     data[8..10].copy_from_slice(&code.to_ne_bytes());
+    data[10..12].copy_from_slice(&char_code.to_ne_bytes());
     for kind in [NX_KEYDOWN, NX_KEYUP] {
         hid_post(connect, kind, IOGPoint { x: 0, y: 0 }, &data, flags, 0)?;
     }
     Ok(())
+}
+
+/// The ASCII code that goes with a special key's event.
+fn char_code(code: u16) -> u16 {
+    match code {
+        KEY_A => b'a' as u16,
+        KEY_DELETE => 0x7f,
+        KEY_ESCAPE => 0x1b,
+        KEY_RETURN => 0x0d,
+        KEY_ENTER => 0x03,
+        _ => 0,
+    }
 }
 
 fn hid_post(
@@ -390,7 +407,7 @@ fn type_text(text: &str) -> Result<usize, String> {
         if shift {
             hid_post(connect, NX_FLAGSCHANGED, IOGPoint { x: 0, y: 0 }, &shift_data, flags, 0)?;
         }
-        hid_key(connect, code, flags)?;
+        hid_key(connect, code, c as u16, flags)?;
         if shift {
             hid_post(connect, NX_FLAGSCHANGED, IOGPoint { x: 0, y: 0 }, &shift_data, 0, 0)?;
         }
