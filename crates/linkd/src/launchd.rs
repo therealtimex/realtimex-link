@@ -8,14 +8,14 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub fn run(role: &str, args: &[String]) -> ! {
-    let spike = args
+    let socket = args
         .iter()
         .position(|arg| arg == "--spike")
         .and_then(|i| args.get(i + 1));
-    match (role, spike) {
+    match (role, socket) {
         ("launchd-session", Some(socket)) => spike(socket),
         _ => {
             eprintln!("rtx-linkd {role}: not available in this build");
@@ -54,7 +54,7 @@ fn serve(stream: UnixStream) -> std::io::Result<()> {
         .parent()
         .map(|dir| dir.join("rtx-control"))
         .ok_or_else(|| std::io::Error::other("no folder"))?;
-    let mut child = Command::new(control)
+    let mut child = crate::util::command(control)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
