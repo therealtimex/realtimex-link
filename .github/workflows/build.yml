@@ -123,13 +123,13 @@ jobs:
           cargo test --locked -p rtx-control -- platform::macos codes::
           cargo test --locked -p rtx-link
       # macOS unattended access (realtimex-link#11), on the Intel runner every build runs: the
-      # launchd plists through plutil, the job's datagrams, and the login-window key events.
+      # launchd plists through plutil and the macOS-only checks. The job's datagrams are tested
+      # on Linux, the login-window key events with the macOS key mapping (Apple silicon):
+      # rtx-control's test build on Intel compiles libvpx from source again, too slow here.
       - name: Test macOS unattended access
         if: matrix.name == 'macos-x86_64'
         timeout-minutes: 15
-        run: |
-          cargo test --locked -p rtx-linkd -- launchd:: unattended:: autostart::
-          cargo test --locked -p rtx-control -- jobinput:: platform::macos::job
+        run: cargo test --locked -p rtx-linkd -- launchd:: unattended:: autostart::
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh
