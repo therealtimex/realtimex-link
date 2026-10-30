@@ -14,8 +14,13 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::codes::{Modifier, PhysicalKey};
+use crate::jobinput::{Event, MouseKind};
 use crate::keys::{from_keysym, Key};
 use crate::platform::{Button, ClipboardContent, PasteGap};
+
+/// The login-window job's input (realtimex-link#11, Addendum 5).
+#[path = "macos_job.rs"]
+pub mod job;
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
@@ -215,13 +220,42 @@ const FLAG_COMMAND: u64 = 0x0010_0000;
 const KEYCODE_V: u16 = 0x09;
 const KEYCODE_COMMAND: u16 = 0x37;
 
+/// Post on a worker, waiting at most this long (realtimex-link#11 I1): a post that hangs (as at
+/// the login window, where WindowServer drops them) fails the request instead of the loop.
+const POST_LIMIT: Duration = Duration::from_secs(2);
+
 fn post(event: CGEventRef) -> Result<()> {
+    use std::sync::mpsc;
+    use std::sync::{Mutex, OnceLock};
+    static POSTER: OnceLock<Mutex<mpsc::Sender<(usize, mpsc::SyncSender<()>)>>> = OnceLock::new();
     if event.is_null() {
         bail!("could not create the input event");
     }
-    unsafe {
-        CGEventPost(HID_EVENT_TAP, event);
-        CFRelease(event);
+    let poster = POSTER.get_or_init(|| {
+        let (send, receive) = mpsc::channel::<(usize, mpsc::SyncSender<()>)>();
+        std::thread::spawn(move || {
+            for (event, done) in receive {
+                // SAFETY: an event created for this post, released once posted.
+                unsafe {
+                    CGEventPost(HID_EVENT_TAP, event as CGEventRef);
+                    CFRelease(event as CGEventRef);
+                }
+                let _ = done.send(());
+            }
+        });
+        Mutex::new(send)
+    });
+    let (done, posted) = mpsc::sync_channel(1);
+    let sent = poster
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .send((event as usize, done));
+    if sent.is_err() || posted.recv_timeout(POST_LIMIT).is_err() {
+        return Err(super::InputError {
+            code: "input-unavailable",
+            message: "Input isn't getting through on this screen".into(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -370,6 +404,10 @@ pub struct Input {
     /// Physical modifier keys held (#2909): every posted key and mouse event carries their
     /// flags, so Shift+click and ⌘+click arrive as such.
     physical_modifiers: Vec<&'static PhysicalKey>,
+    /// This request goes to the login-window job, not CGEventPost (the daemon's `via:job`, C4).
+    via_job: bool,
+    /// The job was sent something: it releases everything when this session ends.
+    used_job: bool,
     last_click: Option<(Button, Instant)>,
     click_state: i64,
     /// The pasteboard's changeCount right after this helper's own last write: not a copy to
@@ -412,7 +450,25 @@ impl Input {
             restore: None,
             gap: PasteGap::default(),
             click_state: 1,
+            via_job: false,
+            used_job: false,
         })
+    }
+
+    /// Where the next input request posts: the login-window job (`via:job`) or CGEventPost.
+    pub fn route(&mut self, via_job: bool) {
+        self.via_job = via_job;
+        self.used_job |= via_job;
+    }
+
+    fn job_mouse(&self, kind: MouseKind, button: u32) -> Result<()> {
+        job::send(&[Event::Mouse {
+            x: self.position.x as i32,
+            y: self.position.y as i32,
+            kind,
+            button: button.min(2) as u8,
+            click_state: self.click_state.clamp(0, 3) as u8,
+        }])
     }
 
     /// The flags of every modifier held, by keysym or physically.
@@ -451,6 +507,10 @@ impl Input {
             [_, _, true] => (27, 2),
             _ => (MOUSE_MOVED, 0),
         };
+        if self.via_job {
+            let kind = if kind == MOUSE_MOVED { MouseKind::Move } else { MouseKind::Drag };
+            return self.job_mouse(kind, button);
+        }
         let event = unsafe { CGEventCreateMouseEvent(self.source, kind, self.position, button) };
         if !event.is_null() {
             unsafe { CGEventSetFlags(event, self.flags()) };
@@ -475,6 +535,9 @@ impl Input {
             self.last_click = Some((button, now));
         }
         self.buttons_down[index as usize] = pressed;
+        if self.via_job {
+            return self.job_mouse(if pressed { MouseKind::Down } else { MouseKind::Up }, index);
+        }
         let event = unsafe {
             CGEventCreateMouseEvent(
                 self.source,
@@ -508,6 +571,18 @@ impl Input {
         };
         // A shortcut keeps its flags as sent: ⌘ with 'C' is still ⌘C.
         let shortcut = self.flags() & (FLAG_COMMAND | FLAG_CONTROL) != 0;
+        if self.via_job {
+            let held = self.flags() as u32;
+            if key.is_modifier() {
+                return job::send(&[Event::Flags { code: code.unwrap_or(0), mask: held }]);
+            }
+            let code = code.with_context(|| format!("{key:?} can't be typed at the login window"))?;
+            let character = match key {
+                Key::Char(c) => Some(c),
+                _ => None,
+            };
+            return job::send(&job::key_events(code, character, shift && !shortcut, held, pressed));
+        }
         let flags = self.flags() | if shift && !shortcut { FLAG_SHIFT } else { 0 };
         let event = unsafe { CGEventCreateKeyboardEvent(self.source, code.unwrap_or(0), pressed) };
         if event.is_null() {
@@ -542,6 +617,20 @@ impl Input {
                 self.physical_modifiers.push(key);
             }
         }
+        if self.via_job {
+            let mask = self.flags() as u32;
+            if key.modifier.is_some() {
+                return job::send(&[Event::Flags { code: key.mac, mask }]);
+            }
+            let char_code = job::special_char_code(key.mac);
+            return job::send(&[Event::Key {
+                code: key.mac,
+                char_code,
+                orig_char_code: char_code,
+                down: pressed,
+                flags: mask,
+            }]);
+        }
         let event = unsafe { CGEventCreateKeyboardEvent(self.source, key.mac, pressed) };
         if event.is_null() {
             bail!("could not create the key event");
@@ -557,6 +646,10 @@ impl Input {
 
     pub fn scroll(&mut self, dx: i32, dy: i32) -> Result<()> {
         // Positive requests scroll down/right; macOS wheel deltas point the other way.
+        if self.via_job {
+            let clamp = |delta: i32| (-delta).clamp(-100, 100) as i16;
+            return job::send(&[Event::Scroll { dy: clamp(dy), dx: clamp(dx) }]);
+        }
         let event = unsafe {
             CGEventCreateScrollWheelEvent2(self.source, SCROLL_UNITS_LINE, 2, -dy, -dx, 0)
         };
@@ -821,6 +914,10 @@ impl Drop for Input {
     /// The session ends: the last paste's previous text still comes back, once the app had its
     /// time to read the paste.
     fn drop(&mut self) {
+        // The job lets go of everything this session held there (I6).
+        if self.used_job {
+            let _ = job::send(&[Event::Release]);
+        }
         if let Some(due) = self.restore_due() {
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
             self.restore_clipboard();

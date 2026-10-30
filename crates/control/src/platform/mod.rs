@@ -116,6 +116,12 @@ pub use macos::{
     Input,
 };
 
+/// macOS, under Link's supervisor (realtimex-link#11): the login-window job's channel.
+#[cfg(target_os = "macos")]
+pub fn macos_job_channel(fd: i32) {
+    macos::job::set_channel(fd);
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

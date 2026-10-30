@@ -244,6 +244,13 @@ impl Controller {
             platform::init_window_server();
             self.window_server = true;
         }
+        // macOS login window (realtimex-link#11 I4, C4): the daemon alone marks a request for
+        // the job; every input request says where it goes, so none falls back by accident.
+        #[cfg(target_os = "macos")]
+        if matches!(op, "move" | "button" | "keysym" | "key" | "scroll") {
+            let via_job = request["via"].as_str() == Some("job");
+            self.input()?.route(via_job);
+        }
         match op {
             "start" => {
                 let size = self.input()?.screen_size();

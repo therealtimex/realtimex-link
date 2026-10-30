@@ -14,10 +14,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod win;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static SUPERVISED: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process is Link's service, running its owner's daemon as SYSTEM.
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
+}
+
+/// macOS (#11): whether this daemon is the owner's, run as the owner by Link's root supervisor
+/// (launchd.rs). It is the owner's daemon in every other way (their HOME, their login item).
+pub fn supervised() -> bool {
+    SUPERVISED.load(Ordering::Relaxed)
+}
+
+pub fn set_supervised() {
+    SUPERVISED.store(true, Ordering::Relaxed);
 }
 
 /// Where the service keeps a transfer's files for the person at the console (SD C2):
@@ -685,6 +696,8 @@ mod windows_service {
                 shared.changed.notify_one();
                 Reply { enabled: false, can_change: caller.admin, ..Reply::default() }
             }
+            // macOS only (launchd.rs).
+            Request::Bridge { .. } => Reply::refused("bad-request", "not on Windows"),
         }
     }
 }

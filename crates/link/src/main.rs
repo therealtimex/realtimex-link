@@ -19,9 +19,9 @@ mod i18n;
 mod icon;
 mod instance;
 #[cfg(target_os = "macos")]
-mod launchd;
+mod job;
 #[cfg(target_os = "macos")]
-mod probe;
+mod launchd;
 mod theme;
 mod tray;
 

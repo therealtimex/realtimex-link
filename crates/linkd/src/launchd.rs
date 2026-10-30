@@ -1,82 +1,56 @@
-//! macOS unattended access (realtimex-link#11): what launchd runs, through `rtx-link
-//! --launchd <role>` (SD M1), so TCC credits RealTimeX Link for everything below it.
+//! macOS unattended access (realtimex-link#11; System Design issue-11-sd-design.md). What
+//! launchd runs, always through `rtx-link --launchd <role>` (M1), so TCC credits RealTimeX
+//! Link for everything below it:
+//! - `launchd-service`: the root supervisor (supervisor.rs), which runs the owner's daemon as the
+//!   owner and answers the socket;
+//! - `launchd-session`: the session bridge (bridge.rs), one per GUI session.
 //!
-//! `launchd-session --spike <socket>` is SD's spike S1–S5 only: it serves rtx-control's JSON
-//! lines, one connection at a time, on a root-only Unix socket, so the login window, the lock
-//! screen and the grants can be tried from SSH before the supervisor and the bridge exist.
+//! And the root steps an administrator's prompt or `sudo` runs (apply.rs):
+//! `unattended-apply` and `unattended-remove`.
+//!
+//! The decisions are pure functions (policy.rs, plist.rs), tested on every platform.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Stdio;
+#[cfg(target_os = "macos")]
+mod apply;
+#[cfg(target_os = "macos")]
+mod bridge;
+// The job's input datagrams (Addendum 5), shared with rtx-control and rtx-link.
+#[cfg(target_os = "macos")]
+#[path = "../../control/src/jobinput.rs"]
+#[allow(dead_code)]
+mod jobinput;
+#[cfg(target_os = "macos")]
+pub mod os;
+pub mod plist;
+pub mod policy;
+pub mod sign;
+#[cfg(target_os = "macos")]
+mod supervisor;
 
+/// Run a launchd role, or a root step; never returns.
+#[cfg(target_os = "macos")]
 pub fn run(role: &str, args: &[String]) -> ! {
-    let socket = args
-        .iter()
-        .position(|arg| arg == "--spike")
-        .and_then(|i| args.get(i + 1));
-    match (role, socket) {
-        ("launchd-session", Some(socket)) => spike(socket),
+    match role {
+        "launchd-service" => supervisor::run(args),
+        "launchd-session" => bridge::run(args),
+        "unattended-apply" | "unattended-remove" => {
+            let done = if role == "unattended-apply" { apply::apply(args) } else { apply::remove() };
+            match done {
+                Ok(()) => {
+                    println!("{}", serde_json::json!({ "ok": true }));
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let code = (message == crate::unattended::LOGIN_ITEMS_DISABLED).then_some(message.clone());
+                    println!("{}", serde_json::json!({ "error": message, "code": code }));
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
-            eprintln!("rtx-linkd {role}: not available in this build");
+            eprintln!("rtx-linkd {role}: not a launchd role");
             std::process::exit(2);
         }
     }
-}
-
-fn spike(socket: &str) -> ! {
-    let _ = std::fs::remove_file(socket);
-    let listener = match UnixListener::bind(socket) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("spike: binding {socket}: {error}");
-            std::process::exit(1);
-        }
-    };
-    let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
-    eprintln!(
-        "spike: uid {} euid {} pid {} on {socket}",
-        unsafe { libc::getuid() },
-        unsafe { libc::geteuid() },
-        std::process::id()
-    );
-    for stream in listener.incoming().flatten() {
-        if let Err(error) = serve(stream) {
-            eprintln!("spike: {error}");
-        }
-    }
-    std::process::exit(0);
-}
-
-/// One connection: a new rtx-control, its stdin and stdout carried as lines.
-fn serve(stream: UnixStream) -> std::io::Result<()> {
-    let control = std::env::current_exe()?
-        .parent()
-        .map(|dir| dir.join("rtx-control"))
-        .ok_or_else(|| std::io::Error::other("no folder"))?;
-    let mut child = crate::util::command(control)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    let mut to_child = child.stdin.take().expect("piped");
-    let from_child = child.stdout.take().expect("piped");
-    let mut to_peer = stream.try_clone()?;
-    let out = std::thread::spawn(move || {
-        for line in BufReader::new(from_child).lines().map_while(Result::ok) {
-            if writeln!(to_peer, "{line}").is_err() {
-                break;
-            }
-        }
-    });
-    for line in BufReader::new(stream).lines().map_while(Result::ok) {
-        if writeln!(to_child, "{line}").is_err() {
-            break;
-        }
-    }
-    drop(to_child);
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = out.join();
-    Ok(())
 }

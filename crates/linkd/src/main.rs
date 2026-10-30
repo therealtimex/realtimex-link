@@ -8,8 +8,12 @@ use rtx_glibc_compat as _;
 
 mod actions;
 mod artifacts;
+#[cfg(target_os = "macos")]
+mod authorize;
 mod autostart;
 mod backend;
+#[cfg(target_os = "macos")]
+mod bridges;
 mod clients;
 mod clipboard_share;
 // rtx-control's physical key table (data only), to check a batch's codes before it runs.
@@ -26,7 +30,7 @@ mod host;
 mod identity;
 mod install;
 mod instance;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 mod launchd;
 mod local_api;
 mod lock;
@@ -85,9 +89,12 @@ fn main() {
         service::run();
         return;
     }
-    // macOS unattended access (realtimex-link#11), started by `rtx-link --launchd <role>`.
+    // macOS unattended access (realtimex-link#11): launchd's roles, started by `rtx-link
+    // --launchd <role>`, and the root steps (the administrator's prompt, or sudo).
     #[cfg(target_os = "macos")]
-    if let Some(role) = std::env::args().nth(1).filter(|arg| arg.starts_with("launchd-")) {
+    if let Some(role) = std::env::args().nth(1).filter(|arg| {
+        arg.starts_with("launchd-") || arg == "unattended-apply" || arg == "unattended-remove"
+    }) {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         launchd::run(&role, &rest);
     }
@@ -151,9 +158,31 @@ async fn run() {
     let port = arg_value(&args, "--port")
         .and_then(|p| p.parse().ok())
         .unwrap_or(host::DEFAULT_PORT);
+    // macOS (#11 M3): the owner's daemon, run as the owner by Link's root supervisor, which
+    // hands it the session bridges on this fd. The folder is checked here, after the drop to the
+    // owner (C5): the standard one, not a link, with its store; else idle (C6).
+    #[cfg(target_os = "macos")]
+    let supervised = arg_value(&args, "--supervised-fd").and_then(|fd| fd.parse::<i32>().ok());
+    #[cfg(not(target_os = "macos"))]
+    let supervised: Option<i32> = None;
+    #[cfg(target_os = "macos")]
+    if let Some(fd) = supervised {
+        let usable = data_dir == paths::default_data_dir()
+            && std::fs::symlink_metadata(&data_dir).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            && data_dir.join("remote-host.db").is_file();
+        if !usable {
+            print_line(json!({
+                "error": "the owner's RealTimeX Link folder isn't available",
+                "code": unattended::PROFILE_UNAVAILABLE,
+            }));
+            std::process::exit(1);
+        }
+        service::set_supervised();
+        bridges::start(fd);
+    }
     // While Link's service runs this folder's daemon, a second one must not take its lock
     // (SD C4): the window and RealTimeX attach to the service's through linkd.json.
-    if unattended::SUPPORTED {
+    if supervised.is_none() && unattended::supported() {
         let request = unattended::Request::Status {
             data_dir: data_dir.clone(),
         };
@@ -202,7 +231,9 @@ async fn run() {
     print_line(
         json!({ "ready": true, "pid": std::process::id(), "port": daemon.port, "version": version }),
     );
-    hand_over_to_the_service(&daemon, data_dir_of(&args));
+    if supervised.is_none() {
+        hand_over_to_the_service(&daemon, data_dir_of(&args));
+    }
     tokio::select! {
         () = wait_for_stop() => {}
         () = daemon.shutdown.notified() => {}
@@ -218,7 +249,7 @@ fn data_dir_of(args: &[String]) -> PathBuf {
 /// while the service was stopped steps aside once the service is back and waiting for its folder
 /// (QA of !12; SD C4), so the sign-in and lock screens are reachable again.
 fn hand_over_to_the_service(daemon: &daemon::Daemon, data_dir: PathBuf) {
-    if !unattended::SUPPORTED {
+    if !unattended::supported() {
         return;
     }
     let shutdown = daemon.shutdown.clone();

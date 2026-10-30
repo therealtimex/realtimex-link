@@ -304,7 +304,7 @@ fn parse_release(answer: &Value) -> Option<Release> {
 /// certificate can claim any OU; only Apple issues one under this anchor. None for a Team ID
 /// that isn't one (ten letters and digits), so nothing odd lands in the requirement.
 #[cfg(any(target_os = "macos", test))]
-fn codesign_requirement(team: &str) -> Option<String> {
+pub(crate) fn codesign_requirement(team: &str) -> Option<String> {
     let valid = team.len() == 10
         && team
             .chars()

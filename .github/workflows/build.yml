@@ -109,7 +109,7 @@ jobs:
           cargo test --locked -p rtx-linkd -p rtx-link -p rtx-screens
           # rtx-control's physical key table and held-key rules (#2909), and the GNOME Wayland
           # frame pipeline and virtual-monitor fallback (#9); its other tests need a desktop.
-          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests
+          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests jobinput::
       # Lints, once (Linux): warnings show in the log; errors fail the build.
       - name: Clippy (Linux)
         if: matrix.name == 'linux-x86_64'
@@ -122,6 +122,14 @@ jobs:
         run: |
           cargo test --locked -p rtx-control -- platform::macos codes::
           cargo test --locked -p rtx-link
+      # macOS unattended access (realtimex-link#11), on the Intel runner every build runs: the
+      # launchd plists through plutil, the job's datagrams, and the login-window key events.
+      - name: Test macOS unattended access
+        if: matrix.name == 'macos-x86_64'
+        timeout-minutes: 15
+        run: |
+          cargo test --locked -p rtx-linkd -- launchd:: unattended:: autostart::
+          cargo test --locked -p rtx-control -- jobinput:: platform::macos::job
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh

@@ -10,6 +10,10 @@ use rtx_glibc_compat as _;
 #[allow(dead_code)]
 mod codes;
 mod control;
+// The login-window job's datagrams (realtimex-link#11), shared with rtx-link and rtx-linkd.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod jobinput;
 #[cfg(all(windows, target_env = "msvc"))]
 mod crt_shim;
 // Linux posts keysyms as they are (XTest, Mutter); macOS and Windows map them to key codes.
@@ -45,6 +49,10 @@ struct Cli {
     /// another session can't inherit the service's handles.
     #[arg(long, value_name = "NAME")]
     pipes: Option<String>,
+    /// macOS, under Link's supervisor (realtimex-link#11): the login-window job's input channel,
+    /// inherited from the session bridge, for the requests the daemon marks `via:job`.
+    #[arg(long, value_name = "FD")]
+    input_fd: Option<i32>,
 }
 
 fn main() {
@@ -55,6 +63,12 @@ fn main() {
             std::process::exit(1);
         }
     }
+    #[cfg(target_os = "macos")]
+    if let Some(fd) = cli.input_fd {
+        platform::macos_job_channel(fd);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = cli.input_fd;
     if cli.check {
         println!("{}", check_report());
         std::process::exit(if platform::INPUT_AVAILABLE { 0 } else { 1 });
