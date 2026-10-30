@@ -26,6 +26,8 @@ mod host;
 mod identity;
 mod install;
 mod instance;
+#[cfg(target_os = "macos")]
+mod launchd;
 mod local_api;
 mod lock;
 mod owner;
@@ -82,6 +84,12 @@ fn main() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         service::run();
         return;
+    }
+    // macOS unattended access (realtimex-link#11), started by `rtx-link --launchd <role>`.
+    #[cfg(target_os = "macos")]
+    if let Some(role) = std::env::args().nth(1).filter(|arg| arg.starts_with("launchd-")) {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        launchd::run(&role, &rest);
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

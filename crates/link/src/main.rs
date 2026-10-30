@@ -18,10 +18,21 @@ mod i18n;
 #[cfg(target_os = "linux")]
 mod icon;
 mod instance;
+#[cfg(target_os = "macos")]
+mod launchd;
 mod theme;
 mod tray;
 
 fn main() -> eframe::Result {
+    // macOS unattended access (realtimex-link#11): launchd's jobs, before anything AppKit.
+    #[cfg(target_os = "macos")]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("--launchd") {
+            let role = args.get(1).cloned().unwrap_or_default();
+            launchd::run(&role, &args[2.min(args.len())..]);
+        }
+    }
     // --background: started at login (rtx-linkd's autostart.rs) or by RealTimeX. The menu bar /
     // tray icon and the daemon, no window until it is opened from the icon. On Linux the icon is
     // a process of its own (icon.rs).
