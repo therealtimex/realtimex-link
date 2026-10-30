@@ -111,7 +111,7 @@ fn sck_shot(dir: std::path::PathBuf, name: &'static str) -> String {
     }
 }
 
-fn cg_image() -> String {
+fn cg_image(dir: std::path::PathBuf, name: &'static str) -> String {
     // SAFETY: CG calls on an image this function owns and releases.
     unsafe {
         let image = CGDisplayCreateImage(CGMainDisplayID());
@@ -125,6 +125,19 @@ fn cg_image() -> String {
         } else {
             let bytes = std::slice::from_raw_parts(CFDataGetBytePtr(data), CFDataGetLength(data) as usize);
             let m = mean(bytes);
+            // A quarter-size picture as PPM (BGRA rows, 4 bytes a pixel), to look at.
+            let row = bytes.len() / height.max(1);
+            let (w, h) = (width / 4, height / 4);
+            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for y in 0..h {
+                for x in 0..w {
+                    let at = (y * 4) * row + (x * 4) * 4;
+                    if at + 2 < bytes.len() {
+                        ppm.extend_from_slice(&[bytes[at + 2], bytes[at + 1], bytes[at]]);
+                    }
+                }
+            }
+            let _ = std::fs::write(dir.join(format!("{name}.ppm")), ppm);
             CFRelease(data);
             m
         };
@@ -186,6 +199,8 @@ pub fn run(dir: &str) -> ! {
             let _ = writeln!(log, "{text}");
         }
     };
+    // As rtx-control does before any capture.
+    rtx_screens::init_window_server();
     // SAFETY: plain calls; the dictionary is released after its description.
     line(format!("session: {}", timed(|| unsafe {
         let d = CGSessionCopyCurrentDictionary();
@@ -224,7 +239,9 @@ pub fn run(dir: &str) -> ! {
         let shot_dir = dir.clone();
         let name: &'static str = if round == "plain" { "sck-plain" } else { "sck-activity" };
         line(format!("[{round}] sck screenshot: {}", timed(move || sck_shot(shot_dir, name))));
-        line(format!("[{round}] CGDisplayCreateImage: {}", timed(cg_image)));
+        let image_dir = dir.clone();
+        let image: &'static str = if round == "plain" { "cg-plain" } else { "cg-activity" };
+        line(format!("[{round}] CGDisplayCreateImage: {}", timed(move || cg_image(image_dir, image))));
         line(format!("[{round}] CGDisplayStream: {}", timed(cg_stream)));
     }
     line("done".into());

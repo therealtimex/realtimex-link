@@ -261,8 +261,10 @@ fn on_worker(work: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
 }
 
 /// How long one capture may take (realtimex-link#11 C5), and how soon after one that timed out
-/// the next is tried.
-const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
+/// the next is tried. 10 s, not 5: a cold first screenshot (window list, picture, text) took
+/// longer than 5 s on office-mac-mini-01, and ScreenCaptureKit's own calls already stop at 5 s
+/// each (rtx-screens' gate).
+const CAPTURE_LIMIT: Duration = Duration::from_secs(10);
 const CAPTURE_RETRY: Duration = Duration::from_secs(2);
 
 type CaptureWork = Box<dyn FnOnce() + Send>;
