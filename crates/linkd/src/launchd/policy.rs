@@ -106,9 +106,29 @@ pub fn bridge_allows(session: Session, op: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Whether a Secure Input holder is the login window's own UI, by its executable's path (I4,
+/// Addendum 6): loginwindow, or SecurityAgent (the login window's password field).
+pub fn login_ui(path: &str) -> bool {
+    path == "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+        || (path.starts_with("/System/Library/Frameworks/Security.framework/")
+            && path.ends_with("/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_login_windows_own_ui_routes_input_to_the_job() {
+        assert!(login_ui("/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"));
+        assert!(login_ui(
+            "/System/Library/Frameworks/Security.framework/Versions/A/MachServices/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"
+        ));
+        // By path, not name: a copy elsewhere doesn't count.
+        assert!(!login_ui("/tmp/loginwindow"));
+        assert!(!login_ui("/Users/a/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"));
+        assert!(!login_ui("/Applications/Terminal.app/Contents/MacOS/Terminal"));
+    }
 
     #[test]
     fn the_owner_an_admin_and_root_may_turn_it_off() {

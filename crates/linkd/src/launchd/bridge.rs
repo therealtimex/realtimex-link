@@ -86,7 +86,7 @@ fn console() -> Console {
         let login_window = libc::getuid() == 0;
         let screen_locked = number(locked).is_some_and(|value| value != 0);
         let secure_input = (login_window || screen_locked)
-            && number(secure).is_some_and(|pid| pid > 0 && process_path(pid).as_deref().is_some_and(login_ui));
+            && number(secure).is_some_and(|pid| pid > 0 && process_path(pid).as_deref().is_some_and(policy::login_ui));
         CFRelease(on_key);
         CFRelease(secure_key);
         CFRelease(locked_key);
@@ -133,14 +133,6 @@ fn process_path(pid: i32) -> Option<String> {
     // SAFETY: the buffer's size is passed (PROC_PIDPATHINFO_MAXSIZE).
     let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     (length > 0).then(|| String::from_utf8_lossy(&buffer[..length as usize]).into_owned())
-}
-
-/// Whether a Secure Input holder is the login window's own UI, by its executable's path (I4,
-/// Addendum 6): loginwindow, or SecurityAgent (the login window's password field).
-pub fn login_ui(path: &str) -> bool {
-    path == "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
-        || (path.starts_with("/System/Library/Frameworks/Security.framework/")
-            && path.ends_with("/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"))
 }
 
 pub fn run(args: &[String]) -> ! {
