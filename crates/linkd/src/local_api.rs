@@ -826,7 +826,7 @@ async fn enable_on_macos(state: &Shared, data_dir: std::path::PathBuf) -> Result
     // SAFETY: a plain getter.
     let uid = unsafe { libc::getuid() };
     let language = state.host.language();
-    let output = tokio::process::Command::new(&link)
+    let output = crate::util::tokio_command(&link)
         .arg("--authorize-unattended")
         .args(["--owner-uid", &uid.to_string()])
         .arg("--data-dir")
