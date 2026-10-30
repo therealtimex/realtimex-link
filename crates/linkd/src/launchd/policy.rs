@@ -40,6 +40,68 @@ pub fn uninstalled(missing_for: Option<Duration>) -> bool {
     missing_for.is_some_and(|missing| missing >= UNINSTALLED_AFTER)
 }
 
+/// The owner's daemon, as [`watch`] sees it.
+pub trait Running {
+    /// Whether it exited.
+    fn exited(&mut self) -> bool;
+    /// Stop it, and wait for it.
+    fn stop(&mut self);
+}
+
+/// Why [`watch`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watched {
+    /// It exited, or the supervisor is stopping.
+    Exited,
+    /// Another version is in /Applications: stopped, to start the new one (Addendum 1).
+    Restart,
+    /// /Applications has had no RealTimeX Link for [`UNINSTALLED_AFTER`]: stopped, to turn off (M3).
+    Uninstalled,
+}
+
+/// Watch the running owner's daemon (M3, Addendum 1; Review of !13): every `tick`, the bundle in
+/// /Applications. Another version restarts the daemon; missing for [`UNINSTALLED_AFTER`] in a
+/// row means uninstalled, while a shorter gap (an update's move) only waits. The clock,
+/// the bundle and the sleep are passed in, so the lifecycle is tested with a fake daemon.
+pub fn watch(
+    daemon: &mut impl Running,
+    version: &str,
+    tick: Duration,
+    mut installed: impl FnMut() -> Option<String>,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut stopping: impl FnMut() -> bool,
+    mut sleep: impl FnMut(Duration),
+) -> Watched {
+    let mut next = now() + tick;
+    let mut missing_since: Option<std::time::Instant> = None;
+    loop {
+        if daemon.exited() || stopping() {
+            return Watched::Exited;
+        }
+        let at = now();
+        if at >= next {
+            next = at + tick;
+            match installed() {
+                None => {
+                    let since = *missing_since.get_or_insert(at);
+                    if uninstalled(Some(at.duration_since(since))) {
+                        daemon.stop();
+                        return Watched::Uninstalled;
+                    }
+                }
+                Some(bundle) => {
+                    missing_since = None;
+                    if restart_owner_daemon(version, Some(&bundle)) {
+                        daemon.stop();
+                        return Watched::Restart;
+                    }
+                }
+            }
+        }
+        sleep(Duration::from_millis(500));
+    }
+}
+
 /// The owner's daemon's restart delay after `failures` quick exits in a row (M3): 2 s doubling
 /// to 60 s.
 pub fn backoff(failures: u32) -> Duration {
@@ -168,6 +230,80 @@ mod tests {
         assert_eq!(backoff(1), Duration::from_secs(4));
         assert_eq!(backoff(4), Duration::from_secs(32));
         assert_eq!(backoff(9), Duration::from_secs(60));
+    }
+
+    /// A daemon that runs until stopped, and a clock that moves only when the watcher sleeps.
+    struct Fake {
+        stopped: bool,
+        exits_at: Option<Duration>,
+        elapsed: std::rc::Rc<std::cell::Cell<Duration>>,
+    }
+
+    impl Running for Fake {
+        fn exited(&mut self) -> bool {
+            self.exits_at.is_some_and(|at| self.elapsed.get() >= at)
+        }
+        fn stop(&mut self) {
+            self.stopped = true;
+        }
+    }
+
+    /// Run the watcher with `presence(elapsed)` as /Applications' version; what it returned, when,
+    /// and whether it stopped the daemon.
+    fn run(presence: impl Fn(Duration) -> Option<&'static str>, exits_at: Option<Duration>) -> (Watched, Duration, bool) {
+        let start = std::time::Instant::now();
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let mut daemon = Fake { stopped: false, exits_at, elapsed: elapsed.clone() };
+        let (a, b, c) = (elapsed.clone(), elapsed.clone(), elapsed.clone());
+        let watched = watch(
+            &mut daemon,
+            "0.3.1",
+            Duration::from_secs(15),
+            move || presence(a.get()).map(str::to_string),
+            move || start + b.get(),
+            || false,
+            move |pause| c.set(c.get() + pause),
+        );
+        (watched, elapsed.get(), daemon.stopped)
+    }
+
+    #[test]
+    fn a_healthy_daemon_whose_app_was_removed_is_turned_off_after_ten_minutes() {
+        // Review of !13: the daemon never exits, the bundle goes at 1 min and doesn't come back.
+        let (watched, at, stopped) = run(|t| (t < Duration::from_secs(60)).then_some("0.3.1"), None);
+        assert_eq!(watched, Watched::Uninstalled);
+        assert!(stopped);
+        assert!(at >= Duration::from_secs(60) + UNINSTALLED_AFTER, "{at:?}");
+        assert!(at < Duration::from_secs(60) + UNINSTALLED_AFTER + Duration::from_secs(30), "{at:?}");
+    }
+
+    #[test]
+    fn an_updates_short_gap_only_waits_and_a_new_version_restarts() {
+        // Missing for 2 minutes (the move), back as the same version: still running at 20 min.
+        let gap = |t: Duration| {
+            !(Duration::from_secs(60)..Duration::from_secs(180)).contains(&t)
+        };
+        let (watched, at, stopped) =
+            run(move |t| gap(t).then_some("0.3.1"), Some(Duration::from_secs(20 * 60)));
+        assert_eq!((watched, stopped), (Watched::Exited, false));
+        assert!(at >= Duration::from_secs(20 * 60));
+        // Back as another version: restarted at the first tick that sees it.
+        let (watched, at, stopped) = run(
+            |t| match t.as_secs() {
+                0..60 => Some("0.3.1"),
+                60..180 => None,
+                _ => Some("0.3.2"),
+            },
+            None,
+        );
+        assert_eq!((watched, stopped), (Watched::Restart, true));
+        assert!(at < Duration::from_secs(200), "{at:?}");
+        // Gaps that add up to more than ten minutes but are each short never count.
+        let (watched, _, _) = run(
+            |t| (t.as_secs() % 300 >= 120).then_some("0.3.1"),
+            Some(Duration::from_secs(40 * 60)),
+        );
+        assert_eq!(watched, Watched::Exited);
     }
 
     #[test]

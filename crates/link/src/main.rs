@@ -18,7 +18,8 @@ mod i18n;
 #[cfg(target_os = "linux")]
 mod icon;
 mod instance;
-#[cfg(target_os = "macos")]
+// The login-window job's input (#11); its state is tested on every platform.
+#[cfg(any(target_os = "macos", test))]
 mod job;
 #[cfg(target_os = "macos")]
 mod launchd;

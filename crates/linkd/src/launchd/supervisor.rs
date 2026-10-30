@@ -184,6 +184,10 @@ impl Supervisor {
                 return;
             }
             let wait = match outcome {
+                Outcome::Uninstalled => {
+                    self.turn_off();
+                    return;
+                }
                 Outcome::Restart => Duration::from_secs(1),
                 Outcome::OwnerRunning => Duration::from_secs(5),
                 Outcome::Unavailable => Duration::from_secs(60),
@@ -280,25 +284,34 @@ impl Supervisor {
                 _ => Outcome::Exited,
             };
         }
-        let mut next_check = Instant::now() + TICK;
-        let outcome = loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break Outcome::Exited,
-                Ok(None) => {}
+        struct Daemon<'a>(&'a mut std::process::Child);
+        impl policy::Running for Daemon<'_> {
+            fn exited(&mut self) -> bool {
+                !matches!(self.0.try_wait(), Ok(None))
             }
-            if self.stopping.load(Ordering::Relaxed) {
-                break Outcome::Exited;
+            fn stop(&mut self) {
+                stop(self.0);
             }
-            if Instant::now() >= next_check {
-                next_check = Instant::now() + TICK;
-                let installed = apply::bundle_version(Path::new(APPLICATIONS_APP));
-                if policy::restart_owner_daemon(version, installed.as_deref()) {
-                    log("RealTimeX Link was updated: restarting the owner's daemon");
-                    stop(&mut child);
-                    break Outcome::Restart;
-                }
+        }
+        let watched = policy::watch(
+            &mut Daemon(&mut child),
+            version,
+            TICK,
+            || apply::bundle_version(Path::new(APPLICATIONS_APP)),
+            Instant::now,
+            || self.stopping.load(Ordering::Relaxed),
+            std::thread::sleep,
+        );
+        let outcome = match watched {
+            policy::Watched::Exited => Outcome::Exited,
+            policy::Watched::Restart => {
+                log("RealTimeX Link was updated: restarted the owner's daemon");
+                Outcome::Restart
             }
-            std::thread::sleep(Duration::from_millis(500));
+            policy::Watched::Uninstalled => {
+                log("RealTimeX Link was removed from Applications: turning off");
+                Outcome::Uninstalled
+            }
         };
         self.state.lock().unwrap_or_else(|p| p.into_inner()).bridges = None;
         let _ = child.wait();
@@ -419,6 +432,8 @@ impl Supervisor {
 enum Outcome {
     /// Stopped for an update: start the new one at once.
     Restart,
+    /// /Applications has been without Link for ten minutes: turn off.
+    Uninstalled,
     OwnerRunning,
     Unavailable,
     Exited,
