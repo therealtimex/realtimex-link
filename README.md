@@ -25,7 +25,7 @@ control other computers from.
   skipped. A view's held keys are released when it closes, loses control, sends a batch that fails
   or is refused, or sends nothing for 30 s; macOS and Windows post the viewer's repeats, X11 and
   Wayland repeat on their own. The HTTP `actions` endpoint takes `keys` combos only.
-  **Which screen** (realtimex-link#12): each live view shows the display it chose, and only it
+  **Which screen** (0.5.0, realtimex-link#12): each live view shows the display it chose, and only it
   (two viewers can watch different screens); a request that names none shows the primary, as
   before. The live view's `info` lists `displays` (feature `displays`; `{id, name, primary, x, y,
   width, height, scale}`, left to right, sizes in native pixels) and the one shown;
