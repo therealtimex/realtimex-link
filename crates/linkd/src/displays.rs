@@ -59,63 +59,91 @@ pub fn shown(chosen: Option<&str>, list: &[Value]) -> Option<String> {
 /// A view's display after a fresh list.
 #[derive(Debug, PartialEq)]
 pub struct Checked {
-    /// Its chosen display is gone: it shows the primary now (rtx-control gets `peer_display`).
-    pub fell_back: bool,
+    /// The display the view must show from now on (rtx-control gets `peer_display` with it,
+    /// after the view's held keys and buttons are let go): its own went away, or it follows the
+    /// primary and the primary changed.
+    pub switch_to: Option<String>,
     /// What to push to the viewer, when anything changed for it.
     pub push: Option<Value>,
 }
 
-/// What a fresh `list` means for a view that chose `chosen` (None: the primary), last told it
-/// shows `told` among `told_list`. A chosen display that is gone falls back to the primary, and
-/// the push says from which display. So does a view on the primary when the primary itself went
-/// away (a lid closed while an external display took over).
+/// What a fresh `list` means for a view that shows `shown` (a concrete id; None only while no
+/// list was ever read) and `follows` the primary (it never chose, or fell back), last told it
+/// shows `told` among `told_list`. A display that is gone falls back to the primary, and the
+/// push says from which display. A view that follows the primary moves when the primary does
+/// (a lid closed while an external display took over), the same way: a handover, never a
+/// silent change of picture under a held button (review of !15, finding 2).
 pub fn check(
-    chosen: Option<&str>,
+    shown: Option<&str>,
+    follows: bool,
     told: Option<&str>,
     told_list: &[Value],
     list: &[Value],
 ) -> Checked {
-    let fell_back = chosen.is_some_and(|id| !has(list, id));
-    let now = if fell_back { None } else { chosen };
-    let shown = shown(now, list);
-    let gone = told.filter(|id| !has(list, id));
-    if shown.as_deref() == told && list == told_list {
+    let gone = shown.filter(|id| !has(list, id));
+    let primary = primary(list);
+    let switch_to = if gone.is_some() || follows {
+        primary.filter(|primary| Some(primary.as_str()) != shown)
+    } else {
+        None
+    };
+    let now = switch_to.as_deref().or(shown);
+    if now == told && list == told_list && switch_to.is_none() {
         return Checked {
-            fell_back,
+            switch_to,
             push: None,
         };
     }
+    let fallback = gone.or(told.filter(|id| !has(list, id)));
+    let push = push(list, now, fallback.map(|from| (from, DISPLAY_REMOVED)));
     Checked {
-        fell_back,
-        push: Some(push(
-            list,
-            shown.as_deref(),
-            gone.map(|from| (from, DISPLAY_REMOVED)),
-        )),
+        switch_to,
+        push: Some(push),
     }
 }
 
-/// What it means that the capture of a view's chosen display failed because rtx-control
-/// doesn't find it (`peer_display_lost`): the view falls back to the primary at once, as
-/// `display_removed` when the fresh `list` lacks it too, else `display_unavailable`. A view on
-/// the primary (None) is never lost: rtx-control follows the primary itself.
-pub fn lost(chosen: Option<&str>, list: &[Value]) -> Checked {
-    let Some(from) = chosen else {
+/// What it means that rtx-control lost the display a view shows (`peer_display_lost`, with
+/// its `reason`: `display_removed`, or `display_unavailable` when it is attached but can't be
+/// captured now). The view moves to the primary of the fresh `list`, never to the lost display
+/// itself; nothing moves when there is no other display.
+pub fn lost(shown: Option<&str>, reason: &str, list: &[Value]) -> Checked {
+    let Some(from) = shown else {
         return Checked {
-            fell_back: false,
+            switch_to: None,
             push: None,
         };
     };
-    let reason = if has(list, from) {
+    let reason = if reason == DISPLAY_UNAVAILABLE {
         DISPLAY_UNAVAILABLE
     } else {
         DISPLAY_REMOVED
     };
+    let others: Vec<Value> = list
+        .iter()
+        .filter(|display| id_of(display) != Some(from))
+        .cloned()
+        .collect();
+    let Some(target) = primary(&others) else {
+        return Checked {
+            switch_to: None,
+            push: None,
+        };
+    };
     Checked {
-        fell_back: true,
-        push: Some(push(list, primary(list).as_deref(), Some((from, reason)))),
+        push: Some(push(&others, Some(&target), Some((from, reason)))),
+        switch_to: Some(target),
     }
 }
+
+/// Whether an MJPEG stream on a named display moves to the primary after a capture failed with
+/// `code` (the display went away, or can't be captured now).
+pub fn stream_falls_back(code: Option<&str>) -> bool {
+    matches!(code, Some(DISPLAY_NOT_FOUND | DISPLAY_UNAVAILABLE_CODE))
+}
+
+/// rtx-control's codes for a display that went away, or can't be captured now.
+pub const DISPLAY_NOT_FOUND: &str = "display-not-found";
+pub const DISPLAY_UNAVAILABLE_CODE: &str = "display-unavailable";
 
 /// `{type:"displays", displays, display, fallback?}`: the list and what this view shows, with
 /// `fallback` only when it moved because the display it showed (`from`) went away, and why.
@@ -171,17 +199,19 @@ mod tests {
         let list = two();
         assert_eq!(shown(None, &list).as_deref(), Some("1"));
         assert_eq!(
-            check(None, Some("1"), &list, &list),
-            Checked { fell_back: false, push: None }
+            check(Some("1"), true, Some("1"), &list, &list),
+            Checked { switch_to: None, push: None }
         );
+        // A view that never had a list (enumeration failed at its start) is given the primary.
+        assert_eq!(check(None, true, None, &[], &list).switch_to.as_deref(), Some("1"));
     }
 
     #[test]
     fn a_chosen_display_that_is_unplugged_falls_back_to_the_primary() {
         let before = two();
         let after = vec![display("1", true, 0)];
-        let checked = check(Some("2"), Some("2"), &before, &after);
-        assert!(checked.fell_back);
+        let checked = check(Some("2"), false, Some("2"), &before, &after);
+        assert_eq!(checked.switch_to.as_deref(), Some("1"));
         let push = checked.push.unwrap();
         assert_eq!(push["type"], "displays");
         assert_eq!(push["display"], "1");
@@ -193,39 +223,59 @@ mod tests {
     fn a_list_that_changed_around_the_view_is_pushed_without_a_fallback() {
         let before = two();
         let after = vec![display("1", true, 0), display("2", false, 1920), display("3", false, 3840)];
-        let checked = check(Some("2"), Some("2"), &before, &after);
-        assert!(!checked.fell_back);
+        let checked = check(Some("2"), false, Some("2"), &before, &after);
+        assert_eq!(checked.switch_to, None);
         let push = checked.push.unwrap();
         assert_eq!(push["display"], "2");
         assert!(push.get("fallback").is_none());
     }
 
-    /// Design §3.4: a lid closed while an external display became the primary.
+    /// Design §3.4 and review of !15, finding 2: a lid closed while an external display became
+    /// the primary. A view that follows the primary is handed over (switch_to: its held input
+    /// is let go first), with the reason.
     #[test]
-    fn a_view_on_the_primary_follows_a_new_primary_and_says_why() {
+    fn a_view_on_the_primary_is_handed_to_a_new_primary_and_says_why() {
         let before = two();
         let after = vec![display("2", true, 0)];
-        let checked = check(None, Some("1"), &before, &after);
-        assert!(!checked.fell_back, "it never chose: rtx-control follows the primary itself");
+        let checked = check(Some("1"), true, Some("1"), &before, &after);
+        assert_eq!(checked.switch_to.as_deref(), Some("2"));
         let push = checked.push.unwrap();
         assert_eq!(push["display"], "2");
-        assert_eq!(push["fallback"]["from"], "1");
+        assert_eq!(push["fallback"], json!({ "from": "1", "reason": "display_removed" }));
+        // The primary moved with both attached: a handover without a fallback.
+        let swapped = vec![display("1", false, 0), display("2", true, 1920)];
+        let checked = check(Some("1"), true, Some("1"), &before, &swapped);
+        assert_eq!(checked.switch_to.as_deref(), Some("2"));
+        assert!(checked.push.unwrap().get("fallback").is_none());
+        // A view that chose display 1 stays on it.
+        assert_eq!(check(Some("1"), false, Some("1"), &before, &swapped).switch_to, None);
     }
 
     #[test]
     fn a_display_that_cannot_be_captured_falls_back_with_its_reason() {
         let list = two();
-        // Still listed, but rtx-control found it gone (e.g. while locked).
-        let checked = lost(Some("2"), &list);
-        assert!(checked.fell_back);
+        // Still listed, but rtx-control can't capture it now: never moved onto itself, and the
+        // list pushed leaves it out.
+        let checked = lost(Some("2"), DISPLAY_UNAVAILABLE, &list);
+        assert_eq!(checked.switch_to.as_deref(), Some("1"));
         let push = checked.push.unwrap();
         assert_eq!(push["display"], "1");
+        assert_eq!(push["displays"], json!([display("1", true, 0)]));
         assert_eq!(push["fallback"], json!({ "from": "2", "reason": "display_unavailable" }));
-        // Gone from the list too.
-        let push = lost(Some("3"), &list).push.unwrap();
+        // Gone.
+        let push = lost(Some("3"), DISPLAY_REMOVED, &list).push.unwrap();
         assert_eq!(push["fallback"]["reason"], "display_removed");
-        // The primary view is never lost.
-        assert_eq!(lost(None, &list), Checked { fell_back: false, push: None });
+        // The primary itself, with nothing else: nowhere to go.
+        assert_eq!(
+            lost(Some("1"), DISPLAY_UNAVAILABLE, &[display("1", true, 0)]),
+            Checked { switch_to: None, push: None }
+        );
+        assert_eq!(lost(None, DISPLAY_REMOVED, &list), Checked { switch_to: None, push: None });
+        // An MJPEG stream moves on for either code, and only those.
+        assert!(stream_falls_back(Some("display-not-found")));
+        assert!(stream_falls_back(Some("display-unavailable")));
+        assert!(!stream_falls_back(Some("input-blocked")));
+        assert!(!stream_falls_back(None));
     }
 
     #[test]
