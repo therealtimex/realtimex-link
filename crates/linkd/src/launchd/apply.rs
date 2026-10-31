@@ -129,30 +129,40 @@ pub fn apply(args: &[String]) -> Result<()> {
     }
     // With RealTimeX.AI off in Login Items, macOS 15 still runs the system job, and bootstraps
     // the session job too, but then won't spawn it and removes it: the owner's own session would
-    // have no picture or input.
-    if users.contains(&uid) && !session_started(uid) {
-        return refused_by_login_items();
+    // have no picture or input. Only a session job seen running counts.
+    if users.contains(&uid) {
+        let target = format!("gui/{uid}/{SESSION_LABEL}");
+        let startup = super::policy::wait_for_start(
+            SESSION_CHECKS,
+            || os::launchctl_print(&target),
+            || std::thread::sleep(std::time::Duration::from_millis(500)),
+        );
+        match startup {
+            super::policy::Startup::Running => {}
+            super::policy::Startup::Refused => return refused_by_login_items(),
+            super::policy::Startup::TimedOut => {
+                undo()?;
+                bail!("RealTimeX Link's session job didn't start");
+            }
+        }
     }
     Ok(())
 }
 
-/// Whether the owner's session job runs (launchd removes it within about a second when
-/// Login Items refuse it). Still starting after ten seconds counts as started.
-fn session_started(uid: u32) -> bool {
-    let target = format!("gui/{uid}/{SESSION_LABEL}");
-    for _ in 0..20 {
-        if let Some(started) = super::policy::job_started(os::launchctl_print(&target).as_deref()) {
-            return started;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    true
-}
+/// How often the owner's session job is checked, half a second apart: 20 seconds, for a Mac
+/// still busy after starting up (launchd removes a refused job within about a second).
+const SESSION_CHECKS: u32 = 40;
 
-/// Login Items refused a job: undo everything, so nothing claims to be on.
-fn refused_by_login_items() -> Result<()> {
+/// Undo everything, so nothing claims to be on.
+fn undo() -> Result<()> {
     write_off()?;
     remove_everything();
+    Ok(())
+}
+
+/// Login Items refused a job: undo everything and say so.
+fn refused_by_login_items() -> Result<()> {
+    undo()?;
     bail!(crate::unattended::LOGIN_ITEMS_DISABLED);
 }
 

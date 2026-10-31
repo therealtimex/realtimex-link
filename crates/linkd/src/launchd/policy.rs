@@ -187,9 +187,63 @@ pub fn job_started(print: Option<&str>) -> Option<bool> {
     }
 }
 
+/// How a job that was just loaded came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    Running,
+    /// launchd removed it: Login Items refused it.
+    Refused,
+    /// Still not running after every check: not a success either.
+    TimedOut,
+}
+
+/// Check `print` (`launchctl print <job>`) up to `checks` times, with `sleep` between, until
+/// the job runs or is gone. Only a job seen running counts as started.
+pub fn wait_for_start(checks: u32, mut print: impl FnMut() -> Option<String>, mut sleep: impl FnMut()) -> Startup {
+    for check in 0..checks {
+        match job_started(print().as_deref()) {
+            Some(true) => return Startup::Running,
+            Some(false) => return Startup::Refused,
+            None if check + 1 < checks => sleep(),
+            None => {}
+        }
+    }
+    Startup::TimedOut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers `prints` in turn (the last one again after that), counting the sleeps.
+    fn wait_over(prints: &[Option<&str>], checks: u32) -> (Startup, usize) {
+        let mut answers = prints.iter().map(|print| print.map(str::to_string));
+        let mut last = None;
+        let mut sleeps = 0;
+        let outcome = wait_for_start(
+            checks,
+            || {
+                if let Some(answer) = answers.next() {
+                    last = answer;
+                }
+                last.clone()
+            },
+            || sleeps += 1,
+        );
+        (outcome, sleeps)
+    }
+
+    #[test]
+    fn only_a_job_seen_running_counts_as_started() {
+        let starting = Some("x = {\n\tstate = xpcproxy\n\tpid = 25678\n}");
+        let running = Some("x = {\n\tstate = running\n\tpid = 25678\n}");
+        // Review of !13: still starting at the deadline is not a success.
+        assert_eq!(wait_over(&[starting], 40), (Startup::TimedOut, 39));
+        assert_eq!(wait_over(&[starting, starting, running], 40), (Startup::Running, 2));
+        // QA's F1: launchd removes it after it was starting.
+        assert_eq!(wait_over(&[starting, None], 40), (Startup::Refused, 1));
+        assert_eq!(wait_over(&[running], 40), (Startup::Running, 0));
+    }
 
     #[test]
     fn a_job_login_items_refused_is_gone_and_only_a_running_one_started() {
