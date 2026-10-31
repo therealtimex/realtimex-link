@@ -668,6 +668,7 @@ mod windows_service {
                     enabled: true,
                     owner_sid: caller.sid.clone(),
                     data_dir: data_dir.clone(),
+                    ..Config::default()
                 };
                 if let Err(error) = on.save(&machine_dir()) {
                     return Reply::refused("io", error.to_string());
