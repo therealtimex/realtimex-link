@@ -25,23 +25,44 @@ pub mod job;
 #[path = "macos_locked.rs"]
 mod locked;
 
-/// The main display, at most `max_width` wide: ScreenCaptureKit, or CGDisplayCreateImage while
-/// the session is locked (ScreenCaptureKit's picture is blank then; S2b).
-pub fn capture_display(max_width: u32) -> Result<super::Shot> {
+/// `display` (None: the main display), at most `max_width` wide: ScreenCaptureKit, or
+/// CGDisplayCreateImage while the session is locked (ScreenCaptureKit's picture is blank then;
+/// S2b).
+pub fn capture_display_on(display: Option<&str>, max_width: u32) -> Result<super::Shot> {
     if locked::screen_locked() {
-        locked::screenshot(max_width)
+        locked::screenshot(display, max_width)
     } else {
-        rtx_screens::capture_display(max_width)
+        rtx_screens::capture_display_on(display, max_width)
     }
 }
 
 /// A live-view frame, the same way.
-pub fn capture_display_frame(max_width: u32) -> Result<super::Frame> {
+pub fn capture_display_frame_on(display: Option<&str>, max_width: u32) -> Result<super::Frame> {
     if locked::screen_locked() {
-        locked::frame(max_width)
+        locked::frame(display, max_width)
     } else {
-        rtx_screens::capture_display_frame(max_width)
+        rtx_screens::capture_display_frame_on(display, max_width)
     }
+}
+
+/// The displays (CoreGraphics only: also at the lock screen and the login window), each with
+/// its bounds in global points, where posted mouse events land (realtimex-link#12).
+pub fn displays() -> Result<Vec<crate::displays::Display>> {
+    Ok(rtx_screens::displays()?
+        .into_iter()
+        .map(|info| {
+            let bounds = unsafe { CGDisplayBounds(info.id.parse().unwrap_or(0)) };
+            crate::displays::Display {
+                rect: crate::displays::Rect {
+                    x: bounds.origin.x,
+                    y: bounds.origin.y,
+                    width: bounds.size.width,
+                    height: bounds.size.height,
+                },
+                info,
+            }
+        })
+        .collect())
 }
 
 type CGEventRef = *mut c_void;
@@ -585,20 +606,31 @@ impl Input {
         Some((self.bounds.size.width, self.bounds.size.height))
     }
 
+    /// The displays come from the platform's list, not through input (only GNOME Wayland's do).
+    pub fn displays(&mut self) -> Result<Vec<crate::displays::Display>> {
+        displays()
+    }
+
     /// Screenshots don't go through input on macOS (see `screenshot_needs_input`).
-    pub fn screenshot(&mut self, max_width: u32, _live: bool) -> Result<crate::platform::Shot> {
-        capture_bounded(move || capture_display(max_width))
+    pub fn screenshot(
+        &mut self,
+        max_width: u32,
+        _live: bool,
+        display: Option<&str>,
+    ) -> Result<crate::platform::Shot> {
+        let display = display.map(str::to_string);
+        capture_bounded(move || capture_display_on(display.as_deref(), max_width))
     }
 
-    pub fn frame(&mut self, max_width: u32) -> Result<crate::platform::Frame> {
-        capture_bounded(move || capture_display_frame(max_width))
+    pub fn frame(&mut self, max_width: u32, display: Option<&str>) -> Result<crate::platform::Frame> {
+        let display = display.map(str::to_string);
+        capture_bounded(move || capture_display_frame_on(display.as_deref(), max_width))
     }
 
-    pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
-        self.position = CGPoint {
-            x: self.bounds.origin.x + x,
-            y: self.bounds.origin.y + y,
-        };
+    /// The pointer to (x, y) in global points, on `_display` (realtimex-link#12: the caller
+    /// mapped the point onto that display's bounds).
+    pub fn move_to(&mut self, _display: &crate::displays::Display, x: f64, y: f64) -> Result<()> {
+        self.position = CGPoint { x, y };
         // While a button is held, macOS expects dragged events instead of moves.
         let (kind, button) = match self.buttons_down {
             [true, _, _] => (6, 0),

@@ -29,6 +29,7 @@ use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Value};
 
 use super::super::{Button, Shot};
 use super::terminal;
+use crate::displays::{Display, DisplayNotFound, Rect};
 
 const RD_BUS: &str = "org.gnome.Mutter.RemoteDesktop";
 const RD_SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
@@ -39,6 +40,8 @@ const CURSOR_EMBEDDED: u32 = 1;
 /// The virtual monitor's size when no monitor is attached: Mutter makes it the size the stream
 /// negotiates.
 const VIRTUAL_SIZE: (u32, u32) = (1920, 1080);
+/// The id of the one display this session records (realtimex-link#12).
+const STREAM_DISPLAY: &str = "primary";
 const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 /// How often a virtual monitor's first-frame wait checks the writer and nudges the pointer.
@@ -421,6 +424,42 @@ impl WaylandInput {
         self.frame_size.map(|(w, h)| (w as f64, h as f64))
     }
 
+    /// The displays this session records, each with its stream's pixels as the rectangle the
+    /// pointer takes (realtimex-link#12). One stream so far: the primary monitor, or the
+    /// virtual one.
+    pub fn displays(&mut self) -> Result<Vec<Display>> {
+        if self.frame_size.is_none() {
+            self.latest_frame(false, true)?;
+        }
+        let (width, height) = self.frame_size.unwrap_or(VIRTUAL_SIZE);
+        Ok(vec![Display {
+            info: rtx_screens::DisplayInfo {
+                id: STREAM_DISPLAY.into(),
+                name: String::new(),
+                primary: true,
+                x: 0,
+                y: 0,
+                width,
+                height,
+                scale: 1.0,
+            },
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: width as f64,
+                height: height as f64,
+            },
+        }])
+    }
+
+    /// `display` names this session's stream, or nothing (the primary).
+    fn check_display(display: Option<&str>) -> Result<()> {
+        match display {
+            Some(id) if id != STREAM_DISPLAY => Err(DisplayNotFound(id.to_string()).into()),
+            _ => Ok(()),
+        }
+    }
+
     /// Mutter streams a frame on pointer motion, not when an app repaints: a 1px nudge and back
     /// makes the next frame current.
     fn nudge(&self) -> Result<()> {
@@ -434,7 +473,8 @@ impl WaylandInput {
     /// The latest frame of the session's stream, one newer than this request when the screen
     /// is changing (an action's effect shows), or else the latest. A `live` view does not
     /// wait: it nudges for the next frame and takes what is there, at most one frame behind.
-    pub fn screenshot(&mut self, max_width: u32, live: bool) -> Result<Shot> {
+    pub fn screenshot(&mut self, max_width: u32, live: bool, display: Option<&str>) -> Result<Shot> {
+        Self::check_display(display)?;
         let (data, width, height) = self.latest_frame(live, false)?;
         super::x11::shot(
             &data[..width * height * 4],
@@ -450,7 +490,8 @@ impl WaylandInput {
     /// Until the stream sends a newer frame, the last one comes back as it was: not copied or
     /// scaled again, and with the same number, so the encoder skips it (#2683). The live view asks
     /// 30 times a second, and GNOME sends a frame only when the screen changes.
-    pub fn frame(&mut self, max_width: u32) -> Result<super::super::Frame> {
+    pub fn frame(&mut self, max_width: u32, display: Option<&str>) -> Result<super::super::Frame> {
+        Self::check_display(display)?;
         if let Some((seq, width, frame)) = &self.last_frame {
             let unchanged = self
                 .frames
@@ -526,7 +567,9 @@ impl WaylandInput {
         Ok((data, width, height, seq))
     }
 
-    pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
+    /// The pointer to (x, y) in `display`'s stream pixels.
+    pub fn move_to(&mut self, display: &Display, x: f64, y: f64) -> Result<()> {
+        Self::check_display(Some(&display.info.id))?;
         self.session.call::<_, _, ()>(
             "NotifyPointerMotionAbsolute",
             &(self.stream_path.as_str(), x, y),

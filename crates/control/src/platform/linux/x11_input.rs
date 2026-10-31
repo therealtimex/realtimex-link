@@ -1,5 +1,6 @@
 //! Remote Control input on X11, through the XTest extension (what xdotool uses): pointer moves,
-//! buttons, wheel steps and keysyms, on the primary monitor (the one `capture_display` shows).
+//! buttons, wheel steps and keysyms. A move lands on the monitor the request names (the caller
+//! maps it onto that monitor's RandR rectangle, realtimex-link#12), else the primary one.
 //!
 //! A keysym the keyboard map lacks (a non-Latin character pressed as a key) is bound for that
 //! press to a spare keycode, one with no symbols, and unbound after its release. Text is not
@@ -178,11 +179,11 @@ impl X11Input {
         Ok(())
     }
 
-    pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
-        let max_x = self.size.0.saturating_sub(1) as f64;
-        let max_y = self.size.1.saturating_sub(1) as f64;
-        let x = self.origin.0 + x.round().clamp(0.0, max_x) as i16;
-        let y = self.origin.1 + y.round().clamp(0.0, max_y) as i16;
+    /// The pointer to (x, y) in root-window pixels, kept on `display`'s monitor.
+    pub fn move_to(&mut self, display: &crate::displays::Display, x: f64, y: f64) -> Result<()> {
+        let rect = display.rect;
+        let x = x.round().clamp(rect.x, (rect.x + rect.width - 1.0).max(rect.x)) as i16;
+        let y = y.round().clamp(rect.y, (rect.y + rect.height - 1.0).max(rect.y)) as i16;
         self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x, y)?;
         self.conn.flush()?;
         Ok(())
@@ -939,7 +940,11 @@ mod tests {
 
         let mut input = X11Input::new()?;
         let (origin_x, origin_y) = input.origin;
-        input.move_to(50.0, 60.0)?;
+        let primary = crate::platform::displays()?
+            .into_iter()
+            .find(|d| d.info.primary)
+            .expect("a primary monitor");
+        input.move_to(&primary, origin_x as f64 + 50.0, origin_y as f64 + 60.0)?;
         input.button(Button::Left, true)?;
         input.button(Button::Left, false)?;
         input.keysym(0x61, true)?; // a

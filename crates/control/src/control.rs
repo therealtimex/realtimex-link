@@ -25,7 +25,14 @@
 //! {"id":11,"op":"peer_offer","sdp":"…","maxWidth":1280,"fps":15} -> {"session":1,"sdp":"<answer>"}
 //! {"id":12,"op":"peer_send","session":1,"data":"…"}   (text to the viewer's DataChannel)
 //! {"id":13,"op":"peer_close","session":1}
+//! {"id":19,"op":"displays"}                  -> {"displays":[{"id","name","primary","x","y","width","height","scale"}…]}
+//! {"id":20,"op":"peer_display","session":1,"display":"<id>"} -> {"display":"<id>","width":..,"height":..}
 //! ```
+//!
+//! Which display (realtimex-link#12): `screenshot`, `move` and `peer_offer` take `"display":"<id>"`
+//! (an id from `displays`); without one they mean the primary display, as before. A display that
+//! isn't attached answers the code `display-not-found`, never another display. Nothing here
+//! remembers a choice: rtx-linkd keeps each live view's.
 //!
 //! A peer session (see [`crate::peer`]) is the WebRTC live view: the screen as VP8 and a
 //! DataChannel, directly between the two machines. It reports on stdout without a request:
@@ -33,11 +40,13 @@
 //! ```text
 //! {"id":null,"event":"peer_state","session":1,"state":"connected"|"closed"}
 //! {"id":null,"event":"peer_message","session":1,"data":"…"}   (text from the DataChannel)
+//! {"id":null,"event":"peer_display_lost","session":1,"display":"<id>"}   (its display went away;
+//!     the view keeps its last picture until rtx-linkd sends `peer_display`)
 //! ```
 //!
 //! Errors answer `{"id":..,"ok":false,"error":"…"}`, with a `"code"` when the server can say
 //! what to do about it ([`platform::InputError`], e.g. `input-blocked` on Windows). Pointer
-//! coordinates are pixels of the latest screenshot, mapped onto the main display.
+//! coordinates are pixels of the latest screenshot of that display, mapped onto it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
@@ -48,6 +57,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
 use crate::codes::{physical_key, PhysicalKey};
+use crate::displays::{self, Display};
 use crate::peer::{self, Peer, ToMain};
 use crate::platform::{self, Button, Input};
 
@@ -82,8 +92,11 @@ impl std::error::Error for CaptureStalled {}
 
 struct Controller {
     input: Option<Input>,
-    /// Size of the latest screenshot, the space request coordinates are in.
-    shot_size: Option<(u32, u32)>,
+    /// Size of the latest screenshot of each display (None: the primary), the space request
+    /// coordinates on it are in.
+    shot_sizes: HashMap<Option<String>, (u32, u32)>,
+    /// The displays and where the pointer reaches each (realtimex-link#12).
+    displays: displays::Table,
     /// Keys and buttons pressed and not yet released. They are released when the session ends
     /// (stop, an error that drops it, or stdin closing), so a dropped controller can't leave
     /// Ctrl or a mouse button held down on the desktop.
@@ -204,38 +217,78 @@ impl Controller {
     fn end_session(&mut self) {
         self.release_held();
         self.input = None;
+        // GNOME Wayland's displays are the session's streams.
+        self.displays.clear();
     }
 
-    /// The main display. On GNOME Wayland the frame comes from the remote-desktop session
-    /// itself; elsewhere it needs no input permission (a view-only client works with Screen
-    /// Recording alone on macOS).
-    fn screenshot(&mut self, max_width: u32, live: bool) -> Result<platform::Shot> {
-        let shot = if platform::screenshot_needs_input() {
-            self.input()?.screenshot(max_width, live)?
+    /// The displays as they are now: GNOME Wayland's from its remote-desktop session, others'
+    /// from the system's list (no input permission needed).
+    fn read_displays(&mut self) -> Result<Vec<Display>> {
+        let mut list = if platform::screenshot_needs_input() {
+            self.input()?.displays()?
         } else {
-            capture(max_width)?
+            platform::displays()?
+        };
+        // The picker's order (realtimex-ai-app#2970), whoever listed them.
+        list.sort_by_key(|display| (display.info.x, display.info.y));
+        Ok(list)
+    }
+
+    /// The display `id` names (None: the primary), from the table while it is fresh, else
+    /// read again.
+    fn display(&mut self, id: Option<&str>) -> Result<Display> {
+        if let Some(found) = self.displays.cached(id) {
+            return Ok(found.clone());
+        }
+        let list = self.read_displays()?;
+        self.displays.set(list);
+        displays::find(self.displays.list(), id).cloned()
+    }
+
+    /// `display` (None: the primary). On GNOME Wayland the frame comes from the remote-desktop
+    /// session itself; elsewhere it needs no input permission (a view-only client works with
+    /// Screen Recording alone on macOS).
+    fn screenshot(
+        &mut self,
+        max_width: u32,
+        live: bool,
+        display: Option<&str>,
+    ) -> Result<platform::Shot> {
+        let shot = if platform::screenshot_needs_input() {
+            self.input()?.screenshot(max_width, live, display)?
+        } else {
+            capture(max_width, display)?
         };
         // A live view's smaller frames say their own size with each click (`space`).
         if !live {
-            self.shot_size = Some((shot.width, shot.height));
+            self.shot_sizes
+                .insert(display.map(str::to_string), (shot.width, shot.height));
         }
         Ok(shot)
     }
 
-    /// Screenshot pixels to the input system's coordinates (points on macOS, frame pixels on
-    /// GNOME Wayland). `space` is the size of the picture the point is in, when not the
-    /// latest screenshot.
-    fn screen_point(&mut self, x: f64, y: f64, space: Option<(u32, u32)>) -> Result<(f64, f64)> {
-        if space.is_none() && self.shot_size.is_none() {
+    /// Screenshot pixels to the input system's coordinates on `display` (None: the primary):
+    /// global points on macOS, virtual-desktop pixels on Windows and X11, that display's stream
+    /// pixels on GNOME Wayland. `space` is the size of the picture the point is in, when not the
+    /// latest screenshot of that display.
+    fn screen_point(
+        &mut self,
+        x: f64,
+        y: f64,
+        space: Option<(u32, u32)>,
+        display: Option<&str>,
+    ) -> Result<(Display, f64, f64)> {
+        let target = self.display(display)?;
+        let key = display.map(str::to_string);
+        if space.is_none() && !self.shot_sizes.contains_key(&key) {
             // No screenshot yet: take one so coordinates have a meaning.
-            self.screenshot(DEFAULT_MAX_WIDTH, false)?;
+            self.screenshot(DEFAULT_MAX_WIDTH, false, display)?;
         }
-        let (sw, sh) = space.or(self.shot_size).unwrap();
-        let (w, h) = self
-            .input()?
-            .screen_size()
-            .unwrap_or((sw as f64, sh as f64));
-        Ok((x * w / sw as f64, y * h / sh as f64))
+        let space = space
+            .or_else(|| self.shot_sizes.get(&key).copied())
+            .expect("a screenshot was just taken");
+        let (x, y) = displays::map_point(target.rect, x, y, space);
+        Ok((target, x, y))
     }
 
     fn handle(&mut self, request: &Value) -> Result<Value> {
@@ -275,21 +328,39 @@ impl Controller {
                 self.end_session();
                 Ok(json!({}))
             }
+            "displays" => {
+                // Always read now: rtx-linkd asks while a live view is open to see changes.
+                let list = self.read_displays()?;
+                self.displays.set(list);
+                let infos: Vec<&displays::DisplayInfo> =
+                    self.displays.list().iter().map(|d| &d.info).collect();
+                Ok(json!({ "displays": infos }))
+            }
             "screenshot" => {
                 let max_width = request["maxWidth"]
                     .as_u64()
                     .unwrap_or(DEFAULT_MAX_WIDTH as u64) as u32;
                 // A live view's frame: no waiting for one newer than the request.
                 let live = request["live"].as_bool().unwrap_or(false);
-                let shot = self.screenshot(max_width, live)?;
-                Ok(json!({
+                let display = display_of(request);
+                let shot = self.screenshot(max_width, live, display)?;
+                let mut answer = json!({
                     "mime": "image/jpeg",
                     "width": shot.width,
                     "height": shot.height,
                     "data": base64(&shot.jpeg),
                     // Same value for the same picture: a live view skips unchanged frames.
                     "thumb": thumb_hash(&shot.thumb),
-                }))
+                });
+                // Which display it is: the one named, else the primary's id when known.
+                let shown = match display {
+                    Some(id) => Some(id.to_string()),
+                    None => self.display(None).ok().map(|d| d.info.id),
+                };
+                if let Some(shown) = shown {
+                    answer["display"] = json!(shown);
+                }
+                Ok(answer)
             }
             "move" => {
                 let (x, y) = coordinates(request)?;
@@ -300,8 +371,8 @@ impl Controller {
                     (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
                     _ => None,
                 };
-                let (x, y) = self.screen_point(x, y, space)?;
-                self.input()?.move_to(x, y)?;
+                let (target, x, y) = self.screen_point(x, y, space, display_of(request))?;
+                self.input()?.move_to(&target, x, y)?;
                 Ok(json!({}))
             }
             "button" => {
@@ -419,7 +490,13 @@ impl Controller {
                     .as_str()
                     .ok_or_else(|| anyhow!("sdp is required"))?;
                 let defaults = peer::Options::default();
+                // The view's first display: it must be there now.
+                let display = match display_of(request) {
+                    Some(id) => Some(self.display(Some(id))?.info.id),
+                    None => None,
+                };
                 let options = peer::Options {
+                    display,
                     max_width: request["maxWidth"]
                         .as_u64()
                         .map_or(defaults.max_width, |w| w.clamp(320, 1920) as u32),
@@ -456,6 +533,20 @@ impl Controller {
                 let session = request["session"].as_u64().unwrap_or(0);
                 self.peers.remove(&session);
                 Ok(json!({}))
+            }
+            // Another display for a live view (realtimex-link#12): its next frames show it.
+            "peer_display" => {
+                let session = request["session"].as_u64().unwrap_or(0);
+                let target = self.display(display_of(request))?;
+                match self.peers.get(&session) {
+                    Some(handle) => handle.show(display_of(request).map(str::to_string)),
+                    None => bail!("no live view session {session}"),
+                }
+                Ok(json!({
+                    "display": target.info.id,
+                    "width": target.info.width,
+                    "height": target.info.height,
+                }))
             }
             other => bail!("Unknown op: {other}"),
         }
@@ -524,6 +615,11 @@ fn press_key(
         }
         (false, None) => Ok(()),
     }
+}
+
+/// The display a request names (`"display":"<id>"`); None for the primary.
+fn display_of(request: &Value) -> Option<&str> {
+    request["display"].as_str().filter(|id| !id.is_empty())
 }
 
 fn coordinates(request: &Value) -> Result<(f64, f64)> {
@@ -629,7 +725,8 @@ pub fn run() -> Result<()> {
     let (to_main, inbox) = mpsc::channel();
     let mut controller = Controller {
         input: None,
-        shot_size: None,
+        shot_sizes: HashMap::new(),
+        displays: displays::Table::default(),
         held_keys: BTreeSet::new(),
         held_buttons: Vec::new(),
         held_codes: Vec::new(),
@@ -714,7 +811,13 @@ pub fn run() -> Result<()> {
         let id = request["id"].clone();
         let op = request["op"].as_str().unwrap_or("");
         let result = controller.handle(&request);
-        if result.is_err() && !matches!(op, "start" | "peer_offer" | "peer_send" | "peer_close") {
+        let ends_session = result.as_ref().is_err_and(|error| !displays::not_found(error));
+        if ends_session
+            && !matches!(
+                op,
+                "start" | "peer_offer" | "peer_send" | "peer_close" | "peer_display" | "displays"
+            )
+        {
             // The desktop may have ended the session (GNOME: the user stopped sharing); start
             // a fresh one with the next request instead of failing forever.
             controller.end_session();
@@ -726,27 +829,32 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// A screenshot of the display: on macOS within C5's limit (realtimex-link#11).
-fn capture(max_width: u32) -> Result<platform::Shot> {
+/// A screenshot of `display` (None: the primary): on macOS within C5's limit
+/// (realtimex-link#11).
+fn capture(max_width: u32, display: Option<&str>) -> Result<platform::Shot> {
     #[cfg(target_os = "macos")]
     {
-        platform::capture_bounded(move || platform::capture_display(max_width))
+        let display = display.map(str::to_string);
+        platform::capture_bounded(move || platform::capture_display_on(display.as_deref(), max_width))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        platform::capture_display(max_width)
+        platform::capture_display_on(display, max_width)
     }
 }
 
 /// A live-view frame: on macOS within C5's limit too.
-fn capture_frame(max_width: u32) -> Result<platform::Frame> {
+fn capture_frame(max_width: u32, display: Option<&str>) -> Result<platform::Frame> {
     #[cfg(target_os = "macos")]
     {
-        platform::capture_bounded(move || platform::capture_display_frame(max_width))
+        let display = display.map(str::to_string);
+        platform::capture_bounded(move || {
+            platform::capture_display_frame_on(display.as_deref(), max_width)
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
-        platform::capture_display_frame(max_width)
+        platform::capture_display_frame_on(display, max_width)
     }
 }
 
@@ -758,30 +866,47 @@ fn response(id: Value, result: Result<Value>) -> Value {
             Value::Object(fields)
         }
         Ok(_) => json!({ "id": id, "ok": true }),
-        Err(error) => match error.downcast_ref::<platform::InputError>() {
-            Some(input) => json!({
+        Err(error) => match error_code(&error) {
+            Some(code) => json!({
                 "id": id,
                 "ok": false,
                 "error": format!("{error:#}"),
-                "code": input.code,
+                "code": code,
             }),
             None => json!({ "id": id, "ok": false, "error": format!("{error:#}") }),
         },
     }
 }
 
+/// The code a failure is answered with, when the server can tell what to do about it.
+fn error_code(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(input) = error.downcast_ref::<platform::InputError>() {
+        return Some(input.code);
+    }
+    displays::not_found(error).then_some("display-not-found")
+}
+
 impl Controller {
     /// A peer session's request (a frame) or report (DataChannel text, state).
     fn on_peer(&mut self, event: ToMain, out: &mut impl Write) {
         match event {
-            ToMain::Frame { max_width, reply } => {
+            ToMain::Frame {
+                max_width,
+                display,
+                reply,
+            } => {
+                let display = display.as_deref();
                 let frame = if platform::screenshot_needs_input() {
-                    self.input().and_then(|input| input.frame(max_width))
+                    self.input().and_then(|input| input.frame(max_width, display))
                 } else {
-                    capture_frame(max_width)
+                    capture_frame(max_width, display)
                 };
                 let _ = reply.send(peer::SessionIn::Frame(frame));
             }
+            ToMain::DisplayLost { session, display } => write_line(
+                out,
+                &json!({ "id": null, "event": "peer_display_lost", "session": session, "display": display }),
+            ),
             ToMain::Message { session, text } => write_line(
                 out,
                 &json!({ "id": null, "event": "peer_message", "session": session, "data": text }),

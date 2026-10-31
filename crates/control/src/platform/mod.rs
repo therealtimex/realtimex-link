@@ -99,11 +99,24 @@ mod tests {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use rtx_screens::{capture_display, capture_display_frame};
+pub use rtx_screens::{capture_display_frame_on, capture_display_on};
 pub use rtx_screens::{init_window_server, Frame, Shot};
 // macOS: the lock screen's own picture while it shows (realtimex-link#11).
 #[cfg(target_os = "macos")]
-pub use macos::{capture_display, capture_display_frame};
+pub use macos::{capture_display_frame_on, capture_display_on, displays};
+
+/// The displays, each with the rectangle the pointer reaches it in: physical pixels of the
+/// virtual desktop, as listed (Windows, X11). GNOME Wayland lists its own (`Input::displays`).
+#[cfg(not(target_os = "macos"))]
+pub fn displays() -> anyhow::Result<Vec<crate::displays::Display>> {
+    Ok(rtx_screens::displays()?
+        .into_iter()
+        .map(|info| crate::displays::Display {
+            rect: crate::displays::Rect::of(&info),
+            info,
+        })
+        .collect())
+}
 // Numbers live-view frames (#2683): the Wayland capture here, and peer.rs's tests.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use rtx_screens::next_frame_seq;

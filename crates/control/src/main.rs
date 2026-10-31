@@ -10,6 +10,7 @@ use rtx_glibc_compat as _;
 #[allow(dead_code)]
 mod codes;
 mod control;
+mod displays;
 // The login-window job's datagrams (realtimex-link#11), shared with rtx-link and rtx-linkd.
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
