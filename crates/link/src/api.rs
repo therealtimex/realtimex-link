@@ -316,8 +316,29 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                // The whole request: closing with some of it unread resets the connection, and
+                // the client would see that instead of the answer.
+                let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
-                let _ = stream.read(&mut buffer);
+                loop {
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+                            })
+                            .unwrap_or(0usize);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
                 std::thread::sleep(delay);
                 let _ = write!(
                     stream,
