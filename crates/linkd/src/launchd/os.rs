@@ -275,6 +275,17 @@ pub fn launchctl(args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// `launchctl print <target>`'s text, or None when launchd has no such job.
+pub fn launchctl_print(target: &str) -> Option<String> {
+    let output = std::process::Command::new("/bin/launchctl")
+        .args(["print", target])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// The users with a GUI session now: each Aqua session has its own loginwindow, running as the
 /// session's user.
 pub fn gui_users() -> Vec<u32> {

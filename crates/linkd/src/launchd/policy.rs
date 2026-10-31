@@ -176,9 +176,26 @@ pub fn login_ui(path: &str) -> bool {
             && path.ends_with("/SecurityAgent.bundle/Contents/MacOS/SecurityAgent"))
 }
 
+/// What `launchctl print <job>` says about a job that was just loaded: Some(true) once it has a
+/// process, Some(false) when launchd has removed it (Login Items refused to spawn it: "Unable
+/// to verify trusted spawn"), None while it is still starting.
+pub fn job_started(print: Option<&str>) -> Option<bool> {
+    match print {
+        None => Some(false),
+        Some(text) => text.lines().any(|line| line.trim_start().starts_with("pid = ")).then_some(true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_login_items_refused_is_gone_and_a_started_one_has_a_pid() {
+        assert_eq!(job_started(None), Some(false));
+        assert_eq!(job_started(Some("gui/501/x = {\n\tstate = running\n\tpid = 647\n}")), Some(true));
+        assert_eq!(job_started(Some("gui/501/x = {\n\tstate = xpcproxy\n\tpid-local endpoints = {\n}")), None);
+    }
 
     #[test]
     fn only_the_login_windows_own_ui_routes_input_to_the_job() {

@@ -121,21 +121,32 @@ pub fn apply(args: &[String]) -> Result<()> {
     if !os::launchctl(&["bootstrap", "system", SERVICE_PLIST]) {
         return refused_by_login_items();
     }
-    let mut owner_loaded = true;
-    for user in os::gui_users() {
+    let users = os::gui_users();
+    for user in &users {
         let domain = format!("gui/{user}");
         let _ = os::launchctl(&["bootout", &format!("{domain}/{SESSION_LABEL}")]);
-        let loaded = os::launchctl(&["bootstrap", &domain, SESSION_PLIST]);
-        if user == uid {
-            owner_loaded = loaded;
-        }
+        let _ = os::launchctl(&["bootstrap", &domain, SESSION_PLIST]);
     }
-    // With RealTimeX.AI off in Login Items, macOS 15 still loads the system job for root but
-    // refuses the session job: the owner's own session would then have no input or picture.
-    if !owner_loaded {
+    // With RealTimeX.AI off in Login Items, macOS 15 still runs the system job, and bootstraps
+    // the session job too, but then won't spawn it and removes it: the owner's own session would
+    // have no picture or input.
+    if users.contains(&uid) && !session_started(uid) {
         return refused_by_login_items();
     }
     Ok(())
+}
+
+/// Whether the owner's session job got a process (launchd removes it within about a second when
+/// Login Items refuse it). Still starting after ten seconds counts as started.
+fn session_started(uid: u32) -> bool {
+    let target = format!("gui/{uid}/{SESSION_LABEL}");
+    for _ in 0..20 {
+        if let Some(started) = super::policy::job_started(os::launchctl_print(&target).as_deref()) {
+            return started;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    true
 }
 
 /// Login Items refused a job: undo everything, so nothing claims to be on.
