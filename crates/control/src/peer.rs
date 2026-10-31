@@ -55,10 +55,21 @@ const SKIPPED_INTERFACES: &[&str] = &["docker", "br-", "veth", "lxc", "virbr", "
 
 /// What a session asks of the control loop, which owns capture and stdout.
 pub enum ToMain {
-    /// Capture a frame at most `max_width` wide and send it back on `reply`.
+    /// Capture a frame of `display` (None: the primary) at most `max_width` wide and send it back
+    /// on `reply`.
     Frame {
         max_width: u32,
+        display: Option<String>,
         reply: Sender<SessionIn>,
+    },
+    /// The display this view shows went away, or can't be captured now (realtimex-link#12):
+    /// said once, until it is given another, with why (`display_removed`,
+    /// `display_unavailable`). The view keeps its last picture meanwhile; rtx-linkd picks the
+    /// next display.
+    DisplayLost {
+        session: u64,
+        display: String,
+        reason: &'static str,
     },
     /// Text from the viewer's DataChannel, for the server.
     Message { session: u64, text: String },
@@ -74,6 +85,8 @@ pub enum SessionIn {
     },
     Frame(Result<Frame>),
     Send(String),
+    /// Show this display from the next frame on (None: the primary).
+    Display(Option<String>),
     Close,
 }
 
@@ -86,6 +99,11 @@ impl Peer {
     pub fn send(&self, text: String) {
         let _ = self.tx.send(SessionIn::Send(text));
     }
+
+    /// Show `display` (None: the primary) from the next frame on, starting with a keyframe.
+    pub fn show(&self, display: Option<String>) {
+        let _ = self.tx.send(SessionIn::Display(display));
+    }
 }
 
 impl Drop for Peer {
@@ -95,6 +113,8 @@ impl Drop for Peer {
 }
 
 pub struct Options {
+    /// The display it shows (None: the primary); `peer_display` changes it (realtimex-link#12).
+    pub display: Option<String>,
     pub max_width: u32,
     pub fps: u32,
     pub bitrate: u32,
@@ -112,6 +132,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            display: None,
             max_width: DEFAULT_MAX_WIDTH,
             fps: DEFAULT_FPS,
             bitrate: DEFAULT_BITRATE,
@@ -192,6 +213,8 @@ pub fn start(
                 channel: None,
                 encoder: None,
                 force_keyframe: false,
+                display_lost: false,
+                stale_frame: false,
                 last_frame: None,
                 frame_pending: false,
                 next_frame: Instant::now(),
@@ -226,6 +249,10 @@ struct Session {
     /// The VP8 encoder and the frame size and bitrate it was made for (a change needs a new one).
     encoder: Option<(Encoder, (usize, usize, u32))>,
     force_keyframe: bool,
+    /// Its display went away and that was said (`ToMain::DisplayLost`, once per display).
+    display_lost: bool,
+    /// The frame on its way was asked of the display shown before a switch: it is dropped.
+    stale_frame: bool,
     /// The `seq` and size of the last frame encoded.
     last_frame: Option<(u64, usize, usize)>,
     frame_pending: bool,
@@ -309,10 +336,39 @@ impl Session {
                 }
                 SessionIn::Frame(frame) => {
                     self.frame_pending = false;
+                    if std::mem::take(&mut self.stale_frame) {
+                        continue;
+                    }
                     match frame {
-                        Ok(frame) => self.send_frame(frame)?,
+                        Ok(frame) => {
+                            self.display_lost = false;
+                            self.send_frame(frame)?
+                        }
                         // The screen may be locked; try again at the next interval.
-                        Err(error) => eprintln!("[peer {}] no frame: {error:#}", self.id),
+                        Err(error) => {
+                            if let Some((display, reason)) =
+                                lost_display(&self.options.display, &mut self.display_lost, &error)
+                            {
+                                let _ = self.to_main.send(ToMain::DisplayLost {
+                                    session: self.id,
+                                    display,
+                                    reason,
+                                });
+                            } else if !self.display_lost {
+                                eprintln!("[peer {}] no frame: {error:#}", self.id);
+                            }
+                        }
+                    }
+                }
+                SessionIn::Display(display) => {
+                    if display != self.options.display {
+                        self.options.display = display;
+                        self.display_lost = false;
+                        // The next frame is another picture, maybe of another size: a keyframe,
+                        // and a new encoder when the size changed (send_frame).
+                        self.force_keyframe = true;
+                        self.last_frame = None;
+                        self.stale_frame = self.frame_pending;
                     }
                 }
                 SessionIn::Send(text) => {
@@ -417,6 +473,7 @@ impl Session {
         self.next_frame = now + Duration::from_secs(1) / self.options.frame_rate();
         let _ = self.to_main.send(ToMain::Frame {
             max_width: self.options.max_width,
+            display: self.options.display.clone(),
             reply: self.me.clone(),
         });
     }
@@ -490,6 +547,27 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// The display to report gone and why, when a frame failed because `display` (the one this view
+/// shows) isn't attached or can't be captured now, and that wasn't said yet: once, so a view
+/// isn't flooded at its frame rate.
+fn lost_display(
+    display: &Option<String>,
+    reported: &mut bool,
+    error: &anyhow::Error,
+) -> Option<(String, &'static str)> {
+    let display = display.as_ref()?;
+    if *reported || !crate::displays::lost(error) {
+        return None;
+    }
+    *reported = true;
+    let reason = if crate::displays::unavailable(error).is_some() {
+        "display_unavailable"
+    } else {
+        "display_removed"
+    };
+    Some((display.clone(), reason))
 }
 
 /// `frame` is the picture last encoded: numbered, the same number and the same size. A different
@@ -1013,6 +1091,31 @@ mod tests {
         assert_eq!(level("not json"), None);
         assert!(Quality::High.max_width() > Quality::Balanced.max_width());
         assert!(Quality::Balanced.bitrate() > Quality::Saver.bitrate());
+    }
+
+    #[test]
+    fn a_lost_display_is_said_once_and_the_primary_is_never_lost() {
+        let gone = || anyhow::Error::from(crate::displays::DisplayNotFound("2".into()));
+        let shown = Some("2".to_string());
+        let mut reported = false;
+        assert_eq!(
+            lost_display(&shown, &mut reported, &gone()),
+            Some(("2".into(), "display_removed"))
+        );
+        assert_eq!(lost_display(&shown, &mut reported, &gone()), None);
+        // Attached but not capturable now (an injected failure): its own reason.
+        let unavailable =
+            anyhow::Error::from(crate::displays::DisplayUnavailable("2".into())).context("frame");
+        assert_eq!(
+            lost_display(&shown, &mut false, &unavailable),
+            Some(("2".into(), "display_unavailable"))
+        );
+        // Another failure (a locked screen) is not a lost display.
+        let mut reported = false;
+        assert_eq!(lost_display(&shown, &mut reported, &anyhow!("locked")), None);
+        assert!(!reported);
+        // The primary (no display named) is never reported.
+        assert_eq!(lost_display(&None, &mut false, &gone()), None);
     }
 
     #[test]

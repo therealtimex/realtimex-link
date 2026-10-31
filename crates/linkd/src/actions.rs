@@ -291,6 +291,14 @@ pub fn is_physical_key(action: &Value) -> bool {
     action.get("type").and_then(Value::as_str) == Some("key") && action.get("code").is_some()
 }
 
+/// A pointer move names the display it lands on; nothing else does, and without one nothing
+/// changes from before (the primary).
+fn on_display(op: &str, params: &mut Map<String, Value>, display: Option<&str>) {
+    if let (Some(display), "move") = (display, op) {
+        params.insert("display".into(), json!(display));
+    }
+}
+
 fn paste_text(action: &Value, text: &str) -> Value {
     let terminal = action.get("terminal") == Some(&Value::Bool(true));
     json!({ "op": "paste_text", "text": text, "terminal": terminal })
@@ -330,11 +338,13 @@ pub fn plan_actions(actions: Option<&Value>, live_view: bool) -> Result<Vec<Vec<
         .collect()
 }
 
-/// Run a batch; resolves with how many actions ran.
+/// Run a batch on `display` (None: the primary; realtimex-link#12): its pointer moves land
+/// there. Resolves with how many actions ran.
 pub async fn run_actions(
     backend: &Arc<Backend>,
     actions: Option<&Value>,
     live_view: bool,
+    display: Option<&str>,
 ) -> Result<usize, ApiError> {
     let plans = plan_actions(actions, live_view)?;
     for ops in &plans {
@@ -344,6 +354,7 @@ pub async fn run_actions(
                 .remove("op")
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_default();
+            on_display(&name, &mut params, display);
             if name == "wait" {
                 let ms = params.get("ms").and_then(Value::as_u64).unwrap_or(0);
                 tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -531,6 +542,30 @@ mod tests {
                 "ShiftLeft↑"
             ]
         );
+    }
+
+    #[test]
+    fn only_moves_name_the_display_and_none_is_as_before() {
+        let mut ops: Vec<(String, Map<String, Value>)> =
+            plan_action(&json!({ "type": "click", "x": 1, "y": 2 }))
+                .unwrap()
+                .into_iter()
+                .map(|op| {
+                    let mut fields = op.as_object().cloned().unwrap();
+                    let name = fields.remove("op").unwrap().as_str().unwrap().to_string();
+                    (name, fields)
+                })
+                .collect();
+        let before = ops.clone();
+        for (name, params) in &mut ops {
+            on_display(name, params, None);
+        }
+        assert_eq!(ops, before, "no display: the ops are what they were");
+        for (name, params) in &mut ops {
+            on_display(name, params, Some("2"));
+        }
+        assert_eq!(ops[0].1["display"], "2");
+        assert!(ops[1..].iter().all(|(_, params)| params.get("display").is_none()));
     }
 
     #[test]

@@ -107,9 +107,10 @@ jobs:
         timeout-minutes: 15
         run: |
           cargo test --locked -p rtx-linkd -p rtx-link -p rtx-screens
-          # rtx-control's physical key table and held-key rules (#2909), and the GNOME Wayland
-          # frame pipeline and virtual-monitor fallback (#9); its other tests need a desktop.
-          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests jobinput::
+          # rtx-control's physical key table and held-key rules (#2909), the GNOME Wayland
+          # frame pipeline and virtual-monitor fallback (#9), and the display table and point
+          # mapping (#12); its other tests need a desktop.
+          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests jobinput:: displays:: peer::tests::a_lost_display
       # Lints, once (Linux): warnings show in the log; errors fail the build.
       - name: Clippy (Linux)
         if: matrix.name == 'linux-x86_64'

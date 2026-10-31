@@ -8,6 +8,7 @@
 use crate::image::{encode_jpeg_bgra, thumbnail_bgra, Bgra};
 use crate::window::WindowInfo;
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 
-use crate::Shot;
+use crate::{DisplayInfo, DisplayNotFound, Shot};
 
 struct X {
     conn: RustConnection,
@@ -243,8 +244,16 @@ fn window_title(x: &X, id: Window) -> String {
 
 /// The primary monitor (what a presenting user most often shares), else the whole screen.
 pub fn capture_display(max_width: u32) -> Result<Shot> {
-    let (data, w, h) = display_pixels()?;
-    shot(&data, w, h, max_width, "display".into())
+    capture_display_on(None, max_width)
+}
+
+/// Screenshot `display` (a RandR monitor name from [`displays`]; None: the primary monitor, else
+/// the whole screen). A monitor that isn't there is [`DisplayNotFound`], never another one.
+pub fn capture_display_on(display: Option<&str>, max_width: u32) -> Result<Shot> {
+    let x = X::connect()?;
+    let (rx, ry, rw, rh) = monitor_area(&x, display)?;
+    let data = x.image(x.root, rx, ry, rw, rh)?;
+    shot(&data, rw as usize, rh as usize, max_width, "display".into())
 }
 
 /// The same picture as [`capture_display`], as a live-view video frame (#2683): read through one
@@ -253,27 +262,86 @@ pub fn capture_display(max_width: u32) -> Result<Shot> {
 /// over the socket, a scale and an encode per frame cost about a core on the T30. (XDamage on the
 /// root window is no help: under a compositor the windows draw offscreen and it reports nothing.)
 pub fn capture_display_frame(max_width: u32) -> Result<crate::Frame> {
+    capture_display_frame_on(None, max_width)
+}
+
+/// The same picture as [`capture_display_on`], as a live-view video frame: each monitor a live
+/// view shows has its own reader on the shared connection (realtimex-link#12), dropped once no
+/// view has asked for it in IDLE_DROP.
+pub fn capture_display_frame_on(display: Option<&str>, max_width: u32) -> Result<crate::Frame> {
     let mut live = LIVE.lock().unwrap();
     if live.is_none() {
-        *live = Some(Live::open()?);
+        *live = Some(Lives {
+            x: X::connect()?,
+            monitors: HashMap::new(),
+        });
     }
-    let result = live.as_mut().unwrap().frame(max_width);
-    if result.is_err() {
+    let lives = live.as_mut().unwrap();
+    lives.drop_idle();
+    let key = display.map(str::to_string);
+    if !lives.monitors.contains_key(&key) {
+        let reader = Live::open(&lives.x, display)?;
+        lives.monitors.insert(key.clone(), reader);
+    }
+    let reader = lives.monitors.get_mut(&key).expect("just added");
+    let result = reader.frame(&lives.x, max_width);
+    match &result {
+        Ok(_) => {}
+        // That monitor is gone: only its reader goes.
+        Err(error) if error.is::<DisplayNotFound>() => {
+            if let Some(gone) = lives.monitors.remove(&key) {
+                gone.release(&lives.x);
+            }
+        }
         // A display change or a lost connection: start over on the next frame.
-        *live = None;
+        Err(_) => *live = None,
     }
     result
 }
 
-static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+static LIVE: Mutex<Option<Lives>> = Mutex::new(None);
 
 /// How often a live view re-reads the monitor area (one RandR request).
 const GEOMETRY_CHECK: Duration = Duration::from_secs(2);
+/// A monitor's reader no live view asked a frame of for this long is dropped.
+const IDLE_DROP: Duration = Duration::from_secs(5);
+
+/// The live readers on one connection, by the monitor asked for (None: the primary).
+struct Lives {
+    x: X,
+    monitors: HashMap<Option<String>, Live>,
+}
+
+impl Lives {
+    fn drop_idle(&mut self) {
+        let idle: Vec<Option<String>> = self
+            .monitors
+            .iter()
+            .filter(|(_, live)| live.last_asked.elapsed() >= IDLE_DROP)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in idle {
+            if let Some(live) = self.monitors.remove(&key) {
+                live.release(&self.x);
+            }
+        }
+    }
+}
+
+impl Drop for Lives {
+    fn drop(&mut self) {
+        for (_, live) in self.monitors.drain() {
+            live.release(&self.x);
+        }
+        let _ = self.x.conn.flush();
+    }
+}
 
 struct Live {
-    x: X,
-    /// The primary monitor (else the whole screen) on the root window, checked every
-    /// GEOMETRY_CHECK: a resolution or primary-monitor change does not make GetImage fail.
+    /// The monitor asked for (None: the primary).
+    display: Option<String>,
+    /// Its area on the root window, checked every GEOMETRY_CHECK: a resolution or
+    /// primary-monitor change does not make GetImage fail.
     area: (i16, i16, u16, u16),
     area_checked: Instant,
     shm: Option<SharedImage>,
@@ -281,37 +349,39 @@ struct Live {
     last_read: Vec<u8>,
     /// The last frame and the width it was made for.
     last: Option<(crate::Frame, u32)>,
+    last_asked: Instant,
 }
 
 impl Live {
-    fn open() -> Result<Self> {
-        let x = X::connect()?;
-        let (rx, ry, rw, rh) = primary_area(&x)?;
-        let shm = SharedImage::new(&x, rw as usize * rh as usize * 4).ok();
+    fn open(x: &X, display: Option<&str>) -> Result<Self> {
+        let (rx, ry, rw, rh) = monitor_area(x, display)?;
+        let shm = SharedImage::new(x, rw as usize * rh as usize * 4).ok();
         Ok(Self {
-            x,
+            display: display.map(str::to_string),
             area: (rx, ry, rw, rh),
             area_checked: Instant::now(),
             shm,
             last_read: Vec::new(),
             last: None,
+            last_asked: Instant::now(),
         })
     }
 
-    fn frame(&mut self, max_width: u32) -> Result<crate::Frame> {
+    fn frame(&mut self, x: &X, max_width: u32) -> Result<crate::Frame> {
+        self.last_asked = Instant::now();
         if self.area_checked.elapsed() >= GEOMETRY_CHECK {
             self.area_checked = Instant::now();
-            let area = primary_area(&self.x)?;
+            let area = monitor_area(x, self.display.as_deref())?;
             if area != self.area {
-                self.resize(area);
+                self.resize(x, area);
             }
         }
-        let (x, y, width, height) = self.area;
+        let (rx, ry, width, height) = self.area;
         let owned;
         let data = match &self.shm {
-            Some(shm) => shm.read(&self.x, self.area)?,
+            Some(shm) => shm.read(x, self.area)?,
             None => {
-                owned = self.x.image(self.x.root, x, y, width, height)?;
+                owned = x.image(x.root, rx, ry, width, height)?;
                 &owned[..]
             }
         };
@@ -337,27 +407,22 @@ impl Live {
         self.last = Some((frame.clone(), max_width));
         Ok(frame)
     }
-}
 
-impl Live {
     /// A new monitor area: a shared segment of the new size, and nothing cached from the old one.
-    fn resize(&mut self, area: (i16, i16, u16, u16)) {
+    fn resize(&mut self, x: &X, area: (i16, i16, u16, u16)) {
         self.area = area;
         if let Some(shm) = self.shm.take() {
-            shm.release(&self.x);
+            shm.release(x);
         }
-        self.shm = SharedImage::new(&self.x, area.2 as usize * area.3 as usize * 4).ok();
+        self.shm = SharedImage::new(x, area.2 as usize * area.3 as usize * 4).ok();
         self.last_read.clear();
         self.last = None;
     }
-}
 
-impl Drop for Live {
-    fn drop(&mut self) {
+    fn release(mut self, x: &X) {
         if let Some(shm) = self.shm.take() {
-            shm.release(&self.x);
+            shm.release(x);
         }
-        let _ = self.x.conn.flush();
     }
 }
 
@@ -430,12 +495,64 @@ impl SharedImage {
     }
 }
 
-/// BGRA of the primary monitor, else the whole screen.
-fn display_pixels() -> Result<(Vec<u8>, usize, usize)> {
+/// The id of the whole screen when RandR lists no monitor.
+const WHOLE_SCREEN: &str = "screen";
+
+/// The RandR monitors (else the whole screen as one), in the picker's order (realtimex-link#12).
+pub fn displays() -> Result<Vec<DisplayInfo>> {
     let x = X::connect()?;
-    let (rx, ry, rw, rh) = primary_area(&x)?;
-    let data = x.image(x.root, rx, ry, rw, rh)?;
-    Ok((data, rw as usize, rh as usize))
+    let mut list: Vec<DisplayInfo> = monitors(&x)?
+        .into_iter()
+        .map(|(id, area, primary)| DisplayInfo {
+            name: id.clone(),
+            id,
+            primary,
+            x: area.0 as i32,
+            y: area.1 as i32,
+            width: area.2 as u32,
+            height: area.3 as u32,
+            scale: 1.0,
+        })
+        .collect();
+    crate::sort_displays(&mut list);
+    Ok(list)
+}
+
+/// A monitor's name, area on the root window and whether it is the primary one.
+type Monitor = (String, (i16, i16, u16, u16), bool);
+
+/// Each monitor; the whole screen alone (named WHOLE_SCREEN) when RandR lists none.
+fn monitors(x: &X) -> Result<Vec<Monitor>> {
+    let mut list = Vec::new();
+    if let Ok(reply) = x.conn.randr_get_monitors(x.root, true)?.reply() {
+        for m in reply.monitors {
+            let name = x
+                .conn
+                .get_atom_name(m.name)?
+                .reply()
+                .map(|n| String::from_utf8_lossy(&n.name).into_owned())
+                .unwrap_or_default();
+            list.push((name, (m.x, m.y, m.width, m.height), m.primary));
+        }
+    }
+    if list.is_empty() {
+        let root = x.conn.get_geometry(x.root)?.reply()?;
+        list.push((WHOLE_SCREEN.to_string(), (0, 0, root.width, root.height), true));
+    }
+    Ok(list)
+}
+
+/// The area of `display` on the root window: the monitor named, or for None the primary one,
+/// else the first, else the whole screen.
+fn monitor_area(x: &X, display: Option<&str>) -> Result<(i16, i16, u16, u16)> {
+    let Some(id) = display else {
+        return primary_area(x);
+    };
+    monitors(x)?
+        .into_iter()
+        .find(|(name, _, _)| name == id)
+        .map(|(_, area, _)| area)
+        .ok_or_else(|| DisplayNotFound(id.to_string()).into())
 }
 
 /// The primary monitor's area on the root window, else the whole screen.

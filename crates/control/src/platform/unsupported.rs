@@ -30,13 +30,24 @@ impl Input {
     pub fn screen_size(&self) -> Option<(f64, f64)> {
         None
     }
-    pub fn screenshot(&mut self, _max_width: u32, _live: bool) -> Result<crate::platform::Shot> {
+    pub fn displays(&mut self) -> Result<Vec<crate::displays::Display>> {
         unreachable!()
     }
-    pub fn frame(&mut self, _max_width: u32) -> Result<crate::platform::Frame> {
+    pub fn current(&mut self) -> Result<Vec<crate::displays::Display>> {
         unreachable!()
     }
-    pub fn move_to(&mut self, _x: f64, _y: f64) -> Result<()> {
+    pub fn screenshot(
+        &mut self,
+        _max_width: u32,
+        _live: bool,
+        _display: Option<&str>,
+    ) -> Result<crate::platform::Shot> {
+        unreachable!()
+    }
+    pub fn frame(&mut self, _max_width: u32, _display: Option<&str>) -> Result<crate::platform::Frame> {
+        unreachable!()
+    }
+    pub fn move_to(&mut self, _display: &crate::displays::Display, _x: f64, _y: f64) -> Result<()> {
         unreachable!()
     }
     pub fn button(&mut self, _button: Button, _pressed: bool) -> Result<()> {

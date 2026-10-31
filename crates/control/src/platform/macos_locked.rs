@@ -11,6 +11,7 @@ use rtx_screens::image::{encode_jpeg_bgra, fit_width, scale_bgra, thumbnail_bgra
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayCreateImage(display: u32) -> *const c_void;
     fn CGImageGetWidth(image: *const c_void) -> usize;
     fn CGImageGetHeight(image: *const c_void) -> usize;
@@ -50,12 +51,38 @@ pub fn screen_locked() -> bool {
     }
 }
 
-/// The main display's picture as packed BGRA rows, through CGDisplayCreateImage.
-fn display_bgra<T>(with: impl FnOnce(&Bgra) -> Result<T>) -> Result<T> {
+/// The CoreGraphics id of `display` (None: the main display); one that isn't attached is
+/// `DisplayNotFound` (realtimex-link#12).
+fn display_id(display: Option<&str>) -> Result<u32> {
+    let Some(id) = display else {
+        // SAFETY: a plain getter.
+        return Ok(unsafe { CGMainDisplayID() });
+    };
+    // CoreGraphics only: this runs on the capture worker, where AppKit (the names) isn't used.
+    let mut ids = [0u32; 32];
+    let mut count = 0u32;
+    // SAFETY: the buffer holds `ids.len()` ids and CoreGraphics writes at most that many.
+    let listed = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) } == 0;
+    let attached = &ids[..count.min(ids.len() as u32) as usize];
+    match id.parse::<u32>() {
+        Ok(number) if listed && attached.contains(&number) => Ok(number),
+        _ => Err(rtx_screens::DisplayNotFound(id.to_string()).into()),
+    }
+}
+
+/// The picture of `display` (None: the main display) as packed BGRA rows, through
+/// CGDisplayCreateImage.
+fn display_bgra<T>(display: Option<&str>, with: impl FnOnce(&Bgra) -> Result<T>) -> Result<T> {
+    let id = display_id(display)?;
     // SAFETY: CG and CF objects made and released here; the bytes are read while the data lives.
     unsafe {
-        let image = CGDisplayCreateImage(CGMainDisplayID());
+        let image = CGDisplayCreateImage(id);
         if image.is_null() {
+            // Another display than the main one: unavailable in this state, so its viewer falls
+            // back to the main display (realtimex-link#12, design risk 2).
+            if id != CGMainDisplayID() {
+                return Err(rtx_screens::DisplayUnavailable(id.to_string()).into());
+            }
             bail!("the display can't be captured");
         }
         let (width, height, stride) = (CGImageGetWidth(image), CGImageGetHeight(image), CGImageGetBytesPerRow(image));
@@ -81,8 +108,8 @@ fn display_bgra<T>(with: impl FnOnce(&Bgra) -> Result<T>) -> Result<T> {
 }
 
 /// A screenshot of the lock screen.
-pub fn screenshot(max_width: u32) -> Result<super::super::Shot> {
-    display_bgra(|image| {
+pub fn screenshot(display: Option<&str>, max_width: u32) -> Result<super::super::Shot> {
+    display_bgra(display, |image| {
         let (jpeg, width, height) = encode_jpeg_bgra(image, max_width as usize)?;
         Ok(super::super::Shot {
             jpeg,
@@ -96,8 +123,8 @@ pub fn screenshot(max_width: u32) -> Result<super::super::Shot> {
 }
 
 /// A live-view frame of the lock screen.
-pub fn frame(max_width: u32) -> Result<super::super::Frame> {
-    display_bgra(|image| {
+pub fn frame(display: Option<&str>, max_width: u32) -> Result<super::super::Frame> {
+    display_bgra(display, |image| {
         let (width, height) = fit_width(image.width, image.height, max_width as usize);
         let data: Arc<[u8]> = scale_bgra(image, width, height).into();
         Ok(super::super::Frame { data, width: width as u32, height: height as u32, seq: 0 })

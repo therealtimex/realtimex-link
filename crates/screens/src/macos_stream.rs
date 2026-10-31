@@ -1,4 +1,5 @@
-//! The main display as one continuous ScreenCaptureKit stream, for live views (#2683).
+//! A display as one continuous ScreenCaptureKit stream, for live views (#2683): the main one, or
+//! the one a live view chose (realtimex-link#12).
 //!
 //! A one-shot screenshot per frame made macOS re-check the Screen Recording permission (tccd),
 //! redraw the recording indicator (systemstatusd, ControlCenter), verify our signature (trustd)
@@ -150,6 +151,8 @@ struct Running {
     _output: Retained<Output>,
     _queue: DispatchRetained<DispatchQueue>,
     latest: Arc<Latest>,
+    /// The display it shows (CGDirectDisplayID).
+    display: u32,
     size: (usize, usize),
     /// The live view widths found to fit `size`, and when: a frame request of one of them
     /// finds this stream without listing the displays (see [`known_stream`]).
@@ -157,8 +160,8 @@ struct Running {
     last_asked: Instant,
 }
 
-/// The running streams, one per size so live views of different widths each keep theirs, and
-/// whether the idle reaper runs (one at a time).
+/// The running streams, one per display and size so live views of different displays and widths
+/// each keep theirs, and whether the idle reaper runs (one at a time).
 struct Streams {
     running: Vec<Running>,
     reaper: bool,
@@ -168,16 +171,20 @@ static STREAMS: Mutex<Streams> = Mutex::new(Streams {
     running: Vec::new(),
     reaper: false,
 });
-/// At most this many sizes stream at once; another one replaces the one asked least recently.
-const MAX_STREAMS: usize = 2;
+/// At most this many displays and sizes stream at once; another one replaces the one asked least
+/// recently.
+const MAX_STREAMS: usize = 4;
 
-/// The newest frame of the main display at most `max_width` wide, from the running stream (started
-/// on first use, and again after a size change or after macOS stopped it). A new `seq` only when
-/// the screen changed.
-pub fn display_frame(max_width: u32) -> Result<Frame> {
-    let latest = match known_stream(max_width) {
+/// The newest frame of `display` (None: the main display) at most `max_width` wide, from the
+/// running stream (started on first use, and again after a size change or after macOS stopped it).
+/// A new `seq` only when the screen changed.
+pub fn display_frame(display: Option<u32>, max_width: u32) -> Result<Frame> {
+    // The main display's id costs nothing to ask (no gate), so a known stream is found without
+    // listing the displays.
+    let key = display.unwrap_or_else(|| objc2_core_graphics::CGMainDisplayID());
+    let latest = match known_stream(key, max_width) {
         Some(latest) => latest,
-        None => stream_for(max_width)?,
+        None => stream_for(display, max_width)?,
     };
     let slot = latest.frame.lock().unwrap();
     let (slot, _) = latest
@@ -195,14 +202,15 @@ pub fn display_frame(max_width: u32) -> Result<Frame> {
     frame.ok_or_else(|| anyhow!("the display stream sent no picture"))
 }
 
-/// The running stream a request of `max_width` was fitted to within REFIT, unless macOS stopped
-/// it. Found without listing the displays: a live view asks for 15 frames a second, and
+/// The running stream of `display` a request of `max_width` was fitted to within REFIT, unless
+/// macOS stopped it. Found without listing the displays: a live view asks for 15 frames a second, and
 /// listing goes through the one-request gate (`crate::gate`), where it would queue behind
 /// screenshots and, after a stalled request, be refused, although the stream itself still runs.
-fn known_stream(max_width: u32) -> Option<Arc<Latest>> {
+fn known_stream(display: u32, max_width: u32) -> Option<Arc<Latest>> {
     let mut streams = STREAMS.lock().unwrap();
     let running = streams.running.iter_mut().find(|r| {
-        r.widths
+        r.display == display
+            && r.widths
             .iter()
             .any(|&(w, at)| w == max_width && at.elapsed() < REFIT)
             && r.latest.stopped().is_none()
@@ -211,17 +219,18 @@ fn known_stream(max_width: u32) -> Option<Arc<Latest>> {
     Some(running.latest.clone())
 }
 
-/// The stream for `max_width`, found by the size the main display fits to now (which lists the
-/// displays): the running one of that size, or a new one.
-fn stream_for(max_width: u32) -> Result<Arc<Latest>> {
-    let filter = crate::macos::main_display_filter()?;
+/// The stream for `display` and `max_width`, found by the size the display fits to now (which
+/// lists the displays): the running one of that display and size, or a new one.
+fn stream_for(display: Option<u32>, max_width: u32) -> Result<Arc<Latest>> {
+    let (filter, display) = crate::macos::display_filter(display)?;
     let size = crate::macos::fit_filter(&filter, max_width)?;
     let mut streams = STREAMS.lock().unwrap();
-    let found = streams.running.iter().position(|r| r.size == size);
+    let same = |r: &Running| r.display == display && r.size == size;
+    let found = streams.running.iter().position(same);
     if let Some(i) = found.filter(|&i| streams.running[i].latest.stopped().is_some()) {
         stop(streams.running.swap_remove(i));
     }
-    let index = match streams.running.iter().position(|r| r.size == size) {
+    let index = match streams.running.iter().position(same) {
         Some(i) => i,
         None => {
             if streams.running.len() >= MAX_STREAMS {
@@ -230,7 +239,7 @@ fn stream_for(max_width: u32) -> Result<Arc<Latest>> {
                     .unwrap();
                 stop(streams.running.swap_remove(oldest));
             }
-            streams.running.push(start(&filter, size)?);
+            streams.running.push(start(&filter, display, size)?);
             streams.running.len() - 1
         }
     };
@@ -238,8 +247,8 @@ fn stream_for(max_width: u32) -> Result<Arc<Latest>> {
         streams.reaper = true;
         thread::spawn(stop_when_idle);
     }
-    // This width fits this stream now, and no other (the display may have changed size).
-    for running in &mut streams.running {
+    // This width fits this stream now, and no other of this display (it may have changed size).
+    for running in streams.running.iter_mut().filter(|r| r.display == display) {
         running.widths.retain(|&(w, _)| w != max_width);
     }
     let running = &mut streams.running[index];
@@ -248,7 +257,7 @@ fn stream_for(max_width: u32) -> Result<Arc<Latest>> {
     Ok(running.latest.clone())
 }
 
-fn start(filter: &SCContentFilter, (width, height): (usize, usize)) -> Result<Running> {
+fn start(filter: &SCContentFilter, display: u32, (width, height): (usize, usize)) -> Result<Running> {
     let config = unsafe { SCStreamConfiguration::new() };
     unsafe {
         config.setWidth(width);
@@ -292,6 +301,7 @@ fn start(filter: &SCContentFilter, (width, height): (usize, usize)) -> Result<Ru
         _output: output,
         _queue: queue,
         latest,
+        display,
         size: (width, height),
         widths: Vec::new(),
         last_asked: Instant::now(),
@@ -330,10 +340,14 @@ mod tests {
     use super::*;
 
     fn latest_for(size_of: u32) -> Arc<Latest> {
-        let filter = crate::macos::main_display_filter().unwrap();
+        let (filter, display) = crate::macos::display_filter(None).unwrap();
         let size = crate::macos::fit_filter(&filter, size_of).unwrap();
         let streams = STREAMS.lock().unwrap();
-        let running = streams.running.iter().find(|r| r.size == size).unwrap();
+        let running = streams
+            .running
+            .iter()
+            .find(|r| r.display == display && r.size == size)
+            .unwrap();
         running.latest.clone()
     }
 
@@ -342,11 +356,11 @@ mod tests {
     #[test]
     #[ignore]
     fn live_view_streams_a_stopped_stream_is_replaced_on_the_next_request() {
-        let first = display_frame(640).expect("a first frame");
+        let first = display_frame(None, 640).expect("a first frame");
         let before = latest_for(640);
         // What the delegate does when macOS stops the stream.
         before.stop("injected stop".into());
-        let again = display_frame(640).expect("a frame from a new stream");
+        let again = display_frame(None, 640).expect("a frame from a new stream");
         let after = latest_for(640);
         assert!(!Arc::ptr_eq(&before, &after), "the stopped stream was kept");
         assert!(after.stopped().is_none());
@@ -358,12 +372,12 @@ mod tests {
     #[test]
     #[ignore]
     fn live_view_streams_alternating_sizes_keep_their_streams() {
-        display_frame(640).unwrap();
-        display_frame(1280).unwrap();
+        display_frame(None, 640).unwrap();
+        display_frame(None, 1280).unwrap();
         let (small, large) = (latest_for(640), latest_for(1280));
         for _ in 0..6 {
-            display_frame(640).unwrap();
-            display_frame(1280).unwrap();
+            display_frame(None, 640).unwrap();
+            display_frame(None, 1280).unwrap();
         }
         assert!(
             Arc::ptr_eq(&small, &latest_for(640)),
@@ -373,11 +387,11 @@ mod tests {
             Arc::ptr_eq(&large, &latest_for(1280)),
             "the 1280 stream was recreated"
         );
-        // A third size replaces the one asked least recently (640 here), not both.
-        display_frame(1280).unwrap();
-        display_frame(960).unwrap();
+        // A third size streams too: up to MAX_STREAMS keep theirs.
+        display_frame(None, 1280).unwrap();
+        display_frame(None, 960).unwrap();
         let streams = STREAMS.lock().unwrap();
-        assert_eq!(streams.running.len(), MAX_STREAMS);
+        assert_eq!(streams.running.len(), 3.min(MAX_STREAMS));
         assert!(streams.reaper);
         drop(streams);
         assert!(Arc::ptr_eq(&large, &latest_for(1280)));

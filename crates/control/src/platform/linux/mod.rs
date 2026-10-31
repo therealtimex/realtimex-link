@@ -8,12 +8,17 @@ use rtx_screens::x11;
 use self::wayland_input::WaylandInput;
 use self::x11_input::X11Input;
 use super::{Button, Frame, Shot};
+use crate::displays::Display;
 use crate::codes::PhysicalKey;
 
 mod terminal;
 mod wayland_input;
 mod x11_clipboard;
 mod x11_input;
+
+/// How many virtual monitors a headless GNOME Wayland session records (`virtualDisplays`,
+/// realtimex-link#12): taken by the next session.
+pub use wayland_input::set_virtual_displays;
 
 /// On Wayland the screenshot comes from the remote-desktop session's own stream.
 pub fn screenshot_needs_input() -> bool {
@@ -55,26 +60,46 @@ impl Input {
         }
     }
 
-    /// Only Wayland takes screenshots through input (`screenshot_needs_input`).
-    pub fn screenshot(&mut self, max_width: u32, live: bool) -> Result<Shot> {
+    /// The displays: GNOME Wayland's from its own session (Mutter's DisplayConfig), X11's from
+    /// RandR (realtimex-link#12).
+    pub fn displays(&mut self) -> Result<Vec<Display>> {
         match self {
-            Self::Wayland(input) => input.screenshot(max_width, live),
-            Self::X11(_) => x11::capture_display(max_width),
+            Self::Wayland(input) => input.displays(),
+            Self::X11(_) => super::displays(),
+        }
+    }
+
+    /// The displays as the session resolves them for capture and the pointer now: GNOME
+    /// Wayland's primary is its session's current one (no new list read more than every 2 s).
+    pub fn current(&mut self) -> Result<Vec<Display>> {
+        match self {
+            Self::Wayland(input) => input.current(),
+            Self::X11(_) => super::displays(),
+        }
+    }
+
+    /// Only Wayland takes screenshots through input (`screenshot_needs_input`).
+    pub fn screenshot(&mut self, max_width: u32, live: bool, display: Option<&str>) -> Result<Shot> {
+        match self {
+            Self::Wayland(input) => input.screenshot(max_width, live, display),
+            Self::X11(_) => x11::capture_display_on(display, max_width),
         }
     }
 
     /// A live-view video frame, like [`Self::screenshot`].
-    pub fn frame(&mut self, max_width: u32) -> Result<Frame> {
+    pub fn frame(&mut self, max_width: u32, display: Option<&str>) -> Result<Frame> {
         match self {
-            Self::Wayland(input) => input.frame(max_width),
-            Self::X11(_) => x11::capture_display_frame(max_width),
+            Self::Wayland(input) => input.frame(max_width, display),
+            Self::X11(_) => x11::capture_display_frame_on(display, max_width),
         }
     }
 
-    pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
+    /// The pointer to (x, y), which the caller mapped onto `display`'s rectangle: root-window
+    /// pixels on X11, that display's stream pixels on GNOME Wayland.
+    pub fn move_to(&mut self, display: &Display, x: f64, y: f64) -> Result<()> {
         match self {
-            Self::Wayland(input) => input.move_to(x, y),
-            Self::X11(input) => input.move_to(x, y),
+            Self::Wayland(input) => input.move_to(display, x, y),
+            Self::X11(input) => input.move_to(display, x, y),
         }
     }
 

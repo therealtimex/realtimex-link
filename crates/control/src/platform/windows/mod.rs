@@ -1,6 +1,7 @@
-//! Remote Control input on Windows through SendInput. Pointer positions are pixels of the
-//! primary monitor (what `capture_display` shoots), sent as absolute positions on the virtual
-//! desktop; keys are virtual keys, or Unicode for characters the layout has no plain key for.
+//! Remote Control input on Windows through SendInput. Pointer positions are physical pixels of the
+//! virtual desktop (a monitor's `rcMonitor` plus the point on it, realtimex-link#12), sent as
+//! absolute positions on the virtual desktop; keys are virtual keys, or Unicode for characters the
+//! layout has no plain key for.
 //!
 //! Windows drops input aimed at a window of a process with a higher integrity level (an app
 //! run as administrator, UAC prompts) and at the secure desktop (lock and sign-in screens).
@@ -120,17 +121,29 @@ impl Input {
         Some(self.screen)
     }
 
+    /// The displays as they are now; only GNOME Wayland's differ from `displays` (its session's).
+    pub fn current(&mut self) -> Result<Vec<crate::displays::Display>> {
+        self.displays()
+    }
+
+    /// The displays come from the platform's list, not through input (only GNOME Wayland's do).
+    pub fn displays(&mut self) -> Result<Vec<crate::displays::Display>> {
+        crate::platform::displays()
+    }
+
     /// Screenshots don't go through input on Windows (see `screenshot_needs_input`).
-    pub fn screenshot(&mut self, max_width: u32, _live: bool) -> Result<Shot> {
-        screens::capture_display(max_width)
+    pub fn screenshot(&mut self, max_width: u32, _live: bool, display: Option<&str>) -> Result<Shot> {
+        screens::capture_display_on(display, max_width)
     }
 
-    pub fn frame(&mut self, max_width: u32) -> Result<crate::platform::Frame> {
-        screens::capture_display_frame(max_width)
+    pub fn frame(&mut self, max_width: u32, display: Option<&str>) -> Result<crate::platform::Frame> {
+        screens::capture_display_frame_on(display, max_width)
     }
 
-    pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
-        // The primary monitor's top-left is (0, 0) on the virtual desktop.
+    /// The pointer to (x, y) in physical pixels of the virtual desktop: the caller mapped the
+    /// point onto `_display`'s `rcMonitor` (realtimex-link#12). The primary monitor's top-left
+    /// is (0, 0), so a point on it is what it was before.
+    pub fn move_to(&mut self, _display: &crate::displays::Display, x: f64, y: f64) -> Result<()> {
         let (dx, dy) = normalise(virtual_desktop(), x, y);
         send(&[mouse(
             dx,
