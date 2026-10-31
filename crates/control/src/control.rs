@@ -277,12 +277,13 @@ impl Controller {
         live: bool,
         display: Option<&str>,
     ) -> Result<platform::Shot> {
-        injected_unavailable(display)?;
-        let shot = if platform::screenshot_needs_input() {
-            self.input()?.screenshot(max_width, live, display)
-        } else {
-            capture(max_width, display)
-        };
+        let shot = injected_unavailable(display).and_then(|()| {
+            if platform::screenshot_needs_input() {
+                self.input()?.screenshot(max_width, live, display)
+            } else {
+                capture(max_width, display)
+            }
+        });
         let shot = self.note_capture(shot)?;
         // A live view's smaller frames say their own size with each click (`space`).
         if !live {
