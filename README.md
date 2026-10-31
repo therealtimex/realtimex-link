@@ -25,6 +25,18 @@ control other computers from.
   skipped. A view's held keys are released when it closes, loses control, sends a batch that fails
   or is refused, or sends nothing for 30 s; macOS and Windows post the viewer's repeats, X11 and
   Wayland repeat on their own. The HTTP `actions` endpoint takes `keys` combos only.
+  **Which screen** (realtimex-link#12): each live view shows the display it chose, and only it
+  (two viewers can watch different screens); a request that names none shows the primary, as
+  before. The live view's `info` lists `displays` (feature `displays`; `{id, name, primary, x, y,
+  width, height, scale}`, left to right, sizes in native pixels) and the one shown;
+  `{type:"select_display", display}` switches, letting go of the view's held keys and buttons
+  first; a `{type:"displays"}` push follows a change, with `fallback {from, reason}` when the
+  view's display went away and it shows the primary instead. A batch of actions may name its
+  `display` and is refused with 409 `display-changed` when that isn't the one shown. Agents:
+  `GET /remote-control/displays`, and `display` on `/screenshot`, `/actions` and `/frames`
+  (404 `display-not-found`; the `X-Screen-Display` header says which one a picture is). A
+  headless GNOME Wayland session records `virtualDisplays` (1–4, default 1; `GET/POST
+  /v1/displays/virtual {count}` on the local API) virtual monitors.
   **Start with this computer on macOS** (0.4.1, realtimex-link#11): one administrator's prompt
   installs a root LaunchDaemon that runs its owner's daemon from boot, and a session agent at the
   login window and in each user's session, so allowed computers connect at the login window and

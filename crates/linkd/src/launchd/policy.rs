@@ -147,13 +147,14 @@ impl Session {
 }
 
 /// Whether a bridge passes `op` to its helper in that session (M5): `Ok`, or the refusal code.
-/// The login window passes capture, input, text clipboard and the live view only; another
+/// The login window passes capture (and the display list, realtimex-link#12), input, text
+/// clipboard and the live view only; another
 /// user's session also images and reading copies; files and permission prompts only the
 /// owner's own (pasted files sit in the owner's 0700 temporary folder).
 pub fn bridge_allows(session: Session, op: &str) -> Result<(), &'static str> {
-    const LOGIN_WINDOW: [&str; 12] = [
-        "start", "stop", "status", "screenshot", "move", "button", "keysym", "key", "scroll",
-        "paste_text", "clipboard_seq", "permissions",
+    const LOGIN_WINDOW: [&str; 13] = [
+        "start", "stop", "status", "screenshot", "displays", "move", "button", "keysym", "key",
+        "scroll", "paste_text", "clipboard_seq", "permissions",
     ];
     const OTHER_USER: [&str; 2] = ["paste_image", "clipboard_read"];
     const OWNER_ONLY: [&str; 2] = ["paste_files", "request_permission"];
@@ -397,7 +398,10 @@ mod tests {
         assert_eq!(Session::of(0, false, 501), Session::LoginWindow);
         assert_eq!(Session::of(501, false, 501), Session::Owner);
         assert_eq!(Session::of(502, false, 501), Session::Other);
-        for op in ["start", "screenshot", "move", "button", "keysym", "key", "scroll", "paste_text", "peer_offer"] {
+        for op in [
+            "start", "screenshot", "move", "button", "keysym", "key", "scroll", "paste_text",
+            "peer_offer", "displays", "peer_display",
+        ] {
             assert_eq!(bridge_allows(Session::LoginWindow, op), Ok(()), "{op}");
         }
         assert!(bridge_allows(Session::LoginWindow, "paste_image").is_err());
@@ -416,5 +420,10 @@ mod tests {
         assert_eq!(bridge_allows(Session::Owner, "paste_files"), Ok(()));
         assert_eq!(bridge_allows(Session::Owner, "request_permission"), Ok(()));
         assert!(bridge_allows(Session::Owner, "format_disk").is_err());
+        // realtimex-link#12: every session lists and switches displays.
+        for session in [Session::LoginWindow, Session::Owner, Session::Other] {
+            assert_eq!(bridge_allows(session, "displays"), Ok(()));
+            assert_eq!(bridge_allows(session, "peer_display"), Ok(()));
+        }
     }
 }

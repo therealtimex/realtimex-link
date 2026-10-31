@@ -20,6 +20,7 @@ mod clipboard_share;
 mod codes;
 mod daemon;
 mod dib;
+mod displays;
 mod error;
 mod file_browse;
 mod files;

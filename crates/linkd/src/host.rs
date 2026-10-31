@@ -57,6 +57,9 @@ pub struct Settings {
     /// "Keep RealTimeX Link running" (realtimex-ai-app#2836): on by default. Off, nothing reaches
     /// this computer (no relay, no remote control) and Link doesn't start at login.
     pub keep_running: bool,
+    /// How many virtual displays a headless GNOME Wayland session records (realtimex-link#12):
+    /// 1 to 4, 1 by default (as 0.2.6). The next remote session takes it.
+    pub virtual_displays: u32,
 }
 
 struct State {
@@ -67,6 +70,7 @@ struct State {
     allow_incoming: bool,
     new_computer_policy: String,
     keep_running: bool,
+    virtual_displays: u32,
     last_error: Option<String>,
     helper_error: Option<String>,
     tailscale: Option<Tailnet>,
@@ -161,6 +165,7 @@ impl Host {
                     allow_incoming: false,
                     new_computer_policy: DEFAULT_NEW_COMPUTER_POLICY.into(),
                     keep_running: true,
+                    virtual_displays: crate::backend::DEFAULT_VIRTUAL_DISPLAYS,
                     last_error: None,
                     helper_error: None,
                     tailscale: None,
@@ -249,6 +254,7 @@ impl Host {
             allow_incoming: state.allow_incoming,
             new_computer_policy: state.new_computer_policy.clone(),
             keep_running: state.keep_running,
+            virtual_displays: state.virtual_displays,
         }
     }
 
@@ -273,6 +279,12 @@ impl Host {
             }
             state.allow_incoming = settings.get("allowIncoming") == Some(&Value::Bool(true));
             state.keep_running = settings.get("keepRunning") != Some(&Value::Bool(false));
+            state.virtual_displays = settings
+                .get("virtualDisplays")
+                .and_then(Value::as_u64)
+                .filter(|n| crate::backend::VIRTUAL_DISPLAYS.contains(n))
+                .map_or(crate::backend::DEFAULT_VIRTUAL_DISPLAYS, |n| n as u32);
+            self.backend.set_virtual_displays(state.virtual_displays);
             state.new_computer_policy = settings
                 .get("newComputerPolicy")
                 .and_then(Value::as_str)
@@ -734,6 +746,7 @@ impl Host {
                 "allowIncoming": settings.allow_incoming,
                 "newComputerPolicy": settings.new_computer_policy,
                 "keepRunning": settings.keep_running,
+                "virtualDisplays": settings.virtual_displays,
             }),
         )?;
         Ok(())
@@ -770,6 +783,18 @@ impl Host {
     /// shared reaches this computer), remote control stops and Link no longer starts at login; the
     /// local API still answers, so RealTimeX can say Link is off. On: all of it comes back, at
     /// login too (an earlier opt-out through POST /v1/autostart is cleared).
+    /// How many virtual displays a headless GNOME Wayland session records (1 to 4): kept with
+    /// the settings, taken by the next remote session (realtimex-link#12).
+    pub fn set_virtual_displays(&self, count: u64) -> Result<(), ApiError> {
+        if !crate::backend::VIRTUAL_DISPLAYS.contains(&count) {
+            return Err(ApiError::bad_request("count must be an integer from 1 to 4"));
+        }
+        self.state().virtual_displays = count as u32;
+        self.save_settings()?;
+        self.backend.set_virtual_displays(count as u32);
+        Ok(())
+    }
+
     pub async fn set_keep_running(&self, on: bool) -> Result<(), ApiError> {
         self.state().keep_running = on;
         self.save_settings()?;

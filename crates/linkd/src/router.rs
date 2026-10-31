@@ -4,7 +4,9 @@
 //! and in total, and there is no MJPEG live view through the relay) (protocol 2): /hello, sign-in (/connect, connection requests),
 //! then with a client token /status, /screenshot, /actions, /frames (MJPEG live view),
 //! /peer/offer (the WebRTC live view, whose DataChannel messages come back as helper events),
-//! /transfer and /stop. RealTimeX's controller (server/utils/remoteControl/computers.js) and agents' CLI speak it.
+//! /displays, /transfer and /stop. RealTimeX's controller (server/utils/remoteControl/computers.js) and agents' CLI speak it.
+//! Which display a view shows is its own (displays.rs, realtimex-link#12); a call that names none
+//! means the primary display, as before.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -28,6 +30,7 @@ use crate::backend::Backend;
 use crate::clients::Authenticated;
 use crate::clipboard_share::{self, ClipboardShare, Pulled, POLL_MS};
 use crate::codes::physical_key;
+use crate::displays;
 use crate::error::{ApiError, ApiResult};
 use crate::file_browse;
 use crate::host::Host;
@@ -50,13 +53,17 @@ const TAILNET_FAILURES_TOTAL: usize = 30;
 pub const SERVICE: &str = "realtimex-remote-control";
 /// 2 (ADR-2611 §4.5): peer live view, connection requests, client keys, identity tokens.
 pub const PROTOCOL_VERSION: u32 = 2;
-const FEATURES: [&str; 5] = [
+const FEATURES: [&str; 6] = [
     "peer-view",
     "connect-requests",
     "client-key",
     "identity-token",
     "transfers",
+    // realtimex-link#12: GET /displays, and `display` on /screenshot, /actions and /frames.
+    "displays",
 ];
+/// What a live view's `info` lists: the features the viewer adapts to.
+const PEER_FEATURES: [&str; 4] = ["transfers", "paste-files", "physical-keys", "displays"];
 const FRAME_BOUNDARY: &str = "rtxframe";
 const MIN_FRAME_INTERVAL_MS: u64 = 66;
 const DEFAULT_FRAME_INTERVAL_MS: u64 = 500;
@@ -126,6 +133,11 @@ struct Peer {
     requests: Mutex<Vec<i64>>,
     moves: Mutex<Vec<i64>>,
     transfer_client: Mutex<Option<(Option<Authenticated>, i64)>>,
+    /// The display this view chose (realtimex-link#12); None: the primary.
+    display: Mutex<Option<String>>,
+    /// What the viewer was last told it shows, and the list it was told: a fresh list is
+    /// pushed only when that changes.
+    told: Mutex<(Option<String>, Vec<Value>)>,
 }
 
 pub struct Shared {
@@ -138,8 +150,11 @@ pub struct Shared {
     last_action: Mutex<Option<(serde_json::Map<String, Value>, String)>>,
     streams: Mutex<Vec<Stream>>,
     next_stream: AtomicU64,
-    shot_sizes: Mutex<HashMap<String, (u64, u64)>>,
+    /// The latest screenshot's size per client and display (None: the primary).
+    shot_sizes: Mutex<HashMap<(String, Option<String>), (u64, u64)>>,
     peers: Mutex<HashMap<u64, Arc<Peer>>>,
+    /// Reads the display list every displays::POLL while a WebRTC view is open.
+    display_poll: Mutex<Option<JoinHandle<()>>>,
     http_sessions: Mutex<HashMap<String, i64>>,
     transfers: Transfers,
     clipboard: ClipboardShare,
@@ -205,6 +220,7 @@ fn new_shared(
         next_stream: AtomicU64::new(1),
         shot_sizes: Mutex::new(HashMap::new()),
         peers: Mutex::new(HashMap::new()),
+        display_poll: Mutex::new(None),
         http_sessions: Mutex::new(HashMap::new()),
         transfers: Transfers::new(temp_dir, downloads),
         clipboard: ClipboardShare::default(),
@@ -229,6 +245,7 @@ fn routes(shared: &Arc<Shared>) -> Router {
         )
         .route("/remote-control/status", get(status))
         .route("/remote-control/screenshot", post(screenshot))
+        .route("/remote-control/displays", get(list_displays))
         .route("/remote-control/actions", post(actions))
         .route("/remote-control/frames", get(frames))
         .route("/remote-control/peer/offer", post(peer_offer))
@@ -672,11 +689,12 @@ async fn screenshot(
 ) -> Response {
     let signed = signed_with!(shared, headers, peer, "view");
     let quality = number_or(body.get("quality"), 75.0).clamp(30.0, 95.0);
-    let shot = match shared
-        .backend
-        .call("screenshot", json!({ "quality": quality }))
-        .await
-    {
+    let display = displays::named(body.get("display"));
+    let mut params = json!({ "quality": quality });
+    if let Some(display) = &display {
+        params["display"] = json!(display);
+    }
+    let shot = match shared.backend.call("screenshot", params).await {
         Ok(shot) => shot,
         Err(error) => {
             let (code, message) = screen_problem(&error.message);
@@ -691,7 +709,10 @@ async fn screenshot(
         shot["width"].as_u64().unwrap_or(0),
         shot["height"].as_u64().unwrap_or(0),
     );
-    lock(&shared.shot_sizes).insert(signed.client.id().to_string(), (width, height));
+    lock(&shared.shot_sizes).insert(
+        (signed.client.id().to_string(), display.clone()),
+        (width, height),
+    );
     (shared.log)(&format!(
         "[remote-control] screenshot {width}x{height} for {}",
         signed.client.name()
@@ -700,12 +721,17 @@ async fn screenshot(
     let mime = shot["mime"].as_str().unwrap_or("image/jpeg").to_string();
     let mut response = (StatusCode::OK, data).into_response();
     let headers = response.headers_mut();
-    for (name, value) in [
+    let mut fields = vec![
         ("content-type", mime),
         ("cache-control", "no-store".into()),
         ("x-screen-width", width.to_string()),
         ("x-screen-height", height.to_string()),
-    ] {
+    ];
+    // Which display the picture is (realtimex-link#12): the one named, else the primary.
+    if let Some(shown) = shot["display"].as_str() {
+        fields.push(("x-screen-display", shown.to_string()));
+    }
+    for (name, value) in fields {
         if let Ok(value) = value.parse() {
             headers.insert(name, value);
         }
@@ -713,11 +739,51 @@ async fn screenshot(
     response
 }
 
+/// The displays (realtimex-link#12), in the picker's order: `{ displays: [{ id, name, primary,
+/// x, y, width, height, scale }] }`.
+async fn list_displays(
+    State(shared): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let _signed = signed_with!(shared, headers, peer, "view");
+    match fresh_displays(&shared).await {
+        Ok(list) => no_store(Json(json!({ "displays": list })).into_response()),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// The display list as it is now.
+async fn fresh_displays(shared: &Shared) -> ApiResult<Vec<Value>> {
+    let answer = shared.backend.call("displays", json!({})).await?;
+    Ok(displays::list_of(&answer))
+}
+
+/// 404 `display-not-found` unless `display` (when one is named) is attached now: checked before
+/// anything of a request runs, so an agent never acts on another screen (design §3.3).
+async fn require_display(shared: &Shared, display: Option<&str>) -> ApiResult<()> {
+    let Some(display) = display else {
+        return Ok(());
+    };
+    if displays::has(&fresh_displays(shared).await?, display) {
+        Ok(())
+    } else {
+        Err(ApiError::coded(
+            404,
+            crate::backend::DISPLAY_NOT_FOUND,
+            format!("Display {display} is not connected"),
+        ))
+    }
+}
+
 /// What a viewer shows about the latest action: its marker and caption.
+/// `display`: the display it was aimed at, so a viewer shows the marker only there
+/// (realtimex-link#12).
 fn describe_action(
     action: &Value,
     client: &Authenticated,
     shot: Option<(u64, u64)>,
+    display: Option<&str>,
 ) -> serde_json::Map<String, Value> {
     let mut shown = serde_json::Map::new();
     shown.insert(
@@ -726,6 +792,9 @@ fn describe_action(
     );
     shown.insert("client".into(), json!(client.name()));
     shown.insert("at".into(), json!(iso_now()));
+    if let Some(display) = display {
+        shown.insert("display".into(), json!(display));
+    }
     if let (Some(x), Some(y)) = (action.get("x"), action.get("y")) {
         shown.insert("x".into(), x.clone());
         shown.insert("y".into(), y.clone());
@@ -764,15 +833,18 @@ fn describe_action(
     shown
 }
 
-/// Run `actions` for `client`: the latest one is shown on every live view.
+/// Run `actions` for `client` on `display` (None: the primary): the latest one is shown on every
+/// live view, marked with `shown_on` (the display it landed on, when known).
 async fn perform_actions(
     shared: &Arc<Shared>,
     client: &Authenticated,
     actions: Option<&Value>,
     quiet: bool,
     live_view: bool,
+    display: Option<&str>,
+    shown_on: Option<&str>,
 ) -> ApiResult<Value> {
-    let performed = run_actions(&shared.backend, actions, live_view).await?;
+    let performed = run_actions(&shared.backend, actions, live_view, display).await?;
     // A person's pointer moves and keystrokes are not news for the other live views, nor for
     // the log.
     if quiet {
@@ -789,9 +861,11 @@ async fn perform_actions(
                 .is_some_and(|t| !t.is_empty() && t != "wait")
     });
     if let Some(action) = shown {
-        let size = lock(&shared.shot_sizes).get(client.id()).copied();
+        let size = lock(&shared.shot_sizes)
+            .get(&(client.id().to_string(), display.map(str::to_string)))
+            .copied();
         *lock(&shared.last_action) = Some((
-            describe_action(action, client, size),
+            describe_action(action, client, size, shown_on),
             client.id().to_string(),
         ));
         announce_action(shared);
@@ -815,7 +889,13 @@ async fn actions(
     Body64(body): Body64,
 ) -> Response {
     let signed = signed_with!(shared, headers, peer, "control");
-    match perform_actions(&shared, &signed.client, body.get("actions"), false, false).await {
+    let display = displays::named(body.get("display"));
+    if let Err(error) = require_display(&shared, display.as_deref()).await {
+        return error.into_response();
+    }
+    let actions = body.get("actions");
+    let display = display.as_deref();
+    match perform_actions(&shared, &signed.client, actions, false, false, display, display).await {
         Ok(result) => Json(result).into_response(),
         Err(error) => error.into_response(),
     }
@@ -823,8 +903,11 @@ async fn actions(
 
 // --- the MJPEG live view -----------------------------------------------------------------
 
-/// JPEG frames as multipart/x-mixed-replace, each with the screen size and the latest action
-/// (base64 JSON) in its headers. The next frame is taken only once the last one has gone out.
+/// JPEG frames as multipart/x-mixed-replace, each with the screen size, its display and the
+/// latest action (base64 JSON) in its headers. The next frame is taken only once the last one
+/// has gone out. `?display=<id>` shows that display (realtimex-link#12): unknown at the start is
+/// 404; one that goes away later switches the stream to the primary, which its headers show
+/// (no JSON part: an older client reads one as "no picture").
 async fn frames(
     State(shared): State<Ctx>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -852,6 +935,10 @@ async fn frames(
     let max_width = number("maxWidth")
         .unwrap_or(MAX_FRAME_WIDTH)
         .clamp(MIN_FRAME_WIDTH, MAX_FRAME_WIDTH);
+    let mut display = query.get("display").filter(|d| !d.is_empty()).cloned();
+    if let Err(error) = require_display(&shared, display.as_deref()).await {
+        return error.into_response();
+    }
     let end = Arc::new(Notify::new());
     let id = shared.next_stream.fetch_add(1, Ordering::SeqCst);
     lock(&shared.streams).push(Stream {
@@ -881,8 +968,12 @@ async fn frames(
             if !still || sender.is_closed() {
                 break;
             }
+            let mut params = json!({ "quality": quality, "live": true, "maxWidth": max_width });
+            if let Some(display) = &display {
+                params["display"] = json!(display);
+            }
             let shot = tokio::select! {
-                shot = shared.backend.call("screenshot", json!({ "quality": quality, "live": true, "maxWidth": max_width })) => shot,
+                shot = shared.backend.call("screenshot", params) => shot,
                 () = end.notified() => break,
             };
             match shot {
@@ -907,6 +998,11 @@ async fn frames(
                             shot["height"]
                         )
                         .into_bytes();
+                        if let Some(shown) = shot["display"].as_str() {
+                            part.extend_from_slice(
+                                format!("X-Screen-Display: {shown}\r\n").as_bytes(),
+                            );
+                        }
                         if !action.is_empty() {
                             part.extend_from_slice(
                                 format!("X-Remote-Control-Action: {action}\r\n").as_bytes(),
@@ -921,6 +1017,18 @@ async fn frames(
                         last_sent = (thumb, action, started);
                     }
                     last_problem = None;
+                }
+                // Its display went away: the primary from now on, at once.
+                Err(error)
+                    if display.is_some()
+                        && error.code.as_deref() == Some(crate::backend::DISPLAY_NOT_FOUND) =>
+                {
+                    (shared.log)(&format!(
+                        "[remote-control] live view: display {} went away; showing the primary",
+                        display.as_deref().unwrap_or("")
+                    ));
+                    display = None;
+                    continue;
                 }
                 Err(error) => {
                     // A JSON part says why there is no picture; frames resume by themselves.
@@ -1070,6 +1178,9 @@ fn close_peer(shared: &Arc<Shared>, session: u64) {
         if let Some(timer) = lock(&shared.access_timer).take() {
             timer.abort();
         }
+        if let Some(poll) = lock(&shared.display_poll).take() {
+            poll.abort();
+        }
     }
     // Nothing more runs for this view. A button it still holds would stay down: let go of it
     // once the actions already running are done.
@@ -1077,19 +1188,32 @@ fn close_peer(shared: &Arc<Shared>, session: u64) {
     let backend = shared.backend.clone();
     tokio::spawn(async move {
         let _all_done = peer.running.write().await;
-        release_keys(&backend, &peer).await;
-        let held: Vec<String> = lock(&peer.held).drain().collect();
-        if !held.is_empty() {
-            let ups: Vec<Value> = held
-                .iter()
-                .map(|button| json!({ "type": "up", "button": button }))
-                .collect();
-            let _ = run_actions(&backend, Some(&Value::Array(ups)), false).await;
-        }
+        release_input(&backend, &peer).await;
         let _ = backend
             .call("peer_close", json!({ "session": session }))
             .await;
     });
+}
+
+/// Let go of every key and mouse button this view holds (its keys first, as a refused batch
+/// does). The caller makes sure none of its actions are still running.
+async fn release_input(backend: &Arc<Backend>, peer: &Peer) {
+    release_keys(backend, peer).await;
+    let held: Vec<String> = lock(&peer.held).drain().collect();
+    if let Some(ups) = button_ups(&held) {
+        let _ = run_actions(backend, Some(&ups), false, None).await;
+    }
+}
+
+/// The ups for these held mouse buttons, as one batch; None when none is held.
+fn button_ups(held: &[String]) -> Option<Value> {
+    (!held.is_empty()).then(|| {
+        Value::Array(
+            held.iter()
+                .map(|button| json!({ "type": "up", "button": button }))
+                .collect(),
+        )
+    })
 }
 
 /// Let go of every physical key this view holds, the last pressed first (#2909). The caller makes
@@ -1099,7 +1223,7 @@ async fn release_keys(backend: &Arc<Backend>, peer: &Peer) {
     for up in release_actions(&held) {
         // One up each: an up that fails doesn't keep the others down (rtx-control keeps the
         // failed one held and lets go of it when its session ends), and no batch limit applies.
-        let _ = run_actions(backend, Some(&Value::Array(vec![up])), true).await;
+        let _ = run_actions(backend, Some(&Value::Array(vec![up])), true, None).await;
     }
 }
 
@@ -1249,6 +1373,10 @@ fn spawn_event_loop(shared: &Arc<Shared>) -> JoinHandle<()> {
                         .to_string();
                     tokio::spawn(on_peer_message(shared, session, data));
                 }
+                // Its display went away (realtimex-link#12): the view falls back at once.
+                Some("peer_display_lost") => {
+                    tokio::spawn(async move { check_views(&shared, Some(session)).await });
+                }
                 Some("peer_state")
                     if event.get("state").and_then(Value::as_str) == Some("closed") =>
                 {
@@ -1296,21 +1424,42 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
         return;
     }
     if kind == "info" {
-        // What the viewer adapts to: this computer's OS (shortcuts: ⌘ on macOS, Ctrl elsewhere).
+        // What the viewer adapts to: this computer's OS (shortcuts: ⌘ on macOS, Ctrl elsewhere),
+        // and its displays with the one this view shows (realtimex-link#12).
         if peer_client(&shared, &peer, "view").is_none() {
             close_peer(&shared, session);
             return;
         }
-        reply(
-            json!({ "ok": true, "os": platform_name(), "features": ["transfers", "paste-files", "physical-keys"] }),
-        );
+        let list = fresh_displays(&shared).await.unwrap_or_default();
+        let shown = displays::shown(lock(&peer.display).as_deref(), &list);
+        *lock(&peer.told) = (shown.clone(), list.clone());
+        reply(json!({
+            "ok": true,
+            "os": platform_name(),
+            "features": PEER_FEATURES,
+            "displays": list,
+            "display": shown,
+        }));
+        return;
+    }
+    if kind == "select_display" {
+        if !within_budget(&peer.requests, PEER_REQUESTS_PER_SECOND) {
+            reply(rate_limited());
+            return;
+        }
+        // Choosing a screen is viewing, not control.
+        if peer_client(&shared, &peer, "view").is_none() {
+            close_peer(&shared, session);
+            return;
+        }
+        let requested = displays::named(message.get("display"));
+        reply(select_display(&shared, session, &peer, requested).await);
         return;
     }
     if kind != "actions" {
         reply(json!({ "ok": false, "error": "Unknown message" }));
         return;
     }
-    let now = now_ms();
     let list = message.get("actions").and_then(Value::as_array);
     fn is_move(action: &Value) -> bool {
         action.get("type").and_then(Value::as_str) == Some("move")
@@ -1325,16 +1474,10 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
         } else {
             (&peer.requests, PEER_REQUESTS_PER_SECOND)
         };
-        let mut recent = lock(budget);
-        recent.retain(|at| now - at < 1000);
-        if recent.len() >= limit {
-            drop(recent);
-            reply(
-                json!({ "ok": false, "status": 429, "code": "rate-limited", "error": "Too many actions at once; slow down" }),
-            );
+        if !within_budget(budget, limit) {
+            reply(rate_limited());
             return;
         }
-        recent.push(now);
     }
     let client = if moves_only {
         cached_client(&shared, &peer)
@@ -1359,6 +1502,29 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
         );
         return;
     }
+    let running = peer.running.read().await;
+    // Closed while it waited: close_peer releases what the view held, and nothing more runs.
+    if peer.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    // A batch aimed at another screen than the one shown now (a late click after a switch or a
+    // fallback) is refused before anything of it runs (realtimex-link#12).
+    let chosen = lock(&peer.display).clone();
+    let told = lock(&peer.told).0.clone();
+    let aimed = displays::named(message.get("display"));
+    let shown = match (&chosen, &aimed, told) {
+        (Some(chosen), _, _) => Some(chosen.clone()),
+        (None, None, told) => told,
+        (None, Some(_), Some(told)) => Some(told),
+        // Never told (no `info` yet): the primary as it is now.
+        (None, Some(_), None) => {
+            displays::primary(&fresh_displays(&shared).await.unwrap_or_default())
+        }
+    };
+    if let Err(refused) = displays::batch_allowed(aimed.as_deref(), shown.as_deref()) {
+        reply(refused);
+        return;
+    }
     // A drag's press (#2736): let go of it if this view closes before its release arrives.
     for action in list.into_iter().flatten() {
         let button = action
@@ -1377,14 +1543,18 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
             _ => {}
         }
     }
-    let running = peer.running.read().await;
-    // Closed while it waited: close_peer releases what the view held, and nothing more runs.
-    if peer.closed.load(Ordering::SeqCst) {
-        return;
-    }
     let actions = list.map_or(&[][..], Vec::as_slice);
     hold_downs(&mut lock(&peer.held_keys), actions);
-    let performed = perform_actions(&shared, &client, message.get("actions"), light, true).await;
+    let performed = perform_actions(
+        &shared,
+        &client,
+        message.get("actions"),
+        light,
+        true,
+        chosen.as_deref(),
+        shown.as_deref(),
+    )
+    .await;
     match &performed {
         Ok(_) => settle_held(&mut lock(&peer.held_keys), actions),
         // A failed batch (input-blocked, screen-locked, an error part way, a refused action)
@@ -1407,6 +1577,152 @@ async fn on_peer_message(shared: Arc<Shared>, session: u64, data: String) {
                 answer["code"] = json!(code);
             }
             reply(answer);
+        }
+    }
+}
+
+/// One more request of this view within `limit` a second, or false when it is over.
+fn within_budget(budget: &Mutex<Vec<i64>>, limit: usize) -> bool {
+    let now = now_ms();
+    let mut recent = lock(budget);
+    recent.retain(|at| now - at < 1000);
+    if recent.len() >= limit {
+        return false;
+    }
+    recent.push(now);
+    true
+}
+
+fn rate_limited() -> Value {
+    json!({ "ok": false, "status": 429, "code": "rate-limited", "error": "Too many actions at once; slow down" })
+}
+
+/// Show another display on this view (realtimex-link#12): checked against a fresh list, the
+/// view's held keys and buttons let go (a drag or a held key never crosses screens), then the
+/// helper switches its picture. The session, Control, transfers, the clipboard watch and the
+/// quality stay. The display already shown answers `ok` and changes nothing.
+async fn select_display(
+    shared: &Arc<Shared>,
+    session: u64,
+    peer: &Arc<Peer>,
+    requested: Option<String>,
+) -> Value {
+    let list = match fresh_displays(shared).await {
+        Ok(list) => list,
+        Err(error) => return failed(&error),
+    };
+    let current = displays::shown(lock(&peer.display).as_deref(), &list);
+    let Some(requested) = requested else {
+        return json!({ "ok": false, "status": 400, "error": "display is required", "display": current, "displays": list });
+    };
+    if !displays::has(&list, &requested) {
+        *lock(&peer.told) = (current.clone(), list.clone());
+        return json!({
+            "ok": false,
+            "status": 404,
+            "code": crate::backend::DISPLAY_NOT_FOUND,
+            "error": format!("Display {requested} is not connected"),
+            "display": current,
+            "displays": list,
+        });
+    }
+    if current.as_deref() == Some(requested.as_str()) {
+        *lock(&peer.told) = (current.clone(), list.clone());
+        return json!({ "ok": true, "display": requested, "displays": list });
+    }
+    let _idle = peer.running.write().await;
+    if peer.closed.load(Ordering::SeqCst) {
+        return json!({ "ok": false, "error": "This live view has ended" });
+    }
+    release_input(&shared.backend, peer).await;
+    let switched = shared
+        .backend
+        .call("peer_display", json!({ "session": session, "display": requested }))
+        .await;
+    if let Err(error) = switched {
+        let mut answer = failed(&error);
+        answer["display"] = json!(current);
+        answer["displays"] = json!(list);
+        return answer;
+    }
+    *lock(&peer.display) = Some(requested.clone());
+    *lock(&peer.told) = (Some(requested.clone()), list.clone());
+    (shared.log)(&format!(
+        "[remote-control] live view (session {session}) shows display {requested}"
+    ));
+    json!({ "ok": true, "display": requested, "displays": list })
+}
+
+/// While a WebRTC view is open: read the display list every displays::POLL and tell each view
+/// what changed for it (`check_views`).
+fn ensure_display_poll(shared: &Arc<Shared>) {
+    let mut poll = lock(&shared.display_poll);
+    if poll.is_some() {
+        return;
+    }
+    let weak = Arc::downgrade(shared);
+    *poll = Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(displays::POLL).await;
+            let Some(shared) = weak.upgrade() else { return };
+            if lock(&shared.peers).is_empty() {
+                *lock(&shared.display_poll) = None;
+                return;
+            }
+            check_views(&shared, None).await;
+        }
+    }));
+}
+
+/// Read the display list and bring each open view (or only `lost`, whose display rtx-control
+/// just failed to find) up to date: a view whose display went away shows the primary (its held
+/// input let go first, as for a switch), and a view whose list or display changed gets a
+/// `displays` push.
+async fn check_views(shared: &Arc<Shared>, lost: Option<u64>) {
+    let Ok(list) = fresh_displays(shared).await else {
+        return;
+    };
+    if list.is_empty() {
+        // Nothing listed (enumeration failed): nothing to tell anyone.
+        return;
+    }
+    let peers: Vec<(u64, Arc<Peer>)> = lock(&shared.peers)
+        .iter()
+        .filter(|(session, _)| lost.is_none_or(|lost| lost == **session))
+        .map(|(session, peer)| (*session, peer.clone()))
+        .collect();
+    for (session, peer) in peers {
+        let chosen = lock(&peer.display).clone();
+        let (told, told_list) = lock(&peer.told).clone();
+        let checked = if lost.is_some() {
+            displays::lost(chosen.as_deref(), &list)
+        } else {
+            displays::check(chosen.as_deref(), told.as_deref(), &told_list, &list)
+        };
+        if checked.fell_back {
+            let _idle = peer.running.write().await;
+            // Closed, or switched by its viewer meanwhile: nothing to undo.
+            if peer.closed.load(Ordering::SeqCst) || *lock(&peer.display) != chosen {
+                continue;
+            }
+            release_input(&shared.backend, &peer).await;
+            let _ = shared
+                .backend
+                .call("peer_display", json!({ "session": session }))
+                .await;
+            *lock(&peer.display) = None;
+            (shared.log)(&format!(
+                "[remote-control] live view (session {session}): display {} went away; showing the primary",
+                chosen.as_deref().unwrap_or("")
+            ));
+        } else if told_list.is_empty() {
+            // A viewer that never asked (`info`) hears nothing it didn't ask for.
+            *lock(&peer.told) = (displays::shown(chosen.as_deref(), &list), list.clone());
+            continue;
+        }
+        if let Some(push) = checked.push {
+            *lock(&peer.told) = (push["display"].as_str().map(String::from), list.clone());
+            send_to_peer(shared, session, push);
         }
     }
 }
@@ -1439,11 +1755,20 @@ async fn peer_offer(
         return json_status(400, json!({ "error": "A WebRTC offer (sdp) is required" }));
     }
     let max_width = number_or(body.get("maxWidth"), 1280.0).clamp(MIN_FRAME_WIDTH, MAX_FRAME_WIDTH);
-    let result = match shared
-        .backend
-        .call("peer_offer", json!({ "sdp": sdp, "maxWidth": max_width }))
-        .await
-    {
+    let mut params = json!({ "sdp": sdp, "maxWidth": max_width });
+    // A display the viewer showed before (a hint for the same session, realtimex-link#12): used
+    // while it is attached, else the view starts on the primary.
+    let mut display = displays::named(body.get("display"));
+    if let Some(hint) = &display {
+        let attached = fresh_displays(&shared).await.unwrap_or_default();
+        if !displays::has(&attached, hint) {
+            display = None;
+        }
+    }
+    if let Some(display) = &display {
+        params["display"] = json!(display);
+    }
+    let result = match shared.backend.call("peer_offer", params).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
@@ -1463,8 +1788,11 @@ async fn peer_offer(
         requests: Mutex::new(Vec::new()),
         moves: Mutex::new(Vec::new()),
         transfer_client: Mutex::new(None),
+        display: Mutex::new(display),
+        told: Mutex::new((None, Vec::new())),
     });
     lock(&shared.peers).insert(session, entry);
+    ensure_display_poll(&shared);
     let id = shared.next_stream.fetch_add(1, Ordering::SeqCst);
     lock(&shared.streams).push(Stream {
         id,
@@ -1593,7 +1921,18 @@ async fn run_transfer(
                     click["width"] = point["width"].clone();
                     click["height"] = point.get("height").cloned().unwrap_or(Value::Null);
                 }
-                perform_actions(shared, client, Some(&json!([click])), false, false).await?;
+                // On the display this view shows (realtimex-link#12).
+                let peer = session
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|number| lock(&shared.peers).get(&number).cloned());
+                let mut display = None;
+                if let Some(peer) = peer {
+                    display = lock(&peer.display).clone();
+                }
+                let display = display.as_deref();
+                perform_actions(shared, client, Some(&json!([click])), false, false, display, display)
+                    .await?;
             }
             let paths: Vec<String> = group
                 .paths
@@ -1929,6 +2268,170 @@ mod tests {
         assert_eq!(failure_window(PUBLIC_TOTAL), PUBLIC_TOTAL_WINDOW_MS);
         assert_eq!(failure_window(TAILNET_TOTAL), PUBLIC_TOTAL_WINDOW_MS);
         assert_eq!(failure_window("password:1.2.3.4"), AUTH_FAILURE_WINDOW_MS);
+    }
+
+    /// A stand-in for rtx-control that writes every request line to `requests` and answers
+    /// `displays` with the list in `displays.json` (both next to it); everything else is ok.
+    #[cfg(unix)]
+    fn fake_helper(dir: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("rtx-control");
+        let script = format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{requests}'
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"op":"displays"'*) printf '{{"id":%s,"ok":true,"displays":%s}}\n' "$id" "$(cat '{list}')" ;;
+    *) printf '{{"id":%s,"ok":true}}\n' "$id" ;;
+  esac
+done
+"#,
+            requests = dir.join("requests").display(),
+            list = dir.join("displays.json").display(),
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn test_shared(backend: Arc<Backend>, dir: &std::path::Path) -> Arc<Shared> {
+        Arc::new(Shared {
+            host: Weak::new(),
+            public: false,
+            backend,
+            log: Arc::new(|_: &str| {}),
+            failures: Mutex::new(HashMap::new()),
+            last_action: Mutex::new(None),
+            streams: Mutex::new(Vec::new()),
+            next_stream: AtomicU64::new(1),
+            shot_sizes: Mutex::new(HashMap::new()),
+            peers: Mutex::new(HashMap::new()),
+            display_poll: Mutex::new(None),
+            http_sessions: Mutex::new(HashMap::new()),
+            transfers: Transfers::new(dir.join("temp"), dir.join("downloads")),
+            clipboard: ClipboardShare::default(),
+            clipboard_polling: AtomicBool::new(false),
+            home: dir.to_path_buf(),
+            tasks: Mutex::new(Vec::new()),
+            access_timer: Mutex::new(None),
+        })
+    }
+
+    #[cfg(unix)]
+    fn test_peer() -> Arc<Peer> {
+        Arc::new(Peer {
+            client_id: "c".into(),
+            token: "t".into(),
+            address: "100.64.0.2".into(),
+            closed: AtomicBool::new(false),
+            held: Mutex::new(HashSet::new()),
+            held_keys: Mutex::new(Vec::new()),
+            last_action: Mutex::new(Instant::now()),
+            watchdog: AtomicBool::new(false),
+            running: tokio::sync::RwLock::new(()),
+            requests: Mutex::new(Vec::new()),
+            moves: Mutex::new(Vec::new()),
+            transfer_client: Mutex::new(None),
+            display: Mutex::new(None),
+            told: Mutex::new((None, Vec::new())),
+        })
+    }
+
+    #[cfg(unix)]
+    fn requests_of(dir: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("requests"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// realtimex-link#12 with a fake helper: a switch lets go of the view's held keys and buttons
+    /// before the picture changes; an unknown display is refused and changes nothing; the
+    /// display shown answers ok and does nothing; an unplugged display falls back to the primary
+    /// with a push that says so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn select_refuse_and_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let two = json!([
+            { "id": "1", "name": "", "primary": true, "x": 0, "y": 0, "width": 1920, "height": 1080, "scale": 1.0 },
+            { "id": "2", "name": "", "primary": false, "x": 1920, "y": 0, "width": 2560, "height": 1440, "scale": 1.0 },
+        ]);
+        std::fs::write(dir.path().join("displays.json"), two.to_string()).unwrap();
+        let backend = Backend::with_detected(crate::backend::Detected {
+            binary: Some(fake_helper(dir.path())),
+            reason: None,
+            code: None,
+        });
+        let shared = test_shared(backend, dir.path());
+        let peer = test_peer();
+        lock(&shared.peers).insert(7, peer.clone());
+        lock(&peer.held).insert("left".into());
+        lock(&peer.held_keys).push("ShiftLeft".into());
+
+        let answer = select_display(&shared, 7, &peer, Some("2".into())).await;
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert_eq!(answer["display"], "2");
+        assert_eq!(answer["displays"], two);
+        assert_eq!(lock(&peer.display).as_deref(), Some("2"));
+        assert!(lock(&peer.held).is_empty() && lock(&peer.held_keys).is_empty());
+        let ops: Vec<String> = requests_of(dir.path())
+            .iter()
+            .map(|r| {
+                let op = r["op"].as_str().unwrap_or("").to_string();
+                match op.as_str() {
+                    "key" => format!("key {} {}", r["code"].as_str().unwrap(), r["pressed"]),
+                    "button" => format!("button {} {}", r["button"].as_str().unwrap(), r["pressed"]),
+                    "peer_display" => format!("peer_display {} {}", r["session"], r["display"]),
+                    _ => op,
+                }
+            })
+            .filter(|op| op != "start" && op != "displays")
+            .collect();
+        assert_eq!(
+            ops,
+            ["key ShiftLeft false", "button left false", "peer_display 7 \"2\""]
+        );
+
+        // Unknown: refused, the view stays where it is.
+        let refused = select_display(&shared, 7, &peer, Some("9".into())).await;
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["code"], "display-not-found");
+        assert_eq!(refused["display"], "2");
+        assert_eq!(lock(&peer.display).as_deref(), Some("2"));
+        // The one shown: ok, and no switch.
+        let switches = |dir: &std::path::Path| {
+            requests_of(dir)
+                .iter()
+                .filter(|r| r["op"] == "peer_display")
+                .count()
+        };
+        assert_eq!(switches(dir.path()), 1);
+        let same = select_display(&shared, 7, &peer, Some("2".into())).await;
+        assert_eq!(same["ok"], true);
+        assert_eq!(switches(dir.path()), 1);
+
+        // Display 2 is unplugged: the view shows the primary and hears why.
+        let one = json!([two[0].clone()]);
+        std::fs::write(dir.path().join("displays.json"), one.to_string()).unwrap();
+        check_views(&shared, None).await;
+        assert_eq!(*lock(&peer.display), None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let requests = requests_of(dir.path());
+        let back = requests.iter().rev().find(|r| r["op"] == "peer_display").unwrap();
+        assert_eq!(back["session"], 7);
+        assert!(back.get("display").is_none(), "{back}");
+        let pushed: Value = requests
+            .iter()
+            .filter(|r| r["op"] == "peer_send")
+            .find_map(|r| serde_json::from_str(r["data"].as_str()?).ok())
+            .expect("a displays push");
+        assert_eq!(pushed["type"], "displays");
+        assert_eq!(pushed["display"], "1");
+        assert_eq!(pushed["fallback"], json!({ "from": "2", "reason": "display_removed" }));
     }
 
     #[test]

@@ -28,10 +28,17 @@ const CONSOLE_CHECK: Duration = Duration::from_secs(1);
 const IDLE_STOP: Duration = Duration::from_secs(5 * 60);
 /// "Someone is using this computer" (#2670): an open live view, or real use this recently.
 const IN_USE_WINDOW: Duration = Duration::from_secs(60);
-/// A live view's own bookkeeping; not use by itself.
-const BOOKKEEPING_OPS: [&str; 2] = ["peer_close", "peer_send"];
+/// A live view's own bookkeeping; not use by itself. `displays` is asked every few seconds while
+/// a live view is open (realtimex-link#12).
+const BOOKKEEPING_OPS: [&str; 3] = ["peer_close", "peer_send", "displays"];
 /// The JSON-lines protocol this daemon speaks with rtx-control.
 pub const CONTROL_PROTOCOL: u64 = 2;
+/// rtx-control's code for a request naming a display that isn't attached (realtimex-link#12).
+pub const DISPLAY_NOT_FOUND: &str = "display-not-found";
+/// How many virtual displays a headless GNOME Wayland session may record (the `virtualDisplays`
+/// setting, realtimex-link#12), and how many by default: one, as since 0.2.6.
+pub const VIRTUAL_DISPLAYS: std::ops::RangeInclusive<u64> = 1..=4;
+pub const DEFAULT_VIRTUAL_DISPLAYS: u32 = 1;
 /// rtx-control's exit code when a ScreenCaptureKit request it gave up on never answered, which
 /// leaves its screenshots and live view refused until it ends (crates/control/src/main.rs,
 /// EXIT_CAPTURE_STALLED). Nothing to do but start a new one, which the next request does.
@@ -277,13 +284,15 @@ fn helper_env(command: &mut Command) {
     let _ = command;
 }
 
-/// A failed helper answer: 409 with its `code` when the desktop refused the input, else 502.
+/// A failed helper answer: 409 with its `code` when the desktop refused the input, 404 for a
+/// display that isn't attached (realtimex-link#12), else 502.
 fn helper_error(message: &Value, fallback: &str) -> ApiError {
     let text = message
         .get("error")
         .and_then(Value::as_str)
         .unwrap_or(fallback);
     match message.get("code").and_then(Value::as_str) {
+        Some(code @ DISPLAY_NOT_FOUND) => ApiError::coded(404, code, text),
         Some(code) => ApiError::coded(409, code, text),
         None => ApiError::new(502, text),
     }
@@ -317,6 +326,8 @@ pub struct Backend {
     start_lock: tokio::sync::Mutex<()>,
     /// The running helper's stdin (generation, pipe); one writer at a time.
     stdin: tokio::sync::Mutex<Option<(u64, crate::helper::Writer)>>,
+    /// Virtual displays a headless GNOME Wayland session records, told to each new session.
+    virtual_displays: std::sync::atomic::AtomicU32,
 }
 
 impl Backend {
@@ -335,6 +346,7 @@ impl Backend {
             events,
             start_lock: tokio::sync::Mutex::new(()),
             stdin: tokio::sync::Mutex::new(None),
+            virtual_displays: std::sync::atomic::AtomicU32::new(DEFAULT_VIRTUAL_DISPLAYS),
         });
         Self::spawn_idle_watch(&backend);
         backend
@@ -373,6 +385,11 @@ impl Backend {
                 }
             }
         });
+    }
+
+    /// The `virtualDisplays` setting, for the next session's `start`.
+    pub fn set_virtual_displays(&self, count: u32) {
+        self.virtual_displays.store(count, Ordering::SeqCst);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
@@ -622,7 +639,14 @@ impl Backend {
         if self.started() {
             return Ok(());
         }
-        self.send("start", &json!({})).await?;
+        // Only a headless GNOME Wayland session uses it; a count other than the default only.
+        let count = self.virtual_displays.load(Ordering::SeqCst);
+        let params = if count == DEFAULT_VIRTUAL_DISPLAYS {
+            json!({})
+        } else {
+            json!({ "virtualDisplays": count })
+        };
+        self.send("start", &params).await?;
         self.inner().started = true;
         Ok(())
     }

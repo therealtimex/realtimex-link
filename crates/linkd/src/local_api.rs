@@ -47,6 +47,9 @@ pub const FEATURES: &[&str] = &[
     // /v1/webhooks, GET /v1/inbox, POST /v1/inbox/ack (the webhook inbox).
     "artifacts",
     "webhooks",
+    // realtimex-link#12: a live view can choose which display it shows (the viewer reads it from
+    // the live view's own `info`); GET/POST /v1/displays/virtual.
+    "displays",
 ];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
 /// caller's nonce (see `hello_proof`).
@@ -85,6 +88,10 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/appearance", get(appearance).post(set_appearance))
         .route("/v1/window/open", post(open_window))
         .route("/v1/running", get(running).post(set_running))
+        .route(
+            "/v1/displays/virtual",
+            get(virtual_displays).post(set_virtual_displays),
+        )
         .route("/v1/exposure", get(exposure))
         .route("/v1/exposure/adopt", post(adopt_exposure))
         .route("/v1/exposure/notice-seen", post(exposure_notice_seen))
@@ -369,6 +376,22 @@ async fn set_running(State(state): State<Shared>, Body64(body): Body64) -> Answe
         .ok_or_else(|| ApiError::bad_request("on must be true or false"))?;
     state.host.set_keep_running(on).await?;
     running(State(state)).await
+}
+
+/// How many virtual displays a headless GNOME Wayland session records (realtimex-link#12):
+/// { count }.
+async fn virtual_displays(State(state): State<Shared>) -> Answer {
+    Ok(Json(json!({ "count": state.host.settings().virtual_displays })))
+}
+
+/// { count: 1..4 }: taken by the next remote session; no UI in this release.
+async fn set_virtual_displays(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let count = body
+        .get("count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ApiError::bad_request("count must be an integer from 1 to 4"))?;
+    state.host.set_virtual_displays(count)?;
+    virtual_displays(State(state)).await
 }
 
 /// This computer's Public Exposure, for RealTimeX's Sharing page (relay.rs `exposure`).
