@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! {"id":1,"op":"start"}                       -> {"id":1,"ok":true,"size":[w,h]}
+//!     ("virtualDisplays":n: a headless GNOME Wayland session records n virtual monitors, 1–4)
 //! {"id":2,"op":"screenshot","live":false}    -> {"id":2,"ok":true,"mime":"image/jpeg","width":..,"height":..,"data":"<base64>","thumb":"<hex>"}
 //! {"id":3,"op":"move","x":10,"y":20}         (screenshot pixels; "spaceWidth"/"spaceHeight"
 //!                                             give another picture size, e.g. a live view's)
@@ -306,6 +307,12 @@ impl Controller {
         }
         match op {
             "start" => {
+                // GNOME Wayland, headless: how many virtual monitors a new session records
+                // (Link's `virtualDisplays`, realtimex-link#12; 1 when not said).
+                #[cfg(target_os = "linux")]
+                platform::set_virtual_displays(
+                    request["virtualDisplays"].as_u64().unwrap_or(1).clamp(1, 4) as u32,
+                );
                 let size = self.input()?.screen_size();
                 Ok(json!({ "size": size.map(|(w, h)| [w, h]), "backend": platform::PLATFORM }))
             }

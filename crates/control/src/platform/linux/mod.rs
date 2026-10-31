@@ -16,6 +16,10 @@ mod wayland_input;
 mod x11_clipboard;
 mod x11_input;
 
+/// How many virtual monitors a headless GNOME Wayland session records (`virtualDisplays`,
+/// realtimex-link#12): taken by the next session.
+pub use wayland_input::set_virtual_displays;
+
 /// On Wayland the screenshot comes from the remote-desktop session's own stream.
 pub fn screenshot_needs_input() -> bool {
     x11::wayland()

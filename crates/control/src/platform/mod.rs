@@ -160,7 +160,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
     control_permissions, permission_owner, request_control_permission, screenshot_needs_input,
-    Input,
+    set_virtual_displays, Input,
 };
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]

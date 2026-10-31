@@ -35,8 +35,10 @@ control other computers from.
   `display` and is refused with 409 `display-changed` when that isn't the one shown. Agents:
   `GET /remote-control/displays`, and `display` on `/screenshot`, `/actions` and `/frames`
   (404 `display-not-found`; the `X-Screen-Display` header says which one a picture is). A
-  headless GNOME Wayland session records `virtualDisplays` (1–4, default 1; `GET/POST
-  /v1/displays/virtual {count}` on the local API) virtual monitors.
+  GNOME Wayland session records every monitor from its start (a stream nobody reads costs
+  nothing measurable) and starts again when a physical monitor is plugged in or out; a headless
+  one records `virtualDisplays` (1–4, default 1; `GET/POST /v1/displays/virtual {count}` on the
+  local API) virtual monitors, `Meta-0`… in the order it made them.
   **Start with this computer on macOS** (0.4.1, realtimex-link#11): one administrator's prompt
   installs a root LaunchDaemon that runs its owner's daemon from boot, and a session agent at the
   login window and in each user's session, so allowed computers connect at the login window and

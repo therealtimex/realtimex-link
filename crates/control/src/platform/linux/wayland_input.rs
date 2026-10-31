@@ -9,8 +9,18 @@
 //! half a second) per frame.
 //!
 //! A computer with no monitor attached (headless, #9) has no monitor to record: the session
-//! records a virtual monitor instead, which Mutter sizes from the stream's negotiated format, as
-//! gnome-remote-desktop does headless.
+//! records a virtual monitor instead (or `virtualDisplays` of them, realtimex-link#12), which
+//! Mutter sizes from the stream's negotiated format, as gnome-remote-desktop does headless.
+//!
+//! Several displays (realtimex-link#12): the monitors come from Mutter's DisplayConfig
+//! (`GetCurrentState`), each recorded as a stream of its own; a display's id is its connector
+//! (`HDMI-1`), a virtual one's `Meta-n` in the order this session made them. Streams can only be
+//! added before the session starts (a later one never starts), so every monitor is recorded
+//! then; a recorded stream nobody reads costs nothing measurable (T30 spike, GNOME 50), and a
+//! frame pipeline runs only for a display in use, stopping after STREAM_IDLE. Pointer moves go
+//! to the shown display's stream, in its pixels. A monitor plugged in or out (DisplayConfig's
+//! MonitorsChanged; a removed monitor's stream only freezes) starts the session again with the
+//! new set, once the change has settled for RESTART_SETTLE.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -19,6 +29,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -29,7 +40,7 @@ use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Value};
 
 use super::super::{Button, Shot};
 use super::terminal;
-use crate::displays::{Display, DisplayNotFound, Rect};
+use crate::displays::{Display, DisplayInfo, DisplayNotFound, Rect};
 
 const RD_BUS: &str = "org.gnome.Mutter.RemoteDesktop";
 const RD_SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
@@ -40,8 +51,24 @@ const CURSOR_EMBEDDED: u32 = 1;
 /// The virtual monitor's size when no monitor is attached: Mutter makes it the size the stream
 /// negotiates.
 const VIRTUAL_SIZE: (u32, u32) = (1920, 1080);
-/// The id of the one display this session records (realtimex-link#12).
-const STREAM_DISPLAY: &str = "primary";
+/// A display's frame pipeline no request has used for this long stops; its stream stays
+/// recorded (realtimex-link#12).
+const STREAM_IDLE: Duration = Duration::from_secs(5);
+const DC_BUS: &str = "org.gnome.Mutter.DisplayConfig";
+/// A monitor change waits this long without another before the session starts again: plugging
+/// a monitor in announces several changes.
+const RESTART_SETTLE: Duration = Duration::from_secs(1);
+/// Mutter's connectors for virtual monitors (Link's own, headless), and their display name.
+const VIRTUAL_CONNECTOR: &str = "Meta-";
+const VIRTUAL_VENDOR: &str = "MetaVendor";
+
+/// How many virtual monitors a headless session records: Link's `virtualDisplays`, from
+/// `start` (1 to 4; 1 as since 0.2.6). Taken when a session starts.
+static VIRTUAL_DISPLAYS: AtomicU32 = AtomicU32::new(1);
+
+pub fn set_virtual_displays(count: u32) {
+    VIRTUAL_DISPLAYS.store(count.clamp(1, 4), Ordering::Relaxed);
+}
 const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 /// How often a virtual monitor's first-frame wait checks the writer and nudges the pointer.
@@ -109,22 +136,37 @@ fn evdev_button(button: Button) -> i32 {
 
 pub struct WaylandInput {
     session: Proxy<'static>,
-    stream_path: OwnedObjectPath,
-    node_id: u32,
-    /// The stream's frame size: pointer coordinates are in these pixels, not the logical
-    /// monitor size Mutter reports (they differ under fractional scaling).
-    frame_size: Option<(u32, u32)>,
+    /// The displays this session records, the primary first.
+    recorded: Vec<Recorded>,
+    /// The session records virtual monitors (none attached).
+    headless: bool,
+    /// The physical connectors this session was made for, and when DisplayConfig last said the
+    /// monitors changed (written by the MonitorsChanged watch).
+    connectors: Vec<String>,
+    monitors_changed: Arc<Mutex<Option<Instant>>>,
     /// What the clipboard serves, per MIME type, as last announced.
     clipboard_data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     clipboard_enabled: bool,
     /// The clipboard as GNOME last announced it (#2682): changes, the offered MIME types, and
     /// whether this session owns it (its own paste).
     selection: Arc<Mutex<Selection>>,
-    frames: Option<FrameStream>,
-    /// The virtual monitor's size, when the session records one (no monitor attached).
+}
+
+/// One display the session records: a monitor, or a virtual one.
+struct Recorded {
+    /// As listed: the connector or `Meta-n` (by creation), and the monitor's place and size.
+    info: DisplayInfo,
+    stream_path: OwnedObjectPath,
+    node_id: u32,
+    /// The virtual monitor's size, when it is one.
     virtual_size: Option<(u32, u32)>,
+    frames: Option<FrameStream>,
+    /// The stream's frame size: pointer coordinates are in these pixels, not the logical
+    /// monitor size Mutter reports (they differ under fractional scaling).
+    frame_size: Option<(u32, u32)>,
     /// The last live-view frame: the stream frame it came from, the width it was made for.
     last_frame: Option<(u64, u32, super::super::Frame)>,
+    last_asked: Instant,
 }
 
 /// The latest frame of the stream, written by the reader thread.
@@ -342,6 +384,7 @@ impl Drop for FrameStream {
 }
 
 impl WaylandInput {
+    /// A session recording every connected monitor, else `virtualDisplays` virtual ones.
     pub fn new() -> Result<Self> {
         let conn = Connection::session().context("session D-Bus")?;
         let manager = Proxy::new(&conn, RD_BUS, "/org/gnome/Mutter/RemoteDesktop", RD_BUS)
@@ -361,102 +404,249 @@ impl WaylandInput {
         let record = || -> HashMap<&str, Value> {
             HashMap::from([("cursor-mode", Value::U32(CURSOR_EMBEDDED))])
         };
-        // An empty connector records the primary monitor. With no monitor attached there is
-        // none: record a virtual one, of the size the frame pipeline asks for (#9). As a
-        // platform monitor, the desktop lays out on it as on a real one.
-        let mut virtual_size = None;
-        let stream_path: OwnedObjectPath = match sc_session.call("RecordMonitor", &("", record()))
-        {
-            Ok(path) => path,
+        // Which monitors: an unreadable DisplayConfig records the primary alone, as before.
+        let monitors = monitors(&conn).unwrap_or_default();
+        let chosen = to_record(&monitors);
+        let mut streams: Vec<(DisplayInfo, OwnedObjectPath, Option<(u32, u32)>)> = Vec::new();
+        // An empty connector records the primary monitor, as before #12. With no monitor
+        // attached there is none: record virtual ones, of the size the frame pipeline asks for
+        // (#9). As platform monitors, the desktop lays out on them as on real ones.
+        let headless = match sc_session.call::<_, _, OwnedObjectPath>("RecordMonitor", &("", record())) {
+            Ok(path) => {
+                let primary = primary_of(&monitors);
+                streams.push((primary.clone(), path, None));
+                for info in chosen.iter().filter(|m| m.id != primary.id) {
+                    match sc_session.call("RecordMonitor", &(info.id.as_str(), record())) {
+                        Ok(path) => streams.push((info.clone(), path, None)),
+                        // Gone since it was listed: the next list starts over without it.
+                        Err(error) => eprintln!("[wayland] {} not recorded: {error}", info.id),
+                    }
+                }
+                false
+            }
             Err(error) if no_monitor(&error.to_string()) => {
-                let mut properties = record();
-                properties.insert("is-platform", Value::Bool(true));
-                virtual_size = Some(VIRTUAL_SIZE);
-                sc_session
-                    .call("RecordVirtual", &(properties,))
-                    .context("no monitor attached, and Mutter recorded no virtual one")?
+                for info in virtual_displays(VIRTUAL_DISPLAYS.load(Ordering::Relaxed)) {
+                    let mut properties = record();
+                    properties.insert("is-platform", Value::Bool(true));
+                    let path = sc_session
+                        .call("RecordVirtual", &(properties,))
+                        .context("no monitor attached, and Mutter recorded no virtual one")?;
+                    streams.push((info, path, Some(VIRTUAL_SIZE)));
+                }
+                true
             }
             Err(error) => return Err(error.into()),
         };
-        let stream = Proxy::new_owned(conn.clone(), SC_BUS, stream_path.clone(), SC_STREAM)?;
 
-        let (tx, rx) = mpsc::channel();
-        let mut added = stream.receive_signal("PipeWireStreamAdded")?;
-        std::thread::spawn(move || {
-            if let Some(message) = added.next() {
-                let _ = tx.send(message.body().deserialize::<u32>());
-            }
-        });
+        // Each stream's PipeWire node, once the session starts.
+        let mut nodes = Vec::new();
+        for (_, path, _) in &streams {
+            let stream = Proxy::new_owned(conn.clone(), SC_BUS, path.clone(), SC_STREAM)?;
+            let (tx, rx) = mpsc::channel();
+            let mut added = stream.receive_signal("PipeWireStreamAdded")?;
+            std::thread::spawn(move || {
+                if let Some(message) = added.next() {
+                    let _ = tx.send(message.body().deserialize::<u32>());
+                }
+            });
+            nodes.push(rx);
+        }
         session.call::<_, _, ()>("Start", &())?;
-        let node_id = rx
-            .recv_timeout(STREAM_TIMEOUT)
-            .map_err(|_| anyhow!("GNOME did not start the screen stream"))??;
+        let started = Instant::now();
+        let mut recorded = Vec::new();
+        for ((info, stream_path, virtual_size), rx) in streams.into_iter().zip(nodes) {
+            let left = STREAM_TIMEOUT.saturating_sub(started.elapsed());
+            let node_id = rx
+                .recv_timeout(left)
+                .map_err(|_| anyhow!("GNOME did not start the screen stream"))??;
+            recorded.push(Recorded {
+                info,
+                stream_path,
+                node_id,
+                virtual_size,
+                frames: None,
+                frame_size: None,
+                last_frame: None,
+                last_asked: Instant::now(),
+            });
+        }
 
         let mut input = Self {
             session,
-            stream_path,
-            node_id,
-            frame_size: None,
+            recorded,
+            headless,
+            connectors: physical(&monitors),
+            monitors_changed: Arc::new(Mutex::new(None)),
             clipboard_data: Arc::new(Mutex::new(HashMap::new())),
             clipboard_enabled: false,
             selection: Arc::new(Mutex::new(Selection::default())),
-            frames: None,
-            virtual_size,
-            last_frame: None,
         };
-        // A virtual monitor exists only once its stream is negotiated and read: read it from the
-        // start and wait for its first frame, so the first input (before any screenshot) has a
-        // monitor to land on and is scaled to its size. A failure here drops `input`, which
-        // stops the session.
-        if let Some(size) = virtual_size {
-            let mut frames = FrameStream::start(node_id, Some(size))?;
+        // A virtual monitor exists only once its stream is negotiated and read, and Mutter lays
+        // the monitors out again as each appears: read every one from the start until its first
+        // frame, so all exist (and the first input has a monitor to land on, scaled to its
+        // size). A monitor outlives its reader, so the pipelines then idle-stop like others. A
+        // failure here drops `input`, which stops the session.
+        for index in 0..input.recorded.len() {
+            let Some(size) = input.recorded[index].virtual_size else {
+                continue;
+            };
+            let mut frames = FrameStream::start(input.recorded[index].node_id, Some(size))?;
             let (width, height) = frames.wait_ready(FRAME_TIMEOUT, || {
-                let _ = input.nudge();
+                let _ = input.nudge_on(index);
             })?;
-            input.frame_size = Some((width as u32, height as u32));
-            input.frames = Some(frames);
+            input.recorded[index].frame_size = Some((width as u32, height as u32));
+            input.recorded[index].frames = Some(frames);
         }
+        if input.headless {
+            input.place_virtual(&conn);
+        }
+        input.watch_monitors(&conn);
         Ok(input)
     }
 
-    /// Frame pixels; known after the first screenshot.
-    pub fn screen_size(&self) -> Option<(f64, f64)> {
-        self.frame_size.map(|(w, h)| (w as f64, h as f64))
+    /// Note each MonitorsChanged (a monitor plugged in or out, or Link's own virtual monitors
+    /// appearing); [`Self::restart_due`] decides what it means.
+    fn watch_monitors(&self, conn: &Connection) {
+        let Ok(config) = Proxy::new(conn, DC_BUS, "/org/gnome/Mutter/DisplayConfig", DC_BUS) else {
+            return;
+        };
+        let Ok(mut changes) = config.receive_signal("MonitorsChanged") else {
+            return;
+        };
+        let noted = Arc::downgrade(&self.monitors_changed);
+        std::thread::spawn(move || {
+            for _ in &mut changes {
+                let Some(noted) = noted.upgrade() else { return };
+                *noted.lock().unwrap() = Some(Instant::now());
+            }
+        });
     }
 
-    /// The displays this session records, each with its stream's pixels as the rectangle the
-    /// pointer takes (realtimex-link#12). One stream so far: the primary monitor, or the
-    /// virtual one.
-    pub fn displays(&mut self) -> Result<Vec<Display>> {
-        if self.frame_size.is_none() {
-            self.latest_frame(false, true)?;
+    /// The virtual monitors' places and sizes as Mutter laid them out: `Meta-n` in its own
+    /// numbering, matched to this session's in the order they were made. Their ids stay this
+    /// session's (`Meta-0`… by creation), so a new session keeps them for the same monitors.
+    fn place_virtual(&mut self, conn: &Connection) {
+        let Ok(listed) = monitors(conn) else { return };
+        let mut placed: Vec<DisplayInfo> = listed.into_iter().filter(|m| is_virtual(&m.id)).collect();
+        placed.sort_by_key(|m| connector_number(&m.id));
+        for (recorded, place) in self.recorded.iter_mut().zip(placed) {
+            recorded.info.x = place.x;
+            recorded.info.y = place.y;
+            recorded.info.width = place.width;
+            recorded.info.height = place.height;
+            recorded.info.scale = place.scale;
         }
-        let (width, height) = self.frame_size.unwrap_or(VIRTUAL_SIZE);
-        Ok(vec![Display {
-            info: rtx_screens::DisplayInfo {
-                id: STREAM_DISPLAY.into(),
-                name: String::new(),
-                primary: true,
-                x: 0,
-                y: 0,
-                width,
-                height,
-                scale: 1.0,
-            },
-            rect: Rect {
-                x: 0.0,
-                y: 0.0,
-                width: width as f64,
-                height: height as f64,
-            },
-        }])
     }
 
-    /// `display` names this session's stream, or nothing (the primary).
-    fn check_display(display: Option<&str>) -> Result<()> {
-        match display {
-            Some(id) if id != STREAM_DISPLAY => Err(DisplayNotFound(id.to_string()).into()),
-            _ => Ok(()),
+    /// Whether the physical monitors changed since this session started: a MonitorsChanged
+    /// that has settled for RESTART_SETTLE, and another set of physical connectors now (Link's
+    /// own virtual monitors coming and going don't count). A change that isn't one is forgotten.
+    fn restart_due(&self, conn: &Connection) -> bool {
+        let noted = *self.monitors_changed.lock().unwrap();
+        if !settled(noted, Instant::now()) {
+            return false;
+        }
+        *self.monitors_changed.lock().unwrap() = None;
+        match monitors(conn) {
+            Ok(now) => physical(&now) != self.connectors,
+            Err(_) => false,
+        }
+    }
+
+    /// The listed places of the monitors, which may move without a new session.
+    fn replace_monitors(&mut self, now: &[DisplayInfo]) {
+        for recorded in self.recorded.iter_mut().filter(|r| r.virtual_size.is_none()) {
+            if let Some(place) = now.iter().find(|m| m.id == recorded.info.id) {
+                recorded.info = place.clone();
+            }
+        }
+    }
+
+    /// The primary display's frame pixels; known after the first screenshot.
+    pub fn screen_size(&self) -> Option<(f64, f64)> {
+        self.recorded
+            .first()
+            .and_then(|r| r.frame_size)
+            .map(|(w, h)| (w as f64, h as f64))
+    }
+
+    /// The displays (realtimex-link#12), each with its stream's pixels as the rectangle the
+    /// pointer takes. When the connected monitors are not the ones this session was made for
+    /// (one plugged in or out), the session starts again with the new set first.
+    pub fn displays(&mut self) -> Result<Vec<Display>> {
+        self.restart_if_due()?;
+        if !self.headless {
+            let conn = self.session.connection().clone();
+            if let Ok(now) = monitors(&conn) {
+                self.replace_monitors(&now);
+            }
+        }
+        Ok(self.listed())
+    }
+
+    /// A new session for the monitors connected now, when they changed. Views on displays that
+    /// still exist keep them (same ids); rtx-linkd moves the others to the primary.
+    fn restart_if_due(&mut self) -> Result<()> {
+        let conn = self.session.connection().clone();
+        if self.restart_due(&conn) {
+            eprintln!("[wayland] the monitors changed: starting the session again");
+            // The old session stops first.
+            self.stop_session();
+            *self = Self::new()?;
+        }
+        Ok(())
+    }
+
+    /// The displays this session records, as it knows them.
+    fn listed(&self) -> Vec<Display> {
+        self.recorded
+            .iter()
+            .map(|r| {
+                let (width, height) = r.frame_size.unwrap_or((r.info.width, r.info.height));
+                Display {
+                    info: r.info.clone(),
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: width as f64,
+                        height: height as f64,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn stop_session(&mut self) {
+        for recorded in &mut self.recorded {
+            recorded.frames = None;
+        }
+        let _ = self.session.call::<_, _, ()>("Stop", &());
+    }
+
+    /// The recorded display `display` names (None: the primary), in a new session first when
+    /// the monitors changed.
+    fn index_of(&mut self, display: Option<&str>) -> Result<usize> {
+        self.restart_if_due()?;
+        let Some(id) = display else {
+            return Ok(0);
+        };
+        self.recorded
+            .iter()
+            .position(|r| r.info.id == id)
+            .ok_or_else(|| DisplayNotFound(id.to_string()).into())
+    }
+
+    /// Stop the frame pipelines no request used for STREAM_IDLE (a virtual monitor outlives
+    /// its reader, and a new one gets frames again).
+    fn stop_idle(&mut self, keep: usize) {
+        for (index, recorded) in self.recorded.iter_mut().enumerate() {
+            if index != keep
+                && recorded.frames.is_some()
+                && recorded.last_asked.elapsed() >= STREAM_IDLE
+            {
+                recorded.frames = None;
+                recorded.last_frame = None;
+            }
         }
     }
 
@@ -470,12 +660,29 @@ impl WaylandInput {
         Ok(())
     }
 
-    /// The latest frame of the session's stream, one newer than this request when the screen
-    /// is changing (an action's effect shows), or else the latest. A `live` view does not
-    /// wait: it nudges for the next frame and takes what is there, at most one frame behind.
+    /// A nudge that reaches stream `index` wherever the pointer is: Mutter sends a monitor's
+    /// first frame on pointer motion over it, so a reader attached to a display the pointer
+    /// isn't on might wait in vain (T30 spike). The pointer goes to that display's middle.
+    fn nudge_on(&self, index: usize) -> Result<()> {
+        let recorded = &self.recorded[index];
+        let (width, height) = recorded
+            .frame_size
+            .or(recorded.virtual_size)
+            .unwrap_or((recorded.info.width, recorded.info.height));
+        self.session.call::<_, _, ()>(
+            "NotifyPointerMotionAbsolute",
+            &(recorded.stream_path.as_str(), width as f64 / 2.0, height as f64 / 2.0),
+        )?;
+        Ok(())
+    }
+
+    /// The latest frame of `display`'s stream (None: the primary), one newer than this request
+    /// when the screen is changing (an action's effect shows), or else the latest. A `live`
+    /// view does not wait: it nudges for the next frame and takes what is there, at most one
+    /// frame behind.
     pub fn screenshot(&mut self, max_width: u32, live: bool, display: Option<&str>) -> Result<Shot> {
-        Self::check_display(display)?;
-        let (data, width, height) = self.latest_frame(live, false)?;
+        let index = self.index_of(display)?;
+        let (data, width, height) = self.latest_frame(index, live, false)?;
         super::x11::shot(
             &data[..width * height * 4],
             width,
@@ -485,15 +692,17 @@ impl WaylandInput {
         )
     }
 
-    /// The latest picture of the stream as a live-view video frame: no waiting for a newer one
-    /// (the stream sends a frame when the screen changes).
+    /// The latest picture of `display`'s stream as a live-view video frame: no waiting for a
+    /// newer one (the stream sends a frame when the screen changes).
     /// Until the stream sends a newer frame, the last one comes back as it was: not copied or
     /// scaled again, and with the same number, so the encoder skips it (#2683). The live view asks
     /// 30 times a second, and GNOME sends a frame only when the screen changes.
     pub fn frame(&mut self, max_width: u32, display: Option<&str>) -> Result<super::super::Frame> {
-        Self::check_display(display)?;
-        if let Some((seq, width, frame)) = &self.last_frame {
-            let unchanged = self
+        let index = self.index_of(display)?;
+        let recorded = &mut self.recorded[index];
+        recorded.last_asked = Instant::now();
+        if let Some((seq, width, frame)) = &recorded.last_frame {
+            let unchanged = recorded
                 .frames
                 .as_mut()
                 .is_some_and(|f| f.running() && f.seq() == *seq);
@@ -501,7 +710,7 @@ impl WaylandInput {
                 return Ok(frame.clone());
             }
         }
-        let (data, width, height, stream_seq) = self.numbered_frame(false, true)?;
+        let (data, width, height, stream_seq) = self.numbered_frame(index, false, true)?;
         let frame = super::super::Frame {
             seq: super::super::next_frame_seq(),
             ..super::super::Frame::scaled(
@@ -514,45 +723,75 @@ impl WaylandInput {
                 max_width,
             )
         };
-        self.last_frame = Some((stream_seq, max_width, frame.clone()));
+        self.recorded[index].last_frame = Some((stream_seq, max_width, frame.clone()));
         Ok(frame)
     }
 
-    /// BGRA of the latest stream frame. The first one, a `live` view's and a fresh screenshot's
-    /// wait for a newer frame as before; a video frame (`frame`) takes what is there.
-    fn latest_frame(&mut self, live: bool, video: bool) -> Result<(Arc<Vec<u8>>, usize, usize)> {
-        let (data, width, height, _) = self.numbered_frame(live, video)?;
+    /// BGRA of the latest frame of stream `index`. The first one, a `live` view's and a fresh
+    /// screenshot's wait for a newer frame as before; a video frame (`frame`) takes what is
+    /// there.
+    fn latest_frame(
+        &mut self,
+        index: usize,
+        live: bool,
+        video: bool,
+    ) -> Result<(Arc<Vec<u8>>, usize, usize)> {
+        let (data, width, height, _) = self.numbered_frame(index, live, video)?;
         Ok((data, width, height))
     }
 
     /// [`Self::latest_frame`] with the stream's number for it.
     fn numbered_frame(
         &mut self,
+        index: usize,
         live: bool,
         video: bool,
     ) -> Result<(Arc<Vec<u8>>, usize, usize, u64)> {
-        if !self.frames.as_mut().is_some_and(FrameStream::running) {
-            self.frames = None;
+        self.stop_idle(index);
+        let recorded = &mut self.recorded[index];
+        recorded.last_asked = Instant::now();
+        if !recorded.frames.as_mut().is_some_and(FrameStream::running) {
+            recorded.frames = None;
             // A new stream numbers its frames from 1 again: nothing cached may match them.
-            self.last_frame = None;
-            self.frames = Some(FrameStream::start(self.node_id, self.virtual_size)?);
+            recorded.last_frame = None;
+            recorded.frames = Some(FrameStream::start(recorded.node_id, recorded.virtual_size)?);
         }
-        let frames = self.frames.as_ref().unwrap();
-        let before = frames.seq();
+        let before = self.recorded[index].frames.as_ref().unwrap().seq();
         if before == 0 {
-            self.nudge()?;
-            if !frames.wait_newer(0, FRAME_TIMEOUT) {
-                self.frames = None;
+            // A new reader: its own display's first frame.
+            self.nudge_on(index)?;
+            if !self.recorded[index]
+                .frames
+                .as_ref()
+                .unwrap()
+                .wait_newer(0, FRAME_TIMEOUT)
+            {
+                self.recorded[index].frames = None;
                 bail!("no frame from the screen stream in {FRAME_TIMEOUT:?}");
             }
         } else if live {
             self.nudge()?;
-            frames.wait_newer(before, LIVE_FRAME_WAIT);
-        } else if !video && !frames.wait_newer(before, FRESH_FRAME_WAIT) {
+            self.recorded[index]
+                .frames
+                .as_ref()
+                .unwrap()
+                .wait_newer(before, LIVE_FRAME_WAIT);
+        } else if !video
+            && !self.recorded[index]
+                .frames
+                .as_ref()
+                .unwrap()
+                .wait_newer(before, FRESH_FRAME_WAIT)
+        {
             self.nudge()?;
-            frames.wait_newer(before, FRESH_FRAME_WAIT);
+            self.recorded[index]
+                .frames
+                .as_ref()
+                .unwrap()
+                .wait_newer(before, FRESH_FRAME_WAIT);
         }
-        let frames = self.frames.as_ref().unwrap();
+        let recorded = &mut self.recorded[index];
+        let frames = recorded.frames.as_ref().unwrap();
         let (data, width, height, seq) = {
             let latest = frames.shared.0.lock().unwrap();
             if latest.data.is_empty() {
@@ -563,17 +802,16 @@ impl WaylandInput {
         if data.len() < width * height * 4 {
             bail!("short frame: {} bytes for {width}x{height}", data.len());
         }
-        self.frame_size = Some((width as u32, height as u32));
+        recorded.frame_size = Some((width as u32, height as u32));
         Ok((data, width, height, seq))
     }
 
     /// The pointer to (x, y) in `display`'s stream pixels.
     pub fn move_to(&mut self, display: &Display, x: f64, y: f64) -> Result<()> {
-        Self::check_display(Some(&display.info.id))?;
-        self.session.call::<_, _, ()>(
-            "NotifyPointerMotionAbsolute",
-            &(self.stream_path.as_str(), x, y),
-        )?;
+        let index = self.index_of(Some(&display.info.id))?;
+        let path = self.recorded[index].stream_path.clone();
+        self.session
+            .call::<_, _, ()>("NotifyPointerMotionAbsolute", &(path.as_str(), x, y))?;
         Ok(())
     }
 
@@ -831,9 +1069,142 @@ impl WaylandInput {
 
 impl Drop for WaylandInput {
     fn drop(&mut self) {
-        self.frames = None;
-        let _ = self.session.call::<_, _, ()>("Stop", &());
+        self.stop_session();
     }
+}
+
+type MonitorSpec = (String, String, String, String);
+type Mode = (String, i32, i32, f64, f64, Vec<f64>, HashMap<String, OwnedValue>);
+type PhysicalMonitor = (MonitorSpec, Vec<Mode>, HashMap<String, OwnedValue>);
+type LogicalMonitor = (i32, i32, f64, u32, bool, Vec<MonitorSpec>, HashMap<String, OwnedValue>);
+/// Mutter's `org.gnome.Mutter.DisplayConfig.GetCurrentState` answer.
+type CurrentState = (u32, Vec<PhysicalMonitor>, Vec<LogicalMonitor>, HashMap<String, OwnedValue>);
+
+/// The connected monitors, in the picker's order: one per logical monitor (mirrored monitors
+/// show one picture), by connector.
+fn monitors(conn: &Connection) -> Result<Vec<DisplayInfo>> {
+    let config = Proxy::new(conn, DC_BUS, "/org/gnome/Mutter/DisplayConfig", DC_BUS)?;
+    let state: CurrentState = config.call("GetCurrentState", &())?;
+    Ok(monitors_of(&state))
+}
+
+fn flag(value: Option<&OwnedValue>) -> bool {
+    value.and_then(|v| bool::try_from(v).ok()).unwrap_or(false)
+}
+
+/// The displays a DisplayConfig state describes: each logical monitor's first monitor, at the
+/// logical monitor's place, its current mode's pixels (turned with it) and scale.
+fn monitors_of(state: &CurrentState) -> Vec<DisplayInfo> {
+    let (_, physical, logical, _) = state;
+    let mut list: Vec<DisplayInfo> = logical
+        .iter()
+        .filter_map(|(x, y, scale, transform, primary, specs, _)| {
+            let spec = specs.first()?;
+            let (_, modes, properties) = physical.iter().find(|(s, _, _)| s.0 == spec.0)?;
+            let mode = modes
+                .iter()
+                .find(|mode| flag(mode.6.get("is-current")))
+                .or(modes.first())?;
+            let (mut width, mut height) = (mode.1.max(0) as u32, mode.2.max(0) as u32);
+            // 90° and 270°, flipped or not.
+            if transform % 2 == 1 {
+                std::mem::swap(&mut width, &mut height);
+            }
+            let name = properties
+                .get("display-name")
+                .and_then(|v| <&str>::try_from(v).ok())
+                .filter(|name| *name != VIRTUAL_VENDOR)
+                .unwrap_or_default()
+                .to_string();
+            Some(DisplayInfo {
+                id: spec.0.clone(),
+                name,
+                primary: *primary,
+                x: *x,
+                y: *y,
+                width,
+                height,
+                scale: *scale,
+            })
+        })
+        .collect();
+    rtx_screens::sort_displays(&mut list);
+    list
+}
+
+/// The primary monitor, else the first; a stand-in when DisplayConfig can't be read (the
+/// session still records the primary, as before #12).
+fn primary_of(monitors: &[DisplayInfo]) -> DisplayInfo {
+    monitors
+        .iter()
+        .find(|m| m.primary)
+        .or(monitors.first())
+        .cloned()
+        .unwrap_or(DisplayInfo {
+            id: "primary".into(),
+            name: String::new(),
+            primary: true,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            scale: 1.0,
+        })
+}
+
+/// The monitors a new session records: every one, the primary first.
+fn to_record(monitors: &[DisplayInfo]) -> Vec<DisplayInfo> {
+    let primary = primary_of(monitors);
+    let mut chosen = vec![primary.clone()];
+    chosen.extend(monitors.iter().filter(|m| m.id != primary.id).cloned());
+    chosen
+}
+
+/// Whether a connector is one of Mutter's virtual monitors (Link's own, when headless).
+fn is_virtual(connector: &str) -> bool {
+    connector.starts_with(VIRTUAL_CONNECTOR)
+}
+
+/// The number in a `Meta-n` connector, for Mutter's order of its virtual monitors.
+fn connector_number(connector: &str) -> u32 {
+    connector
+        .strip_prefix(VIRTUAL_CONNECTOR)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
+/// The physical monitors' connectors, sorted: what a new session would be made for.
+fn physical(monitors: &[DisplayInfo]) -> Vec<String> {
+    let mut connectors: Vec<String> = monitors
+        .iter()
+        .map(|m| m.id.clone())
+        .filter(|id| !is_virtual(id))
+        .collect();
+    connectors.sort();
+    connectors
+}
+
+/// Whether a MonitorsChanged noted at `noted` has settled by `now` (none came since for
+/// RESTART_SETTLE).
+fn settled(noted: Option<Instant>, now: Instant) -> bool {
+    noted.is_some_and(|at| now.saturating_duration_since(at) >= RESTART_SETTLE)
+}
+
+/// `count` virtual monitors, `Meta-0` (the primary) on, by creation order, side by side as Mutter
+/// lays them out (their places are read again once they exist).
+fn virtual_displays(count: u32) -> Vec<DisplayInfo> {
+    (1..=count.clamp(1, 4))
+        .map(|n| DisplayInfo {
+            id: format!("{VIRTUAL_CONNECTOR}{}", n - 1),
+            name: String::new(),
+            primary: n == 1,
+            x: (n as i32 - 1) * VIRTUAL_SIZE.0 as i32,
+            y: 0,
+            width: VIRTUAL_SIZE.0,
+            height: VIRTUAL_SIZE.1,
+            scale: 1.0,
+        })
+        .collect()
 }
 
 /// Mutter's answer to RecordMonitor when there is no monitor to record (none attached).
@@ -890,9 +1261,145 @@ fn frame_size_from_caps(text: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{die_with_parent, frame_size_from_caps, no_monitor, pipeline_args, FrameStream};
+    use super::{
+        connector_number, die_with_parent, frame_size_from_caps, monitors_of, no_monitor, physical,
+        pipeline_args, settled, to_record, virtual_displays, CurrentState, FrameStream,
+        RESTART_SETTLE,
+    };
+    use std::collections::HashMap;
     use std::process::Command;
     use std::time::{Duration, Instant};
+    use zbus::zvariant::{OwnedValue, Str};
+
+    /// GetCurrentState with these monitors: (connector, name, x, y, mode, scale, transform,
+    /// primary).
+    fn state(monitors: &[(&str, &str, i32, i32, (i32, i32), f64, u32, bool)]) -> CurrentState {
+        let spec = |c: &str| (c.to_string(), "GSM".to_string(), "LG".to_string(), "0x01".to_string());
+        let physical = monitors
+            .iter()
+            .map(|(connector, name, _, _, (w, h), _, _, _)| {
+                let current = HashMap::from([("is-current".to_string(), OwnedValue::from(true))]);
+                let other = HashMap::new();
+                (
+                    spec(connector),
+                    vec![
+                        ("1024x768".to_string(), 1024, 768, 60.0, 1.0, vec![1.0], other),
+                        (format!("{w}x{h}"), *w, *h, 60.0, 1.0, vec![1.0], current),
+                    ],
+                    HashMap::from([(
+                        "display-name".to_string(),
+                        OwnedValue::from(Str::from(name.to_string())),
+                    )]),
+                )
+            })
+            .collect();
+        let logical = monitors
+            .iter()
+            .map(|(connector, _, x, y, _, scale, transform, primary)| {
+                (*x, *y, *scale, *transform, *primary, vec![spec(connector)], HashMap::new())
+            })
+            .collect();
+        (1, physical, logical, HashMap::new())
+    }
+
+    #[test]
+    fn monitors_are_listed_from_display_config_left_to_right() {
+        let list = monitors_of(&state(&[
+            ("eDP-1", "Built-in display", 0, 0, (2880, 1800), 2.0, 0, true),
+            ("HDMI-1", "DELL U2720Q", -1080, -200, (1920, 1080), 1.0, 1, false),
+        ]));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "HDMI-1");
+        assert_eq!(list[0].name, "DELL U2720Q");
+        assert!(!list[0].primary);
+        // Turned 90°: its current mode's pixels, turned.
+        assert_eq!((list[0].x, list[0].y, list[0].width, list[0].height), (-1080, -200, 1080, 1920));
+        assert_eq!(list[1].id, "eDP-1");
+        assert!(list[1].primary);
+        assert_eq!((list[1].width, list[1].height, list[1].scale), (2880, 1800, 2.0));
+    }
+
+    #[test]
+    fn a_session_records_every_monitor_with_the_primary_first() {
+        let monitors = monitors_of(&state(&[
+            ("DP-1", "", -1920, 0, (1920, 1080), 1.0, 0, false),
+            ("eDP-1", "", 0, 0, (1920, 1200), 1.0, 0, true),
+            ("HDMI-1", "", 1920, 0, (1920, 1080), 1.0, 0, false),
+        ]));
+        let ids: Vec<String> = to_record(&monitors).into_iter().map(|d| d.id).collect();
+        assert_eq!(ids, ["eDP-1", "DP-1", "HDMI-1"]);
+    }
+
+    /// C-W1: only physical monitors coming or going start the session again; Link's own
+    /// virtual monitors (Meta-n) appearing and disappearing never do.
+    #[test]
+    fn only_physical_monitors_restart_the_session() {
+        let at_start = physical(&monitors_of(&state(&[])));
+        assert!(at_start.is_empty());
+        // Headless: Link's two virtual monitors show up, one at a time, then one goes.
+        for listed in [
+            vec![("Meta-0", "MetaVendor", 0, 0, (1920, 1080), 1.0, 0, true)],
+            vec![
+                ("Meta-0", "MetaVendor", 0, 0, (1920, 1080), 1.0, 0, true),
+                ("Meta-1", "MetaVendor", 1920, 0, (1920, 1080), 1.0, 0, false),
+            ],
+            vec![],
+        ] {
+            assert_eq!(physical(&monitors_of(&state(&listed))), at_start);
+        }
+        // A real monitor plugged in does.
+        let plugged = monitors_of(&state(&[
+            ("Meta-0", "MetaVendor", 0, 0, (1920, 1080), 1.0, 0, true),
+            ("HDMI-1", "LG", 1920, 0, (1920, 1080), 1.0, 0, false),
+        ]));
+        assert_eq!(physical(&plugged), ["HDMI-1"]);
+        // Order doesn't matter; a monitor that moved is the same set.
+        let a = monitors_of(&state(&[
+            ("eDP-1", "", 0, 0, (1920, 1200), 1.0, 0, true),
+            ("HDMI-1", "", 1920, 0, (1920, 1080), 1.0, 0, false),
+        ]));
+        let b = monitors_of(&state(&[
+            ("HDMI-1", "", -1920, 0, (1920, 1080), 1.0, 0, false),
+            ("eDP-1", "", 0, 0, (1920, 1200), 1.0, 0, true),
+        ]));
+        assert_eq!(physical(&a), physical(&b));
+        // Virtual monitors' vendor name is no name.
+        assert_eq!(plugged.iter().find(|m| m.id == "Meta-0").unwrap().name, "");
+    }
+
+    /// C-W1: a change waits RESTART_SETTLE without another before it counts.
+    #[test]
+    fn a_monitor_change_counts_once_it_settles() {
+        let now = Instant::now();
+        assert!(!settled(None, now));
+        assert!(!settled(Some(now), now));
+        assert!(!settled(Some(now - RESTART_SETTLE / 2), now));
+        assert!(settled(Some(now - RESTART_SETTLE), now));
+        // Mutter's own numbering orders its virtual monitors.
+        assert!(connector_number("Meta-2") < connector_number("Meta-10"));
+        assert_eq!(connector_number("HDMI-1"), u32::MAX);
+    }
+
+    #[test]
+    fn headless_records_virtual_monitors_side_by_side() {
+        let one = virtual_displays(1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, "Meta-0");
+        assert!(one[0].primary);
+        let three = virtual_displays(3);
+        let places: Vec<(String, i32, bool)> =
+            three.into_iter().map(|d| (d.id, d.x, d.primary)).collect();
+        assert_eq!(
+            places,
+            [
+                ("Meta-0".to_string(), 0, true),
+                ("Meta-1".to_string(), 1920, false),
+                ("Meta-2".to_string(), 3840, false)
+            ]
+        );
+        assert_eq!(virtual_displays(9).len(), 4);
+        assert_eq!(virtual_displays(0).len(), 1);
+    }
 
     /// A stand-in for gst-launch-1.0: `script` runs in sh with the FIFO as $1.
     fn writer(script: &'static str) -> impl FnOnce(&std::path::Path) -> Command {
