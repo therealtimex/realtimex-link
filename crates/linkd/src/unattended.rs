@@ -1,15 +1,20 @@
-//! Start with this computer (realtimex-link#10, realtimex-ai-app#2967): on Windows, Link's
-//! service (LocalSystem, installed by the installer) runs its owner's daemon from boot, so
-//! computers the owner allowed can connect at the sign-in and lock screens.
+//! Start with this computer (realtimex-link#10, #11, realtimex-ai-app#2967): Link's own service
+//! runs its owner's daemon from boot, so computers the owner allowed can connect at the sign-in
+//! and lock screens.
+//! - Windows: the service (LocalSystem, installed by the installer); the choice is
+//!   `unattended.json` in Link's ProgramData folder, which only SYSTEM and administrators may
+//!   write, changed through the service's pipe (the service checks the caller is an
+//!   administrator; no UAC prompt).
+//! - macOS: a root supervisor (launchd.rs) that runs the owner's daemon as the owner; the choice
+//!   is `unattended.json` in `/Library/Application Support/RealTimeX Link`, written only by the
+//!   root step an administrator approves at a prompt. The supervisor's socket answers status and
+//!   turns it off (no prompt).
 //!
-//! The machine's choice is `unattended.json` in Link's ProgramData folder, which only SYSTEM and
-//! administrators may write. The per-user daemon changes it through the service's pipe: the
-//! service checks that the caller is an administrator (no UAC prompt) and that the folder is the
-//! caller's own. `GET`/`POST /v1/unattended` answer the contract's body:
+//! `GET`/`POST /v1/unattended` answer the contract's body:
 //! `{supported, serviceInstalled, enabled, needsPermission, canChange, reason?, pending}`.
 
-// The service side (service.rs) uses most of this on Windows only.
-#![cfg_attr(not(windows), allow(dead_code))]
+// The service sides (service.rs, launchd.rs) use most of this on Windows and macOS only.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +26,10 @@ use crate::error::ApiError;
 /// The service's name in the Service Control Manager, and its pipe.
 pub const SERVICE_NAME: &str = "RealTimeX Link Service";
 pub const PIPE_NAME: &str = r"\\.\pipe\RealTimeX-Link-Service";
+/// macOS: the root folder, and the supervisor's socket (launchd makes it; only root can create
+/// anything in /var/run, so whatever answers there is the supervisor).
+pub const MACOS_MACHINE_DIR: &str = "/Library/Application Support/RealTimeX Link";
+pub const MACOS_SOCKET: &str = "/var/run/ai.realtimex.link.sock";
 /// The machine's choice, in [`machine_dir`].
 const CONFIG_FILE: &str = "unattended.json";
 
@@ -30,8 +39,13 @@ const CONFIG_FILE: &str = "unattended.json";
 pub struct Config {
     pub enabled: bool,
     /// The Windows SID of the user who turned it on.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_sid: String,
+    /// macOS: that user's uid and short name (the supervisor runs the daemon as them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner_name: String,
     /// That user's Link data folder.
     #[serde(default)]
     pub data_dir: PathBuf,
@@ -61,15 +75,44 @@ impl Config {
 }
 
 /// `%ProgramData%\RealTimeX Link`: the installer creates it, writable by SYSTEM and
-/// administrators only.
+/// administrators only. macOS: [`MACOS_MACHINE_DIR`], root's.
 pub fn machine_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return PathBuf::from(MACOS_MACHINE_DIR);
+    }
     let base = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
     PathBuf::from(base).join("RealTimeX Link")
 }
 
 /// Whether this data folder's owner turned it on (its login item stays while it is: SD §1).
+/// macOS reads the choice only from a root-owned folder and file that aren't links and that
+/// nobody else may write (#11 M8): anything else reads as off.
 pub fn enabled_for(data_dir: &Path) -> bool {
-    cfg!(windows) && Config::load(&machine_dir()).runs(data_dir)
+    if cfg!(windows) {
+        return Config::load(&machine_dir()).runs(data_dir);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let dir = machine_dir();
+        if root_only(&dir) && root_only(&dir.join(CONFIG_FILE)) {
+            return Config::load(&dir).runs(data_dir);
+        }
+    }
+    false
+}
+
+/// A path root may trust: no link, owned by root, and no group or other write.
+#[cfg(unix)]
+pub fn root_only(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        trusted_by_root(meta.file_type().is_symlink(), meta.uid(), meta.mode())
+    })
+}
+
+/// [`root_only`]'s rule on its own, for the tests.
+pub fn trusted_by_root(is_link: bool, uid: u32, mode: u32) -> bool {
+    !is_link && uid == 0 && mode & 0o022 == 0
 }
 
 /// One request to the service's pipe, a JSON line.
@@ -80,6 +123,9 @@ pub enum Request {
     Status { data_dir: PathBuf },
     Enable { data_dir: PathBuf },
     Disable { data_dir: PathBuf },
+    /// macOS: a session bridge's hello (launchd.rs), its bundle version and whether its session
+    /// has the console. The supervisor hands the connection to the owner's daemon.
+    Bridge { version: String, on_console: bool },
 }
 
 /// The service's answer, a JSON line. `code` is set when it refused.
@@ -110,6 +156,17 @@ pub const PROFILE_UNAVAILABLE: &str = "profile-unavailable";
 /// On, and the service is waiting for the owner's own daemon to let go of the folder (it was
 /// started while the service was stopped): that daemon steps aside (QA of !12).
 pub const OWNER_DAEMON_RUNNING: &str = "owner-daemon-running";
+/// macOS (#11 M6): the administrator cancelled the prompt; the prompt can't be shown here; the
+/// jobs were turned off in System Settings › Login Items, so launchd won't load them.
+pub const ADMIN_CANCELLED: &str = "admin-cancelled";
+pub const ADMIN_PROMPT_UNAVAILABLE: &str = "admin-prompt-unavailable";
+pub const LOGIN_ITEMS_DISABLED: &str = "login-items-disabled";
+/// macOS (#11 M5): the root copy and the owner's daemon are different versions for a moment
+/// (an update); the supervisor refreshes the copy.
+pub const UNATTENDED_UPDATING: &str = "unattended-updating";
+/// macOS (#11 M5): pasted files sit in the owner's own temporary folder, so only the owner's
+/// own session can take them.
+pub const FILES_NEED_OWNER_SESSION: &str = "files-need-owner-session";
 
 impl Reply {
     pub fn refused(code: &str, error: impl Into<String>) -> Reply {
@@ -128,8 +185,8 @@ impl Reply {
                 let message = self.error.unwrap_or_else(|| code.to_string());
                 let status = match code {
                     OS_ADMIN_REQUIRED => 403,
-                    STANDARD_ONLY => 409,
-                    SERVICE_MISSING => 503,
+                    STANDARD_ONLY | ADMIN_CANCELLED | LOGIN_ITEMS_DISABLED => 409,
+                    SERVICE_MISSING | ADMIN_PROMPT_UNAVAILABLE | UNATTENDED_UPDATING => 503,
                     _ => 500,
                 };
                 Err(ApiError::coded(status, code, message))
@@ -150,6 +207,16 @@ pub fn yields(reply: Option<&Reply>) -> bool {
     })
 }
 
+/// macOS (#11 M8): this daemon's administrator prompt is open.
+pub static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the per-user daemon tells the body when no supervisor answers: on macOS that only means
+/// off (nothing is installed until it is turned on; consult §2: anyone may ask an admin);
+/// on Windows, that the service is missing.
+pub fn no_service() -> Option<Reply> {
+    cfg!(target_os = "macos").then(|| Reply { can_change: true, ..Reply::default() })
+}
+
 /// GET /v1/unattended's body (contract §6). Off where it isn't supported.
 pub fn body(supported: bool, service: Option<&Reply>) -> Value {
     let installed = supported && service.is_some();
@@ -160,7 +227,7 @@ pub fn body(supported: bool, service: Option<&Reply>) -> Value {
         "enabled": installed && reply.enabled,
         "needsPermission": false,
         "canChange": installed && reply.can_change,
-        "pending": false,
+        "pending": supported && PENDING.load(std::sync::atomic::Ordering::Relaxed),
     });
     if installed && !reply.can_change {
         body["reason"] = json!(OS_ADMIN_REQUIRED);
@@ -191,13 +258,47 @@ pub fn ask(request: &Request) -> anyhow::Result<Option<Reply>> {
     Ok(Some(serde_json::from_str(answer.trim())?))
 }
 
-#[cfg(not(windows))]
+/// macOS: ask the supervisor on its socket. `Ok(None)`: it isn't there (off).
+#[cfg(target_os = "macos")]
+pub fn ask(request: &Request) -> anyhow::Result<Option<Reply>> {
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
+    let stream = match std::os::unix::net::UnixStream::connect(MACOS_SOCKET) {
+        Ok(stream) => stream,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let mut line = serde_json::to_string(request)?;
+    line.push('\n');
+    (&stream).write_all(line.as_bytes())?;
+    let mut answer = String::new();
+    BufReader::new(&stream).read_line(&mut answer)?;
+    if answer.trim().is_empty() {
+        // Closed with no answer: the supervisor refused this caller (M4).
+        anyhow::bail!("RealTimeX Link's service closed the connection");
+    }
+    Ok(Some(serde_json::from_str(answer.trim())?))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn ask(_request: &Request) -> anyhow::Result<Option<Reply>> {
     Ok(None)
 }
 
-/// Whether this build can start with the computer: Windows only for now (macOS is #11).
-pub const SUPPORTED: bool = cfg!(windows);
+/// Whether this build can start with the computer: Windows, and macOS when this bundle carries
+/// a Developer ID team signature (#11 M4, M8: an unsigned or ad-hoc build has no row).
+pub fn supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::launchd::sign::own_team().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        cfg!(windows)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -215,6 +316,7 @@ mod tests {
             enabled: true,
             owner_sid: "S-1-5-21-1-2-3-1001".into(),
             data_dir: PathBuf::from("/home/a/.config/realtimex-link"),
+            ..Config::default()
         };
         on.save(&dir).unwrap();
         assert_eq!(Config::load(&dir), on);
@@ -222,6 +324,50 @@ mod tests {
         assert!(!on.runs(Path::new("/home/b/.config/realtimex-link")));
         assert!(!Config { enabled: false, ..on }.runs(Path::new("/home/a/.config/realtimex-link")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_macos_choice_names_its_owner_and_a_windows_one_doesnt_change() {
+        let mac = Config {
+            enabled: true,
+            owner_uid: Some(501),
+            owner_name: "rta".into(),
+            data_dir: PathBuf::from("/Users/rta/Library/Application Support/RealTimeX Link"),
+            ..Config::default()
+        };
+        let text = serde_json::to_string(&mac).unwrap();
+        assert_eq!(
+            text,
+            r#"{"enabled":true,"ownerUid":501,"ownerName":"rta","dataDir":"/Users/rta/Library/Application Support/RealTimeX Link"}"#
+        );
+        assert_eq!(serde_json::from_str::<Config>(&text).unwrap(), mac);
+        let windows: Config =
+            serde_json::from_str(r#"{"enabled":true,"ownerSid":"S-1-5-21-1","dataDir":"C:/x"}"#).unwrap();
+        assert_eq!(windows.owner_uid, None);
+        assert_eq!(
+            serde_json::to_string(&windows).unwrap(),
+            r#"{"enabled":true,"ownerSid":"S-1-5-21-1","dataDir":"C:/x"}"#
+        );
+    }
+
+    #[test]
+    fn root_trusts_only_its_own_unwritable_files() {
+        assert!(trusted_by_root(false, 0, 0o100644));
+        assert!(trusted_by_root(false, 0, 0o40755));
+        // Owned by someone else, writable by a group or others, or a link: off.
+        assert!(!trusted_by_root(false, 501, 0o100644));
+        assert!(!trusted_by_root(false, 0, 0o100664));
+        assert!(!trusted_by_root(false, 0, 0o100646));
+        assert!(!trusted_by_root(true, 0, 0o120755));
+    }
+
+    #[test]
+    fn a_bridge_says_hello_with_its_version() {
+        let hello = Request::Bridge { version: "0.3.1".into(), on_console: true };
+        assert_eq!(
+            serde_json::to_string(&hello).unwrap(),
+            r#"{"op":"bridge","version":"0.3.1","onConsole":true}"#
+        );
     }
 
     #[test]
@@ -244,6 +390,9 @@ mod tests {
         assert_eq!(status(OS_ADMIN_REQUIRED), 403);
         assert_eq!(status(STANDARD_ONLY), 409);
         assert_eq!(status(SERVICE_MISSING), 503);
+        assert_eq!(status(ADMIN_CANCELLED), 409);
+        assert_eq!(status(ADMIN_PROMPT_UNAVAILABLE), 503);
+        assert_eq!(status(UNATTENDED_UPDATING), 503);
         assert_eq!(status("io"), 500);
         let error = Reply::refused(OS_ADMIN_REQUIRED, "an administrator of this computer")
             .into_result()

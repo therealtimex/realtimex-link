@@ -238,7 +238,7 @@ impl Tray {
                 );
                 drop(state);
                 (actions.copy)(text);
-                lock(&shared).notice = Some((t("tray.copied"), true, Instant::now()));
+                lock(&shared).notice = Some((t("tray.copied"), crate::theme::Tone::Success, Instant::now()));
             } else if id == toggle {
                 let on = lock(&shared)
                     .overview

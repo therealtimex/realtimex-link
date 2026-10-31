@@ -155,7 +155,7 @@ fn recorded_version(destination: &Path) -> Option<String> {
     }
 }
 
-fn plist_version(text: &str) -> Option<String> {
+pub(crate) fn plist_version(text: &str) -> Option<String> {
     let key = "<key>CFBundleShortVersionString</key>";
     let rest = &text[text.find(key)? + key.len()..];
     let start = rest.find("<string>")? + "<string>".len();

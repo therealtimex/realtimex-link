@@ -569,8 +569,14 @@ impl Backend {
         line.insert("op".into(), json!(op));
         if let Some(fields) = params.as_object() {
             for (key, value) in fields {
-                line.insert(key.clone(), value.clone());
+                if key != "via" {
+                    line.insert(key.clone(), value.clone());
+                }
             }
+        }
+        // macOS login window (#11 I4): the job posts this one; only the daemon says so (C4).
+        if crate::helper::input_via_job(op) {
+            line.insert("via".into(), json!("job"));
         }
         let mut text = Value::Object(line).to_string();
         text.push('\n');

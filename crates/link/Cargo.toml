@@ -40,6 +40,8 @@ raw-window-handle = "0.6.2"
 
 # macOS: in the Dock only while the window is open (dock.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
+# SIGTERM passed on to rtx-linkd under launchd (launchd.rs).
+libc.workspace = true
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "objc2-core-foundation"] }
 # The process name, which winit's app menu uses (dock.rs).

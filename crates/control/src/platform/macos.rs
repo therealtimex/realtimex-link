@@ -14,8 +14,35 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::codes::{Modifier, PhysicalKey};
+use crate::jobinput::{Event, MouseKind};
 use crate::keys::{from_keysym, Key};
 use crate::platform::{Button, ClipboardContent, PasteGap};
+
+/// The login-window job's input (realtimex-link#11, Addendum 5).
+#[path = "macos_job.rs"]
+pub mod job;
+/// The lock screen's picture (realtimex-link#11, Addendum 8).
+#[path = "macos_locked.rs"]
+mod locked;
+
+/// The main display, at most `max_width` wide: ScreenCaptureKit, or CGDisplayCreateImage while
+/// the session is locked (ScreenCaptureKit's picture is blank then; S2b).
+pub fn capture_display(max_width: u32) -> Result<super::Shot> {
+    if locked::screen_locked() {
+        locked::screenshot(max_width)
+    } else {
+        rtx_screens::capture_display(max_width)
+    }
+}
+
+/// A live-view frame, the same way.
+pub fn capture_display_frame(max_width: u32) -> Result<super::Frame> {
+    if locked::screen_locked() {
+        locked::frame(max_width)
+    } else {
+        rtx_screens::capture_display_frame(max_width)
+    }
+}
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
@@ -191,6 +218,8 @@ pub fn request_control_permission(name: &str) -> Result<()> {
 
 /// kCGEventSourceStatePrivate: a source with its own state, apart from the hardware's.
 const EVENT_SOURCE_STATE_PRIVATE: i32 = -1;
+/// kCGEventSourceStateHIDSystemState: the hardware's state.
+const EVENT_SOURCE_STATE_HID_SYSTEM: i32 = 1;
 const HID_EVENT_TAP: u32 = 0;
 const MOUSE_MOVED: u32 = 5;
 const SCROLL_UNITS_LINE: u32 = 1;
@@ -213,10 +242,116 @@ const FLAG_COMMAND: u64 = 0x0010_0000;
 const KEYCODE_V: u16 = 0x09;
 const KEYCODE_COMMAND: u16 = 0x37;
 
+/// How long one CG input call may take on the worker (realtimex-link#11 I1).
+const POST_LIMIT: Duration = Duration::from_secs(2);
+
+type Work = Box<dyn FnOnce() -> Result<()> + Send>;
+
+/// Run one CG input call on the worker: making the event, setting its fields and posting it,
+/// waiting at most [`POST_LIMIT`] (I1, Addendum 6). Under Secure Input (the login window)
+/// WindowServer may never answer, already when the event is made; the request then fails with
+/// `input-unavailable` instead of holding the loop.
+fn on_worker(work: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
+    use std::sync::mpsc;
+    use std::sync::{Mutex, OnceLock};
+    static WORKER: OnceLock<Mutex<mpsc::Sender<(Work, mpsc::SyncSender<Result<()>>)>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (send, receive) = mpsc::channel::<(Work, mpsc::SyncSender<Result<()>>)>();
+        std::thread::spawn(move || {
+            for (work, done) in receive {
+                let _ = done.send(work());
+            }
+        });
+        Mutex::new(send)
+    });
+    let (done, finished) = mpsc::sync_channel(1);
+    let sent = worker
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .send((Box::new(work), done));
+    match (sent, finished.recv_timeout(POST_LIMIT)) {
+        (Ok(()), Ok(result)) => result,
+        _ => Err(super::InputError {
+            code: "input-unavailable",
+            message: "Input isn't getting through on this screen".into(),
+        }
+        .into()),
+    }
+}
+
+/// How long one capture may take (realtimex-link#11 C5), and how soon after one that timed out
+/// the next is tried. 10 s, not 5: a cold first screenshot (window list, picture, text) took
+/// longer than 5 s on office-mac-mini-01, and ScreenCaptureKit's own calls already stop at 5 s
+/// each (rtx-screens' gate).
+const CAPTURE_LIMIT: Duration = Duration::from_secs(10);
+const CAPTURE_RETRY: Duration = Duration::from_secs(2);
+
+type CaptureWork = Box<dyn FnOnce() + Send>;
+
+/// Run one capture (a screenshot, a stream's start or frame) on the capture worker, waiting at
+/// most [`CAPTURE_LIMIT`] (C5, Addendum 8). At a locked screen a capture may not answer: the
+/// request then answers `capture-unavailable` and the helper stays (input still works there).
+/// Only one capture is in flight, so a stuck one leaves no thread per attempt behind, and after
+/// a timeout the next try waits [`CAPTURE_RETRY`].
+pub fn capture_bounded<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static WORKER: OnceLock<Mutex<mpsc::Sender<CaptureWork>>> = OnceLock::new();
+    static BUSY: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    static LAST_TIMEOUT: Mutex<Option<Instant>> = Mutex::new(None);
+    let unavailable = || -> anyhow::Error {
+        super::InputError {
+            code: "capture-unavailable",
+            message: "The screen can't be captured right now".into(),
+        }
+        .into()
+    };
+    if LAST_TIMEOUT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some_and(|at| at.elapsed() < CAPTURE_RETRY)
+    {
+        return Err(unavailable());
+    }
+    let busy = BUSY.get_or_init(|| Arc::new(AtomicBool::new(false))).clone();
+    if busy.swap(true, Ordering::SeqCst) {
+        return Err(unavailable());
+    }
+    let worker = WORKER.get_or_init(|| {
+        let (send, receive) = mpsc::channel::<CaptureWork>();
+        std::thread::spawn(move || {
+            for work in receive {
+                work();
+            }
+        });
+        Mutex::new(send)
+    });
+    let (done, answer) = mpsc::sync_channel(1);
+    let finished = busy.clone();
+    let job: CaptureWork = Box::new(move || {
+        let _ = done.send(work());
+        finished.store(false, Ordering::SeqCst);
+    });
+    if worker.lock().unwrap_or_else(|p| p.into_inner()).send(job).is_err() {
+        busy.store(false, Ordering::SeqCst);
+        return Err(unavailable());
+    }
+    match answer.recv_timeout(CAPTURE_LIMIT) {
+        Ok(result) => result,
+        Err(_) => {
+            *LAST_TIMEOUT.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+            Err(unavailable())
+        }
+    }
+}
+
+/// Post an event the worker just made, and release it. Only on the worker.
 fn post(event: CGEventRef) -> Result<()> {
     if event.is_null() {
         bail!("could not create the input event");
     }
+    // SAFETY: an event made for this post, released once posted.
     unsafe {
         CGEventPost(HID_EVENT_TAP, event);
         CFRelease(event);
@@ -368,6 +503,10 @@ pub struct Input {
     /// Physical modifier keys held (#2909): every posted key and mouse event carries their
     /// flags, so Shift+click and ⌘+click arrive as such.
     physical_modifiers: Vec<&'static PhysicalKey>,
+    /// This request goes to the login-window job, not CGEventPost (the daemon's `via:job`, C4).
+    via_job: bool,
+    /// The job was sent something: it releases everything when this session ends.
+    used_job: bool,
     last_click: Option<(Button, Instant)>,
     click_state: i64,
     /// The pasteboard's changeCount right after this helper's own last write: not a copy to
@@ -386,10 +525,14 @@ impl Input {
                  Security → Accessibility → turn on RealTimeX (or the terminal running it)"
             );
         }
-        let source = unsafe { CGEventSourceCreate(EVENT_SOURCE_STATE_PRIVATE) };
-        if source.is_null() {
-            bail!("could not create the input event source");
-        }
+        // At the login window (realtimex-link#11, as root under launchd) a private source can't
+        // be made: the HID system's state is used there, and with neither, events go without a
+        // source (CGEventCreate*Event takes NULL).
+        let source = [EVENT_SOURCE_STATE_PRIVATE, EVENT_SOURCE_STATE_HID_SYSTEM]
+            .into_iter()
+            .map(|state| unsafe { CGEventSourceCreate(state) })
+            .find(|source| !source.is_null())
+            .unwrap_or(std::ptr::null_mut());
         let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
         Ok(Self {
             source,
@@ -406,7 +549,25 @@ impl Input {
             restore: None,
             gap: PasteGap::default(),
             click_state: 1,
+            via_job: false,
+            used_job: false,
         })
+    }
+
+    /// Where the next input request posts: the login-window job (`via:job`) or CGEventPost.
+    pub fn route(&mut self, via_job: bool) {
+        self.via_job = via_job;
+        self.used_job |= via_job;
+    }
+
+    fn job_mouse(&self, kind: MouseKind, button: u32) -> Result<()> {
+        job::send(&[Event::Mouse {
+            x: self.position.x as i32,
+            y: self.position.y as i32,
+            kind,
+            button: button.min(2) as u8,
+            click_state: self.click_state.clamp(0, 3) as u8,
+        }])
     }
 
     /// The flags of every modifier held, by keysym or physically.
@@ -426,11 +587,11 @@ impl Input {
 
     /// Screenshots don't go through input on macOS (see `screenshot_needs_input`).
     pub fn screenshot(&mut self, max_width: u32, _live: bool) -> Result<crate::platform::Shot> {
-        super::capture_display(max_width)
+        capture_bounded(move || capture_display(max_width))
     }
 
     pub fn frame(&mut self, max_width: u32) -> Result<crate::platform::Frame> {
-        super::capture_display_frame(max_width)
+        capture_bounded(move || capture_display_frame(max_width))
     }
 
     pub fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
@@ -445,11 +606,19 @@ impl Input {
             [_, _, true] => (27, 2),
             _ => (MOUSE_MOVED, 0),
         };
-        let event = unsafe { CGEventCreateMouseEvent(self.source, kind, self.position, button) };
-        if !event.is_null() {
-            unsafe { CGEventSetFlags(event, self.flags()) };
+        if self.via_job {
+            let kind = if kind == MOUSE_MOVED { MouseKind::Move } else { MouseKind::Drag };
+            return self.job_mouse(kind, button);
         }
-        post(event)
+        let (source, position, flags) = (self.source as usize, self.position, self.flags());
+        on_worker(move || {
+            // SAFETY: the source lives as long as this Input; the event is posted and released.
+            let event = unsafe { CGEventCreateMouseEvent(source as CGEventSourceRef, kind, position, button) };
+            if !event.is_null() {
+                unsafe { CGEventSetFlags(event, flags) };
+            }
+            post(event)
+        })
     }
 
     pub fn button(&mut self, button: Button, pressed: bool) -> Result<()> {
@@ -469,21 +638,23 @@ impl Input {
             self.last_click = Some((button, now));
         }
         self.buttons_down[index as usize] = pressed;
-        let event = unsafe {
-            CGEventCreateMouseEvent(
-                self.source,
-                if pressed { down } else { up },
-                self.position,
-                index,
-            )
-        };
-        if !event.is_null() {
-            unsafe {
-                CGEventSetIntegerValueField(event, FIELD_CLICK_STATE, self.click_state);
-                CGEventSetFlags(event, self.flags());
-            }
+        if self.via_job {
+            return self.job_mouse(if pressed { MouseKind::Down } else { MouseKind::Up }, index);
         }
-        post(event)
+        let (source, position, flags, clicks) = (self.source as usize, self.position, self.flags(), self.click_state);
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe {
+                CGEventCreateMouseEvent(source as CGEventSourceRef, if pressed { down } else { up }, position, index)
+            };
+            if !event.is_null() {
+                unsafe {
+                    CGEventSetIntegerValueField(event, FIELD_CLICK_STATE, clicks);
+                    CGEventSetFlags(event, flags);
+                }
+            }
+            post(event)
+        })
     }
 
     pub fn keysym(&mut self, keysym: u32, pressed: bool) -> Result<()> {
@@ -502,29 +673,42 @@ impl Input {
         };
         // A shortcut keeps its flags as sent: ⌘ with 'C' is still ⌘C.
         let shortcut = self.flags() & (FLAG_COMMAND | FLAG_CONTROL) != 0;
-        let flags = self.flags() | if shift && !shortcut { FLAG_SHIFT } else { 0 };
-        let event = unsafe { CGEventCreateKeyboardEvent(self.source, code.unwrap_or(0), pressed) };
-        if event.is_null() {
-            bail!("could not create the key event");
-        }
-        unsafe {
-            match key {
-                // The exact character too, so typing doesn't depend on the keyboard layout.
-                Key::Char(c) if code.is_none() || !shortcut => {
-                    let mut units = [0u16; 2];
-                    let units = c.encode_utf16(&mut units);
-                    CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
-                }
-                Key::Char(_) => {}
-                _ if code.is_none() => {
-                    CFRelease(event);
-                    bail!("{key:?} has no macOS key");
-                }
-                _ => {}
+        if self.via_job {
+            let held = self.flags() as u32;
+            if key.is_modifier() {
+                return job::send(&[Event::Flags { code: code.unwrap_or(0), mask: held }]);
             }
-            CGEventSetFlags(event, flags);
+            let code = code.with_context(|| format!("{key:?} can't be typed at the login window"))?;
+            let character = match key {
+                Key::Char(c) => Some(c),
+                _ => None,
+            };
+            return job::send(&job::key_events(code, character, shift && !shortcut, held, pressed));
         }
-        post(event)
+        let flags = self.flags() | if shift && !shortcut { FLAG_SHIFT } else { 0 };
+        if code.is_none() && !matches!(key, Key::Char(_)) {
+            bail!("{key:?} has no macOS key");
+        }
+        let source = self.source as usize;
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe { CGEventCreateKeyboardEvent(source as CGEventSourceRef, code.unwrap_or(0), pressed) };
+            if event.is_null() {
+                bail!("could not create the key event");
+            }
+            unsafe {
+                // The exact character too, so typing doesn't depend on the keyboard layout.
+                if let Key::Char(c) = key {
+                    if code.is_none() || !shortcut {
+                        let mut units = [0u16; 2];
+                        let units = c.encode_utf16(&mut units);
+                        CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
+                    }
+                }
+                CGEventSetFlags(event, flags);
+            }
+            post(event)
+        })
     }
 
     /// A physical key by position (#2909). No Unicode string goes with it, so this Mac's own
@@ -536,25 +720,51 @@ impl Input {
                 self.physical_modifiers.push(key);
             }
         }
-        let event = unsafe { CGEventCreateKeyboardEvent(self.source, key.mac, pressed) };
-        if event.is_null() {
-            bail!("could not create the key event");
-        }
-        unsafe {
-            if repeat {
-                CGEventSetIntegerValueField(event, FIELD_KEYBOARD_AUTOREPEAT, 1);
+        if self.via_job {
+            let mask = self.flags() as u32;
+            if key.modifier.is_some() {
+                return job::send(&[Event::Flags { code: key.mac, mask }]);
             }
-            CGEventSetFlags(event, self.flags());
+            let char_code = job::special_char_code(key.mac);
+            return job::send(&[Event::Key {
+                code: key.mac,
+                char_code,
+                orig_char_code: char_code,
+                down: pressed,
+                flags: mask,
+            }]);
         }
-        post(event)
+        let (source, code, flags) = (self.source as usize, key.mac, self.flags());
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe { CGEventCreateKeyboardEvent(source as CGEventSourceRef, code, pressed) };
+            if event.is_null() {
+                bail!("could not create the key event");
+            }
+            unsafe {
+                if repeat {
+                    CGEventSetIntegerValueField(event, FIELD_KEYBOARD_AUTOREPEAT, 1);
+                }
+                CGEventSetFlags(event, flags);
+            }
+            post(event)
+        })
     }
 
     pub fn scroll(&mut self, dx: i32, dy: i32) -> Result<()> {
         // Positive requests scroll down/right; macOS wheel deltas point the other way.
-        let event = unsafe {
-            CGEventCreateScrollWheelEvent2(self.source, SCROLL_UNITS_LINE, 2, -dy, -dx, 0)
-        };
-        post(event)
+        if self.via_job {
+            let clamp = |delta: i32| (-delta).clamp(-100, 100) as i16;
+            return job::send(&[Event::Scroll { dy: clamp(dy), dx: clamp(dx) }]);
+        }
+        let source = self.source as usize;
+        on_worker(move || {
+            // SAFETY: as in move_to.
+            let event = unsafe {
+                CGEventCreateScrollWheelEvent2(source as CGEventSourceRef, SCROLL_UNITS_LINE, 2, -dy, -dx, 0)
+            };
+            post(event)
+        })
     }
 
     /// The pasteboard's change count, and whether its content is this helper's own write.
@@ -639,16 +849,16 @@ impl Input {
             (KEYCODE_V, false),
             (KEYCODE_COMMAND, false),
         ] {
-            let event = unsafe { CGEventCreateKeyboardEvent(self.source, code, down) };
-            if !event.is_null() {
-                let event_flags = if code == KEYCODE_COMMAND && !down {
-                    self.flags()
-                } else {
-                    flags
-                };
-                unsafe { CGEventSetFlags(event, event_flags) };
-            }
-            post(event)?;
+            let event_flags = if code == KEYCODE_COMMAND && !down { self.flags() } else { flags };
+            let source = self.source as usize;
+            on_worker(move || {
+                // SAFETY: as in move_to.
+                let event = unsafe { CGEventCreateKeyboardEvent(source as CGEventSourceRef, code, down) };
+                if !event.is_null() {
+                    unsafe { CGEventSetFlags(event, event_flags) };
+                }
+                post(event)
+            })?;
         }
         self.gap.pasted();
         Ok(())
@@ -815,11 +1025,17 @@ impl Drop for Input {
     /// The session ends: the last paste's previous text still comes back, once the app had its
     /// time to read the paste.
     fn drop(&mut self) {
+        // The job lets go of everything this session held there (I6).
+        if self.used_job {
+            let _ = job::send(&[Event::Release]);
+        }
         if let Some(due) = self.restore_due() {
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
             self.restore_clipboard();
         }
-        unsafe { CFRelease(self.source) };
+        if !self.source.is_null() {
+            unsafe { CFRelease(self.source) };
+        }
     }
 }
 

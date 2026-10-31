@@ -98,7 +98,12 @@ mod tests {
     }
 }
 
-pub use rtx_screens::{capture_display, capture_display_frame, init_window_server, Frame, Shot};
+#[cfg(not(target_os = "macos"))]
+pub use rtx_screens::{capture_display, capture_display_frame};
+pub use rtx_screens::{init_window_server, Frame, Shot};
+// macOS: the lock screen's own picture while it shows (realtimex-link#11).
+#[cfg(target_os = "macos")]
+pub use macos::{capture_display, capture_display_frame};
 // Numbers live-view frames (#2683): the Wayland capture here, and peer.rs's tests.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use rtx_screens::next_frame_seq;
@@ -112,9 +117,15 @@ pub const INPUT_AVAILABLE: bool = cfg!(any(target_os = "macos", windows, target_
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    control_permissions, permission_owner, request_control_permission, screenshot_needs_input,
-    Input,
+    capture_bounded, control_permissions, permission_owner, request_control_permission,
+    screenshot_needs_input, Input,
 };
+
+/// macOS, under Link's supervisor (realtimex-link#11): the login-window job's channel.
+#[cfg(target_os = "macos")]
+pub fn macos_job_channel(fd: i32) {
+    macos::job::set_channel(fd);
+}
 
 #[cfg(windows)]
 mod windows;

@@ -2,7 +2,8 @@
 //! Windows service (realtimex-link#10) the daemon runs as SYSTEM in session 0, which has no
 //! screen: the helper runs as SYSTEM in the active console session instead (the sign-in screen,
 //! the lock screen, or the signed-in person's desktop), with its JSON lines over pipes, and is
-//! ended when another session takes the console.
+//! ended when another session takes the console. Under Link's macOS supervisor (#11) it runs in
+//! the console's session through that session's bridge (bridges.rs), the same way.
 
 use std::path::Path;
 
@@ -24,6 +25,8 @@ pub enum Child {
     Local(tokio::process::Child),
     #[cfg(windows)]
     Session(session::Process),
+    #[cfg(target_os = "macos")]
+    Bridge(crate::bridges::InSession),
 }
 
 impl Child {
@@ -34,6 +37,8 @@ impl Child {
             }
             #[cfg(windows)]
             Child::Session(process) => process.kill(),
+            #[cfg(target_os = "macos")]
+            Child::Bridge(helper) => helper.kill(),
         }
     }
 
@@ -43,6 +48,9 @@ impl Child {
             Child::Local(child) => child.wait().await.ok().and_then(|status| status.code()),
             #[cfg(windows)]
             Child::Session(process) => process.wait().await,
+            // Its exit code stays in its session; its lines ending is what counts.
+            #[cfg(target_os = "macos")]
+            Child::Bridge(_) => None,
         }
     }
 }
@@ -55,6 +63,10 @@ pub async fn spawn(
     #[cfg(windows)]
     if crate::service::active() {
         return session::spawn(binary).await;
+    }
+    #[cfg(target_os = "macos")]
+    if crate::service::supervised() {
+        return crate::bridges::spawn().await;
     }
     let _ = binary;
     let mut child = local()?;
@@ -71,15 +83,34 @@ pub async fn spawn(
     })
 }
 
-/// The session that has the console now (Windows; None elsewhere or with no console).
+/// The session that has the console now (Windows; macOS under the supervisor, its bridge;
+/// None elsewhere or with no console).
 pub fn console_session() -> Option<u32> {
     #[cfg(windows)]
     {
         let session = unsafe { crate::service::win::WTSGetActiveConsoleSessionId() };
         (session != crate::service::win::NO_SESSION).then_some(session)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::bridges::console_session()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     None
+}
+
+/// Whether an input request goes to the login-window job, not rtx-control's CGEventPost
+/// (#11 I4). Only the daemon decides it (C4).
+pub fn input_via_job(op: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::service::supervised() && crate::bridges::via_job(op)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = op;
+        false
+    }
 }
 
 #[cfg(windows)]

@@ -14,6 +14,20 @@ use serde_json::Value;
 
 use crate::i18n::{t, tf};
 
+/// How long any call to rtx-linkd may take.
+const TIMEOUT: Duration = Duration::from_secs(8);
+/// How long turning Start with this computer on may take: macOS asks for an administrator's
+/// password first, and the person may take minutes (contract: the RealTimeX surface waits ten).
+pub const ADMIN_PROMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
+
 const PROTOCOL: u64 = 1;
 /// rtx-linkd's local_api::HELLO_CONTEXT.
 const HELLO_CONTEXT: &str = "linkd-hello";
@@ -102,6 +116,8 @@ pub struct Api {
 #[derive(Debug)]
 pub struct Refused {
     pub status: u16,
+    /// The answer's `code`, when it has one (`admin-cancelled`, `login-items-disabled`…).
+    pub code: Option<String>,
     pub message: String,
 }
 
@@ -126,11 +142,7 @@ impl Api {
             .get("port")
             .and_then(Value::as_u64)
             .ok_or_else(|| anyhow!("not running"))?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(8)))
-            .build()
-            .into();
+        let agent = agent(TIMEOUT);
         let port = u16::try_from(port).map_err(|_| anyhow!("not running"))?;
         let base = format!("http://127.0.0.1:{port}");
         verify_daemon(&agent, &base, port, &token)?;
@@ -208,6 +220,7 @@ impl Api {
                 .map_or_else(|| t("errors.requestFailed"), str::to_string);
             return Err(Refused {
                 status: status.as_u16(),
+                code: body.get("code").and_then(Value::as_str).map(str::to_string),
                 message,
             }
             .into());
@@ -228,6 +241,20 @@ impl Api {
         Self::answer(
             self.agent
                 .post(format!("{}{path}", self.base))
+                .header("Authorization", format!("Bearer {}", self.token))
+                .send_json(&body),
+        )
+    }
+
+    /// A POST that may take up to `timeout`, longer than every other call: one that waits for a
+    /// person (the administrator prompt). Polling and the rest keep the short timeout.
+    pub fn post_waiting(&self, path: &str, body: Value, timeout: Duration) -> Result<Value> {
+        Self::answer(
+            self.agent
+                .post(format!("{}{path}", self.base))
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
                 .header("Authorization", format!("Bearer {}", self.token))
                 .send_json(&body),
         )
@@ -281,6 +308,75 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    /// A one-request server that answers after `delay` with `status` and `body`.
+    fn slow_server(delay: Duration, status: u16, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // The whole request: closing with some of it unread resets the connection, and
+                // the client would see that instead of the answer.
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+                            })
+                            .unwrap_or(0usize);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                std::thread::sleep(delay);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn api(base: String, timeout: Duration) -> Api {
+        Api { base, token: "t".into(), agent: agent(timeout), version: String::new() }
+    }
+
+    /// Review of !13: an answer later than the usual deadline (the person at the macOS password
+    /// prompt) still arrives through post_waiting, success and cancel alike.
+    #[test]
+    fn turning_on_waits_past_the_usual_deadline_for_the_answer() {
+        let short = Duration::from_millis(300);
+        let slow = Duration::from_millis(900);
+        // The usual call gives up first: that is what the window used to do.
+        let base = slow_server(slow, 200, r#"{"enabled":true}"#);
+        assert!(api(base, short).post("/v1/unattended", serde_json::json!({ "enabled": true })).is_err());
+        // The waiting call gets the success…
+        let base = slow_server(slow, 200, r#"{"enabled":true}"#);
+        let answer = api(base, short)
+            .post_waiting("/v1/unattended", serde_json::json!({ "enabled": true }), Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(answer["enabled"], true);
+        // …and the cancel, with its code.
+        let base = slow_server(slow, 409, r#"{"code":"admin-cancelled","error":"cancelled"}"#);
+        let error = api(base, short)
+            .post_waiting("/v1/unattended", serde_json::json!({ "enabled": true }), Duration::from_secs(5))
+            .unwrap_err();
+        let refused = error.downcast_ref::<Refused>().unwrap();
+        assert_eq!((refused.status, refused.code.as_deref()), (409, Some("admin-cancelled")));
+    }
 
     #[test]
     fn only_the_tokens_holder_proves_itself() {

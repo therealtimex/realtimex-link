@@ -243,7 +243,7 @@ async fn version(State(state): State<Shared>) -> Json<Value> {
 /// for it. RealTimeX shows its setting only when this is listed, and never requires it.
 fn features() -> Vec<&'static str> {
     let mut features = FEATURES.to_vec();
-    if crate::unattended::SUPPORTED {
+    if crate::unattended::supported() {
         features.push("unattended");
     }
     features
@@ -722,14 +722,14 @@ async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Ans
 /// serviceInstalled, enabled, needsPermission, canChange, reason?, pending}`, asked of the
 /// service, which decides whether the caller may change it.
 async fn unattended(State(_state): State<Shared>) -> Answer {
-    use crate::unattended::{body, Request, SUPPORTED};
+    use crate::unattended::{body, Request};
     // Only this computer's own Link can start with it (SD C5): another instance (a development
     // RealTimeX's) has no row, as with starting at login (Product/UX review of !12).
-    if !SUPPORTED || !crate::paths::is_standard() {
+    if !crate::unattended::supported() || !crate::paths::is_standard() {
         return Ok(Json(body(false, None)));
     }
     let data_dir = crate::paths::data_dir().unwrap_or_default();
-    let reply = ask_service(Request::Status { data_dir }).await?;
+    let reply = ask_service(Request::Status { data_dir }).await?.or_else(crate::unattended::no_service);
     Ok(Json(body(true, reply.as_ref())))
 }
 
@@ -739,12 +739,12 @@ async fn unattended(State(_state): State<Shared>) -> Answer {
 /// and the owner's own daemon starts again at the next window, tray or RealTimeX start.
 /// 403 os-admin-required, 409 unattended-standard-only, 503 service-missing.
 async fn set_unattended(State(state): State<Shared>, Body64(body): Body64) -> Answer {
-    use crate::unattended::{Request, SERVICE_MISSING, STANDARD_ONLY, SUPPORTED};
+    use crate::unattended::{Request, SERVICE_MISSING, STANDARD_ONLY};
     let on = body
         .get("enabled")
         .and_then(Value::as_bool)
         .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
-    if !SUPPORTED {
+    if !crate::unattended::supported() {
         return Err(ApiError::coded(
             404,
             "unsupported",
@@ -759,6 +759,18 @@ async fn set_unattended(State(state): State<Shared>, Body64(body): Body64) -> An
         ));
     }
     let data_dir = crate::paths::data_dir().unwrap_or_default();
+    // macOS (#11 M6): on is one administrator prompt and the root step, not a socket request.
+    #[cfg(target_os = "macos")]
+    if on {
+        let reply = enable_on_macos(&state, data_dir).await?;
+        state.host.follow_hosting_at_login_now();
+        let shutdown = state.shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            shutdown.notify_one();
+        });
+        return Ok(Json(crate::unattended::body(true, Some(&reply))));
+    }
     let request = if on {
         Request::Enable { data_dir }
     } else {
@@ -766,6 +778,8 @@ async fn set_unattended(State(state): State<Shared>, Body64(body): Body64) -> An
     };
     let reply = ask_service(request)
         .await?
+        // macOS: no supervisor means it is off already.
+        .or_else(|| if on { None } else { crate::unattended::no_service() })
         .ok_or_else(|| {
             ApiError::coded(
                 503,
@@ -784,6 +798,57 @@ async fn set_unattended(State(state): State<Shared>, Body64(body): Body64) -> An
         });
     }
     Ok(Json(crate::unattended::body(true, Some(&reply))))
+}
+
+/// macOS (#11 M6 *On*): checked as this user (the installed, signed Link; this daemon holds its
+/// standard folder), then Link.app's own executable asks for an administrator
+/// (`rtx-link --authorize-unattended`, so the prompt names RealTimeX Link and speaks Link's
+/// language) and runs this bundle's `rtx-linkd unattended-apply` as root. `pending` is true
+/// while the prompt is open.
+#[cfg(target_os = "macos")]
+async fn enable_on_macos(state: &Shared, data_dir: std::path::PathBuf) -> Result<crate::unattended::Reply, ApiError> {
+    use std::sync::atomic::Ordering;
+    use crate::unattended::{Reply, ADMIN_PROMPT_UNAVAILABLE, PENDING, STANDARD_ONLY};
+    let exe = std::env::current_exe().map_err(ApiError::internal)?;
+    if !exe.starts_with("/Applications/RealTimeX Link.app") {
+        return Err(ApiError::coded(
+            409,
+            STANDARD_ONLY,
+            "Only RealTimeX Link installed in Applications can start with this computer",
+        ));
+    }
+    let Some(link) = crate::autostart::app_binary() else {
+        return Err(ApiError::coded(503, ADMIN_PROMPT_UNAVAILABLE, "RealTimeX Link's app isn't next to rtx-linkd"));
+    };
+    if PENDING.swap(true, Ordering::SeqCst) {
+        return Err(ApiError::coded(409, "pending", "The administrator prompt is already open"));
+    }
+    // SAFETY: a plain getter.
+    let uid = unsafe { libc::getuid() };
+    let language = state.host.language();
+    let output = crate::util::tokio_command(&link)
+        .arg("--authorize-unattended")
+        .args(["--owner-uid", &uid.to_string()])
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["--language", &language])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    PENDING.store(false, Ordering::SeqCst);
+    let output = output.map_err(|error| ApiError::coded(503, ADMIN_PROMPT_UNAVAILABLE, error.to_string()))?;
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .unwrap_or_default();
+    if line.get("ok") == Some(&Value::Bool(true)) {
+        return Ok(Reply { enabled: true, can_change: true, ..Reply::default() });
+    }
+    let message = line.get("error").and_then(Value::as_str).unwrap_or("The root step failed").to_string();
+    let code = line.get("code").and_then(Value::as_str).unwrap_or("io").to_string();
+    Err(Reply::refused(&code, message).into_result().unwrap_err())
 }
 
 /// The service's answer, or None when it isn't there.

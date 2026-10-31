@@ -213,7 +213,7 @@ impl Controller {
         let shot = if platform::screenshot_needs_input() {
             self.input()?.screenshot(max_width, live)?
         } else {
-            platform::capture_display(max_width)?
+            capture(max_width)?
         };
         // A live view's smaller frames say their own size with each click (`space`).
         if !live {
@@ -243,6 +243,13 @@ impl Controller {
         if !self.window_server && !matches!(op, "permissions" | "status") {
             platform::init_window_server();
             self.window_server = true;
+        }
+        // macOS login window (realtimex-link#11 I4, C4): the daemon alone marks a request for
+        // the job; every input request says where it goes, so none falls back by accident.
+        #[cfg(target_os = "macos")]
+        if matches!(op, "move" | "button" | "keysym" | "key" | "scroll") {
+            let via_job = request["via"].as_str() == Some("job");
+            self.input()?.route(via_job);
         }
         match op {
             "start" => {
@@ -719,6 +726,30 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// A screenshot of the display: on macOS within C5's limit (realtimex-link#11).
+fn capture(max_width: u32) -> Result<platform::Shot> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::capture_bounded(move || platform::capture_display(max_width))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        platform::capture_display(max_width)
+    }
+}
+
+/// A live-view frame: on macOS within C5's limit too.
+fn capture_frame(max_width: u32) -> Result<platform::Frame> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::capture_bounded(move || platform::capture_display_frame(max_width))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        platform::capture_display_frame(max_width)
+    }
+}
+
 fn response(id: Value, result: Result<Value>) -> Value {
     match result {
         Ok(Value::Object(mut fields)) => {
@@ -747,7 +778,7 @@ impl Controller {
                 let frame = if platform::screenshot_needs_input() {
                     self.input().and_then(|input| input.frame(max_width))
                 } else {
-                    platform::capture_display_frame(max_width)
+                    capture_frame(max_width)
                 };
                 let _ = reply.send(peer::SessionIn::Frame(frame));
             }

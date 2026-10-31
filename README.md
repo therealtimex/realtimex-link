@@ -25,6 +25,12 @@ control other computers from.
   skipped. A view's held keys are released when it closes, loses control, sends a batch that fails
   or is refused, or sends nothing for 30 s; macOS and Windows post the viewer's repeats, X11 and
   Wayland repeat on their own. The HTTP `actions` endpoint takes `keys` combos only.
+  **Start with this computer on macOS** (0.4.0, realtimex-link#11): one administrator's prompt
+  installs a root LaunchDaemon that runs its owner's daemon from boot, and a session agent at the
+  login window and in each user's session, so allowed computers connect at the login window and
+  the lock screen and can sign in there. Turning it off needs no prompt. Background items show
+  under RealTimeX.AI when the main app is installed; with it off in Login Items, turning on is
+  refused and nothing is left installed.
   **Start with this computer** (0.3.0, realtimex-link#10, Windows): Link's service (`rtx-linkd
   --service`, LocalSystem, installed by the installer) runs its owner's daemon from boot while
   `POST /v1/unattended {enabled:true}` is on, so allowed computers connect at the sign-in and lock

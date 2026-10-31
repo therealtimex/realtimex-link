@@ -22,8 +22,12 @@ pub const OPT_OUT_KEY: &str = "autostart-off";
 /// The login item's name: the Run value (Windows), the entry's Name (Linux).
 #[cfg(not(target_os = "macos"))]
 const NAME: &str = "RealTimeX Link";
+/// macOS keeps a login item's parent from its first registration, so the label from before
+/// #11 stays under the team's name: a new label registers under RealTimeX.AI (M7).
 #[cfg(target_os = "macos")]
-const LABEL: &str = "ai.realtimex.link";
+const LABEL: &str = "ai.realtimex.link.agent";
+#[cfg(target_os = "macos")]
+const OLD_LABEL: &str = "ai.realtimex.link";
 
 /// rtx-link installed next to this daemon (the same folder, or the .app's Contents/MacOS).
 pub fn app_binary() -> Option<PathBuf> {
@@ -37,10 +41,11 @@ pub fn app_binary() -> Option<PathBuf> {
     app.is_file().then_some(app)
 }
 
-/// Whether the login item is there and starts this installation's rtx-link.
+/// Whether the login item is there, starts this installation's rtx-link and is in today's form
+/// (macOS: it names RealTimeX.AI, #11 M7; an older one is rewritten once).
 pub fn enabled() -> bool {
     match (app_binary(), platform::current()) {
-        (Some(app), Some(current)) => current == command_line(&app),
+        (Some(app), Some(current)) => current == command_line(&app) && platform::current_form(),
         _ => false,
     }
 }
@@ -143,14 +148,49 @@ pub fn desktop_exec(app: &Path, args: &str) -> String {
     quoted + "\"" + args
 }
 
+/// macOS shows a login item by the app its `AssociatedBundleIdentifiers` names: RealTimeX.AI
+/// when it is installed, else the program's own name (the Human's decision, #11 M7). The key
+/// goes after `ProgramArguments`, so [`launch_agent_program`] still reads the program first.
+#[cfg(any(target_os = "macos", test))]
+pub const ASSOCIATED_APP: &str = "co.realtimex.ai";
+
+/// The program a LaunchAgent starts: the first `<string>` after the first `<array>`.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_program(text: &str) -> Option<String> {
+    let start = text.find("<array>")? + "<array>".len();
+    let rest = &text[start..];
+    let first = rest.find("<string>")? + "<string>".len();
+    let end = rest[first..].find("</string>")? + first;
+    Some(
+        rest[first..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Whether a LaunchAgent names RealTimeX.AI as its app.
+#[cfg(any(target_os = "macos", test))]
+fn names_realtimex(text: &str) -> bool {
+    text.find("<key>AssociatedBundleIdentifiers</key>").is_some_and(|at| {
+        text[at..]
+            .split_once("<string>")
+            .is_some_and(|(_, rest)| rest.starts_with(&format!("{ASSOCIATED_APP}</string>")))
+    })
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
 
-    fn plist() -> PathBuf {
+    fn plist_named(label: &str) -> PathBuf {
         PathBuf::from(crate::paths::home_dir())
             .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"))
+            .join(format!("{label}.plist"))
+    }
+
+    fn plist() -> PathBuf {
+        plist_named(LABEL)
     }
 
     fn escape(text: &str) -> String {
@@ -159,19 +199,17 @@ mod platform {
             .replace('>', "&gt;")
     }
 
-    /// The program path in the LaunchAgent, when there is one.
+    /// The program path in the LaunchAgent (or the one from before #11), when there is one.
     pub fn current() -> Option<String> {
-        let text = std::fs::read_to_string(plist()).ok()?;
-        let start = text.find("<array>")? + "<array>".len();
-        let rest = &text[start..];
-        let first = rest.find("<string>")? + "<string>".len();
-        let end = rest[first..].find("</string>")? + first;
-        Some(
-            rest[first..end]
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&amp;", "&"),
-        )
+        [plist(), plist_named(OLD_LABEL)]
+            .iter()
+            .find_map(|path| super::launch_agent_program(&std::fs::read_to_string(path).ok()?))
+    }
+
+    /// Whether the LaunchAgent is today's, naming RealTimeX.AI as its app (#11 M7).
+    pub fn current_form() -> bool {
+        std::fs::read_to_string(plist()).is_ok_and(|text| super::names_realtimex(&text))
+            && !plist_named(OLD_LABEL).exists()
     }
 
     pub fn write(program: &str, _app: &Path) -> Result<()> {
@@ -189,6 +227,8 @@ mod platform {
     <string>{}</string>
     <string>--background</string>
   </array>
+  <key>AssociatedBundleIdentifiers</key>
+  <string>{ASSOCIATED_APP}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>LimitLoadToSessionType</key>
@@ -198,10 +238,13 @@ mod platform {
 "#,
             escape(program)
         );
-        std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))
+        std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
+        // The tray this session started keeps running; the next login starts it from the new item.
+        super::remove_file(&plist_named(OLD_LABEL))
     }
 
     pub fn remove() -> Result<()> {
+        super::remove_file(&plist_named(OLD_LABEL))?;
         super::remove_file(&plist())
     }
 }
@@ -218,6 +261,11 @@ mod platform {
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// The Run value has one form.
+    pub fn current_form() -> bool {
+        true
     }
 
     /// The Run value's command line, when there is one.
@@ -303,6 +351,11 @@ mod platform {
         config.join("autostart/realtimex-link.desktop")
     }
 
+    /// The entry has one form.
+    pub fn current_form() -> bool {
+        true
+    }
+
     /// The entry's Exec line, when there is one.
     pub fn current() -> Option<String> {
         let text = std::fs::read_to_string(desktop_file()).ok()?;
@@ -378,6 +431,31 @@ mod tests {
         set_opted_out(&store, false).unwrap();
         assert!(!opted_out(&store));
         assert_eq!(store.get(OPT_OUT_KEY), None);
+    }
+
+    #[test]
+    fn a_launch_agent_names_realtimex_after_its_program() {
+        let today = r#"<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/RealTimeX Link.app/Contents/MacOS/rtx-link</string>
+    <string>--background</string>
+  </array>
+  <key>AssociatedBundleIdentifiers</key>
+  <string>co.realtimex.ai</string>
+</dict>"#;
+        assert_eq!(
+            launch_agent_program(today).as_deref(),
+            Some("/Applications/RealTimeX Link.app/Contents/MacOS/rtx-link")
+        );
+        assert!(names_realtimex(today));
+        // An item from before #11: not in today's form, so follow() rewrites it once.
+        let older = today.replace("<key>AssociatedBundleIdentifiers</key>\n  <string>co.realtimex.ai</string>\n", "");
+        assert!(!names_realtimex(&older));
+        assert_eq!(launch_agent_program(&older), launch_agent_program(today));
+        assert!(!names_realtimex(&today.replace("co.realtimex.ai", "com.example.other")));
+        // The present-but-not-ours case: rewritten (Change::Add), never removed.
+        assert_eq!(change(true, false, true, true, false), Change::Add);
     }
 
     #[test]
