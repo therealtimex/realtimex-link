@@ -37,7 +37,7 @@ use objc2_vision::{
 };
 
 use crate::gate::{Busy, Cancelled, Completion, Gate, OpStats, TimedOut};
-use crate::Shot;
+use crate::{DisplayInfo, DisplayNotFound, Shot};
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
@@ -567,30 +567,172 @@ pub fn capture_window(id: u32, max_width: u32) -> Result<Shot> {
 /// Screenshot the main display (what a presenting user most often shares), at most `max_width`
 /// pixels wide.
 pub fn capture_display(max_width: u32) -> Result<Shot> {
-    let filter = main_display_filter()?;
+    capture_display_on(None, max_width)
+}
+
+/// Screenshot `display` (an id from [`displays`]; None: the main display), at most `max_width`
+/// pixels wide. A display that isn't attached is [`DisplayNotFound`], never another one.
+pub fn capture_display_on(display: Option<&str>, max_width: u32) -> Result<Shot> {
+    let (filter, _) = display_filter(display_number(display)?)?;
     shoot(&filter, max_width, "the display", "display".into())
 }
 
-/// The main display, else the first one.
-pub(crate) fn main_display_filter() -> Result<Retained<SCContentFilter>> {
-    let displays = recent_content()?.1;
-    let main = CGMainDisplayID();
-    let display = displays
-        .iter()
-        .find(|d| unsafe { d.displayID() } == main)
-        .or(displays.first())
-        .ok_or_else(|| anyhow!("no display to screenshot"))?;
-    Ok(unsafe {
+/// A display id as CoreGraphics numbers it; anything else names no display here.
+pub(crate) fn display_number(display: Option<&str>) -> Result<Option<u32>> {
+    match display {
+        None => Ok(None),
+        Some(id) => match id.parse::<u32>() {
+            Ok(number) => Ok(Some(number)),
+            Err(_) => Err(DisplayNotFound(id.to_string()).into()),
+        },
+    }
+}
+
+/// The filter of `display` and its id: the one named, or for None the main display, else the
+/// first one. A named display missing from a recent list is looked for in a fresh one before it
+/// counts as gone (it may have just been attached).
+pub(crate) fn display_filter(display: Option<u32>) -> Result<(Retained<SCContentFilter>, u32)> {
+    let displays = match display {
+        Some(id) if !has_display(&recent_content()?.1, id) => shareable_content()?.1,
+        _ => recent_content()?.1,
+    };
+    let found = match display {
+        Some(id) => displays
+            .iter()
+            .find(|d| unsafe { d.displayID() } == id)
+            .ok_or_else(|| anyhow::Error::from(DisplayNotFound(id.to_string())))?,
+        None => {
+            let main = CGMainDisplayID();
+            displays
+                .iter()
+                .find(|d| unsafe { d.displayID() } == main)
+                .or(displays.first())
+                .ok_or_else(|| anyhow!("no display to screenshot"))?
+        }
+    };
+    let filter = unsafe {
         SCContentFilter::initWithDisplay_excludingWindows(
             SCContentFilter::alloc(),
-            display,
+            found,
             &NSArray::new(),
         )
-    })
+    };
+    Ok((filter, unsafe { found.displayID() }))
+}
+
+fn has_display(displays: &[Retained<SCDisplay>], id: u32) -> bool {
+    displays.iter().any(|d| unsafe { d.displayID() } == id)
 }
 
 /// The same picture as [`capture_display`], as a live-view video frame: from one continuous
 /// stream, not a screenshot per frame (#2683).
 pub fn capture_display_frame(max_width: u32) -> Result<crate::Frame> {
-    crate::macos_stream::display_frame(max_width)
+    capture_display_frame_on(None, max_width)
+}
+
+/// The same picture as [`capture_display_on`], as a live-view video frame.
+pub fn capture_display_frame_on(display: Option<&str>, max_width: u32) -> Result<crate::Frame> {
+    crate::macos_stream::display_frame(display_number(display)?, max_width)
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGDisplayMirrorsDisplay(display: u32) -> u32;
+    fn CGDisplayCopyDisplayMode(display: u32) -> *const std::ffi::c_void;
+    fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
+    fn CGDisplayModeRelease(mode: *const std::ffi::c_void);
+}
+
+/// The displays that show something of their own (a mirror's copy is left out), in the picker's
+/// order. CoreGraphics only, so no ScreenCaptureKit request (and its one-at-a-time gate) is
+/// taken: it works at the lock screen and the login window too (realtimex-link#12).
+pub fn displays() -> Result<Vec<DisplayInfo>> {
+    let mut ids = [0u32; 32];
+    let mut count = 0u32;
+    // SAFETY: the buffer holds `ids.len()` ids and CoreGraphics writes at most that many.
+    let error = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if error != 0 {
+        bail!("cannot list the displays (CoreGraphics error {error})");
+    }
+    let main = CGMainDisplayID();
+    let names = screen_names();
+    let mut list: Vec<DisplayInfo> = ids[..count.min(ids.len() as u32) as usize]
+        .iter()
+        .copied()
+        // A display in a mirror set other than its main one shows the same picture.
+        .filter(|&id| unsafe { CGDisplayMirrorsDisplay(id) } == 0)
+        .map(|id| {
+            // SAFETY: plain getters; the mode is released here.
+            let bounds = unsafe { CGDisplayBounds(id) };
+            let (mut width, mut height) = (bounds.size.width, bounds.size.height);
+            unsafe {
+                let mode = CGDisplayCopyDisplayMode(id);
+                if !mode.is_null() {
+                    let (w, h) = (CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode));
+                    if w > 0 && h > 0 {
+                        (width, height) = (w as f64, h as f64);
+                    }
+                    CGDisplayModeRelease(mode);
+                }
+            }
+            DisplayInfo {
+                id: id.to_string(),
+                name: names.get(&id).cloned().unwrap_or_default(),
+                primary: id == main,
+                x: bounds.origin.x.round() as i32,
+                y: bounds.origin.y.round() as i32,
+                width: width as u32,
+                height: height as u32,
+                scale: if bounds.size.width > 0.0 {
+                    width / bounds.size.width
+                } else {
+                    1.0
+                },
+            }
+        })
+        .collect();
+    crate::sort_displays(&mut list);
+    Ok(list)
+}
+
+/// AppKit's names of the displays (`NSScreen.localizedName`) by display id; empty where AppKit
+/// has no screens (no window server connection yet, the login window).
+fn screen_names() -> std::collections::HashMap<u32, String> {
+    use objc2::runtime::Bool;
+    use objc2::sel;
+    let mut names = std::collections::HashMap::new();
+    let Some(class) = AnyClass::get(c"NSScreen") else {
+        return names;
+    };
+    let key = NSString::from_str("NSScreenNumber");
+    // SAFETY: NSScreen's documented class and instance methods, on objects AppKit returns.
+    unsafe {
+        let screens: *mut NSArray<AnyObject> = msg_send![class, screens];
+        let Some(screens) = screens.as_ref() else {
+            return names;
+        };
+        for screen in screens.iter() {
+            let description: *mut AnyObject = msg_send![&*screen, deviceDescription];
+            if description.is_null() {
+                continue;
+            }
+            let number: *mut AnyObject = msg_send![description, objectForKey: &*key];
+            if number.is_null() {
+                continue;
+            }
+            let id: u32 = msg_send![number, unsignedIntValue];
+            let named: Bool = msg_send![&*screen, respondsToSelector: sel!(localizedName)];
+            if !named.as_bool() {
+                continue;
+            }
+            let name: *mut NSString = msg_send![&*screen, localizedName];
+            if let Some(name) = name.as_ref() {
+                names.insert(id, name.to_string());
+            }
+        }
+    }
+    names
 }

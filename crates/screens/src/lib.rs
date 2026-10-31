@@ -3,12 +3,14 @@
 //! uses the clipboard, and this package's dependencies must not either (RealTimeX's no-keyboard
 //! check scans this package with the recorder).
 
+pub mod display;
 pub mod image;
 pub mod text;
 pub mod window;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+pub use display::{find_display, sort_displays, DisplayInfo, DisplayNotFound};
 pub use window::WindowInfo;
 
 /// One window screenshot, ready to keep or drop.
@@ -81,7 +83,10 @@ mod win_dupl;
 pub mod x11;
 
 #[cfg(target_os = "macos")]
-pub use macos::{capture_display, capture_display_frame, init_window_server};
+pub use macos::{
+    capture_display, capture_display_frame, capture_display_frame_on, capture_display_on,
+    displays, init_window_server,
+};
 
 /// A native capture request this process gave up on that has not answered for so long that it
 /// never will, and how long it has been outstanding. While there is one, this process's
@@ -96,7 +101,10 @@ pub fn stalled_request() -> Option<(&'static str, std::time::Duration)> {
 }
 
 #[cfg(target_os = "linux")]
-pub use x11::{capture_display, capture_display_frame};
+pub use x11::{
+    capture_display, capture_display_frame, capture_display_frame_on, capture_display_on,
+    displays,
+};
 
 /// Physical-pixel coordinates on Windows; nothing to prepare on Linux.
 #[cfg(not(target_os = "macos"))]
@@ -106,7 +114,10 @@ pub fn init_window_server() {
 }
 
 #[cfg(windows)]
-pub use win::{capture_display, capture_display_frame};
+pub use win::{
+    capture_display, capture_display_frame, capture_display_frame_on, capture_display_on,
+    displays,
+};
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub fn capture_display(_max_width: u32) -> anyhow::Result<Shot> {
@@ -116,4 +127,20 @@ pub fn capture_display(_max_width: u32) -> anyhow::Result<Shot> {
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub fn capture_display_frame(_max_width: u32) -> anyhow::Result<Frame> {
     anyhow::bail!("display screenshots are not supported on this platform yet")
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn capture_display_on(_display: Option<&str>, max_width: u32) -> anyhow::Result<Shot> {
+    capture_display(max_width)
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn capture_display_frame_on(_display: Option<&str>, max_width: u32) -> anyhow::Result<Frame> {
+    capture_display_frame(max_width)
+}
+
+/// No display list on other platforms: callers treat that as the primary alone.
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn displays() -> anyhow::Result<Vec<DisplayInfo>> {
+    Ok(Vec::new())
 }
