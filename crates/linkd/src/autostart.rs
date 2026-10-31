@@ -22,8 +22,12 @@ pub const OPT_OUT_KEY: &str = "autostart-off";
 /// The login item's name: the Run value (Windows), the entry's Name (Linux).
 #[cfg(not(target_os = "macos"))]
 const NAME: &str = "RealTimeX Link";
+/// macOS keeps a login item's parent from its first registration, so the label from before
+/// #11 stays under the team's name: a new label registers under RealTimeX.AI (M7).
 #[cfg(target_os = "macos")]
-const LABEL: &str = "ai.realtimex.link";
+const LABEL: &str = "ai.realtimex.link.agent";
+#[cfg(target_os = "macos")]
+const OLD_LABEL: &str = "ai.realtimex.link";
 
 /// rtx-link installed next to this daemon (the same folder, or the .app's Contents/MacOS).
 pub fn app_binary() -> Option<PathBuf> {
@@ -179,10 +183,14 @@ fn names_realtimex(text: &str) -> bool {
 mod platform {
     use super::*;
 
-    fn plist() -> PathBuf {
+    fn plist_named(label: &str) -> PathBuf {
         PathBuf::from(crate::paths::home_dir())
             .join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"))
+            .join(format!("{label}.plist"))
+    }
+
+    fn plist() -> PathBuf {
+        plist_named(LABEL)
     }
 
     fn escape(text: &str) -> String {
@@ -191,14 +199,17 @@ mod platform {
             .replace('>', "&gt;")
     }
 
-    /// The program path in the LaunchAgent, when there is one.
+    /// The program path in the LaunchAgent (or the one from before #11), when there is one.
     pub fn current() -> Option<String> {
-        super::launch_agent_program(&std::fs::read_to_string(plist()).ok()?)
+        [plist(), plist_named(OLD_LABEL)]
+            .iter()
+            .find_map(|path| super::launch_agent_program(&std::fs::read_to_string(path).ok()?))
     }
 
-    /// Whether the LaunchAgent names RealTimeX.AI as its app (#11 M7).
+    /// Whether the LaunchAgent is today's, naming RealTimeX.AI as its app (#11 M7).
     pub fn current_form() -> bool {
         std::fs::read_to_string(plist()).is_ok_and(|text| super::names_realtimex(&text))
+            && !plist_named(OLD_LABEL).exists()
     }
 
     pub fn write(program: &str, _app: &Path) -> Result<()> {
@@ -227,10 +238,13 @@ mod platform {
 "#,
             escape(program)
         );
-        std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))
+        std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
+        // The tray this session started keeps running; the next login starts it from the new item.
+        super::remove_file(&plist_named(OLD_LABEL))
     }
 
     pub fn remove() -> Result<()> {
+        super::remove_file(&plist_named(OLD_LABEL))?;
         super::remove_file(&plist())
     }
 }

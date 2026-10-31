@@ -119,14 +119,30 @@ pub fn apply(args: &[String]) -> Result<()> {
     // 5–6. Load them: the supervisor now, the session job in every GUI session there is (the
     //      login window loads it the next time it shows).
     if !os::launchctl(&["bootstrap", "system", SERVICE_PLIST]) {
-        bail!(crate::unattended::LOGIN_ITEMS_DISABLED);
+        return refused_by_login_items();
     }
+    let mut owner_loaded = true;
     for user in os::gui_users() {
         let domain = format!("gui/{user}");
         let _ = os::launchctl(&["bootout", &format!("{domain}/{SESSION_LABEL}")]);
-        let _ = os::launchctl(&["bootstrap", &domain, SESSION_PLIST]);
+        let loaded = os::launchctl(&["bootstrap", &domain, SESSION_PLIST]);
+        if user == uid {
+            owner_loaded = loaded;
+        }
+    }
+    // With RealTimeX.AI off in Login Items, macOS 15 still loads the system job for root but
+    // refuses the session job: the owner's own session would then have no input or picture.
+    if !owner_loaded {
+        return refused_by_login_items();
     }
     Ok(())
+}
+
+/// Login Items refused a job: undo everything, so nothing claims to be on.
+fn refused_by_login_items() -> Result<()> {
+    write_off()?;
+    remove_everything();
+    bail!(crate::unattended::LOGIN_ITEMS_DISABLED);
 }
 
 /// Every folder from the home down to `folder` belongs to `uid` (or root, for /Users) and none
