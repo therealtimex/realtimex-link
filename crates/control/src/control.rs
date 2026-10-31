@@ -41,8 +41,10 @@
 //! ```text
 //! {"id":null,"event":"peer_state","session":1,"state":"connected"|"closed"}
 //! {"id":null,"event":"peer_message","session":1,"data":"…"}   (text from the DataChannel)
-//! {"id":null,"event":"peer_display_lost","session":1,"display":"<id>"}   (its display went away;
-//!     the view keeps its last picture until rtx-linkd sends `peer_display`)
+//! {"id":null,"event":"peer_display_lost","session":1,"display":"<id>","reason":"display_removed"}
+//!     (its display went away, or "display_unavailable": it can't be captured now, and it is
+//!     unlisted until the state changes; the view keeps its last picture until rtx-linkd sends
+//!     `peer_display`)
 //! ```
 //!
 //! Errors answer `{"id":..,"ok":false,"error":"…"}`, with a `"code"` when the server can say
@@ -98,6 +100,8 @@ struct Controller {
     shot_sizes: HashMap<Option<String>, (u32, u32)>,
     /// The displays and where the pointer reaches each (realtimex-link#12).
     displays: displays::Table,
+    /// Displays that can't be captured in the current state, left out of the list.
+    unavailable: displays::Unavailable,
     /// Keys and buttons pressed and not yet released. They are released when the session ends
     /// (stop, an error that drops it, or stdin closing), so a dropped controller can't leave
     /// Ctrl or a mouse button held down on the desktop.
@@ -232,12 +236,30 @@ impl Controller {
         };
         // The picker's order (realtimex-ai-app#2970), whoever listed them.
         list.sort_by_key(|display| (display.info.x, display.info.y));
-        Ok(list)
+        // Only what can be captured now (design risk 2).
+        Ok(self.unavailable.filter(list, platform::capture_state()))
+    }
+
+    /// Note a capture that failed because its display can't be captured now: it leaves the
+    /// list until the state changes, and the table is read again.
+    fn note_capture<T>(&mut self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            if let Some(id) = displays::unavailable(error) {
+                self.unavailable.note(id, platform::capture_state());
+                self.displays.clear();
+            }
+        }
+        result
     }
 
     /// The display `id` names (None: the primary), from the table while it is fresh, else
-    /// read again.
+    /// read again. GNOME Wayland's come from its session each time: which stream is the primary
+    /// is the session's to say, for capture and the pointer alike (review of !15, finding 1).
     fn display(&mut self, id: Option<&str>) -> Result<Display> {
+        if platform::screenshot_needs_input() {
+            let list = self.input()?.current()?;
+            return displays::find(&list, id).cloned();
+        }
         if let Some(found) = self.displays.cached(id) {
             return Ok(found.clone());
         }
@@ -255,11 +277,13 @@ impl Controller {
         live: bool,
         display: Option<&str>,
     ) -> Result<platform::Shot> {
+        injected_unavailable(display)?;
         let shot = if platform::screenshot_needs_input() {
-            self.input()?.screenshot(max_width, live, display)?
+            self.input()?.screenshot(max_width, live, display)
         } else {
-            capture(max_width, display)?
+            capture(max_width, display)
         };
+        let shot = self.note_capture(shot)?;
         // A live view's smaller frames say their own size with each click (`space`).
         if !live {
             self.shot_sizes
@@ -624,6 +648,18 @@ fn press_key(
     }
 }
 
+/// For QA (realtimex-link#12): with `RTX_CONTROL_TEST_UNAVAILABLE=<display id>`, capturing that
+/// display fails as unavailable, as a locked Mac's second display may. Release builds too; only
+/// a tester sets it, and it only fails this process's own captures.
+fn injected_unavailable(display: Option<&str>) -> Result<()> {
+    match (display, std::env::var("RTX_CONTROL_TEST_UNAVAILABLE")) {
+        (Some(id), Ok(injected)) if id == injected => {
+            Err(displays::DisplayUnavailable(id.to_string()).into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The display a request names (`"display":"<id>"`); None for the primary.
 fn display_of(request: &Value) -> Option<&str> {
     request["display"].as_str().filter(|id| !id.is_empty())
@@ -734,6 +770,7 @@ pub fn run() -> Result<()> {
         input: None,
         shot_sizes: HashMap::new(),
         displays: displays::Table::default(),
+        unavailable: displays::Unavailable::default(),
         held_keys: BTreeSet::new(),
         held_buttons: Vec::new(),
         held_codes: Vec::new(),
@@ -818,7 +855,7 @@ pub fn run() -> Result<()> {
         let id = request["id"].clone();
         let op = request["op"].as_str().unwrap_or("");
         let result = controller.handle(&request);
-        let ends_session = result.as_ref().is_err_and(|error| !displays::not_found(error));
+        let ends_session = result.as_ref().is_err_and(|error| !displays::lost(error));
         if ends_session
             && !matches!(
                 op,
@@ -890,7 +927,10 @@ fn error_code(error: &anyhow::Error) -> Option<&'static str> {
     if let Some(input) = error.downcast_ref::<platform::InputError>() {
         return Some(input.code);
     }
-    displays::not_found(error).then_some("display-not-found")
+    if displays::not_found(error) {
+        return Some("display-not-found");
+    }
+    displays::unavailable(error).map(|_| "display-unavailable")
 }
 
 impl Controller {
@@ -903,16 +943,23 @@ impl Controller {
                 reply,
             } => {
                 let display = display.as_deref();
-                let frame = if platform::screenshot_needs_input() {
-                    self.input().and_then(|input| input.frame(max_width, display))
-                } else {
-                    capture_frame(max_width, display)
-                };
+                let frame = injected_unavailable(display).and_then(|()| {
+                    if platform::screenshot_needs_input() {
+                        self.input().and_then(|input| input.frame(max_width, display))
+                    } else {
+                        capture_frame(max_width, display)
+                    }
+                });
+                let frame = self.note_capture(frame);
                 let _ = reply.send(peer::SessionIn::Frame(frame));
             }
-            ToMain::DisplayLost { session, display } => write_line(
+            ToMain::DisplayLost {
+                session,
+                display,
+                reason,
+            } => write_line(
                 out,
-                &json!({ "id": null, "event": "peer_display_lost", "session": session, "display": display }),
+                &json!({ "id": null, "event": "peer_display_lost", "session": session, "display": display, "reason": reason }),
             ),
             ToMain::Message { session, text } => write_line(
                 out,

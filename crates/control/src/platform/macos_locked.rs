@@ -78,6 +78,11 @@ fn display_bgra<T>(display: Option<&str>, with: impl FnOnce(&Bgra) -> Result<T>)
     unsafe {
         let image = CGDisplayCreateImage(id);
         if image.is_null() {
+            // Another display than the main one: unavailable in this state, so its viewer falls
+            // back to the main display (realtimex-link#12, design risk 2).
+            if id != CGMainDisplayID() {
+                return Err(rtx_screens::DisplayUnavailable(id.to_string()).into());
+            }
             bail!("the display can't be captured");
         }
         let (width, height, stride) = (CGImageGetWidth(image), CGImageGetHeight(image), CGImageGetBytesPerRow(image));

@@ -128,9 +128,15 @@ pub const INPUT_AVAILABLE: bool = cfg!(any(target_os = "macos", windows, target_
 
 #[cfg(target_os = "macos")]
 mod macos;
+/// One capture state where nothing depends on it (realtimex-link#12).
+#[cfg(not(target_os = "macos"))]
+pub fn capture_state() -> u64 {
+    0
+}
+
 #[cfg(target_os = "macos")]
 pub use macos::{
-    capture_bounded, control_permissions, permission_owner, request_control_permission,
+    capture_bounded, capture_state, control_permissions, permission_owner, request_control_permission,
     screenshot_needs_input, Input,
 };
 

@@ -62,9 +62,15 @@ pub enum ToMain {
         display: Option<String>,
         reply: Sender<SessionIn>,
     },
-    /// The display this view shows went away (realtimex-link#12): said once, until it is given
-    /// another. The view keeps its last picture meanwhile; rtx-linkd picks the next display.
-    DisplayLost { session: u64, display: String },
+    /// The display this view shows went away, or can't be captured now (realtimex-link#12):
+    /// said once, until it is given another, with why (`display_removed`,
+    /// `display_unavailable`). The view keeps its last picture meanwhile; rtx-linkd picks the
+    /// next display.
+    DisplayLost {
+        session: u64,
+        display: String,
+        reason: &'static str,
+    },
     /// Text from the viewer's DataChannel, for the server.
     Message { session: u64, text: String },
     /// `connected`, or `closed` (the session is over).
@@ -340,12 +346,13 @@ impl Session {
                         }
                         // The screen may be locked; try again at the next interval.
                         Err(error) => {
-                            if let Some(display) =
+                            if let Some((display, reason)) =
                                 lost_display(&self.options.display, &mut self.display_lost, &error)
                             {
                                 let _ = self.to_main.send(ToMain::DisplayLost {
                                     session: self.id,
                                     display,
+                                    reason,
                                 });
                             } else if !self.display_lost {
                                 eprintln!("[peer {}] no frame: {error:#}", self.id);
@@ -542,19 +549,25 @@ impl Session {
     }
 }
 
-/// The display to report gone, when a frame failed because `display` (the one this view shows)
-/// isn't attached and that wasn't said yet: once, so a view isn't flooded at its frame rate.
+/// The display to report gone and why, when a frame failed because `display` (the one this view
+/// shows) isn't attached or can't be captured now, and that wasn't said yet: once, so a view
+/// isn't flooded at its frame rate.
 fn lost_display(
     display: &Option<String>,
     reported: &mut bool,
     error: &anyhow::Error,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     let display = display.as_ref()?;
-    if *reported || !crate::displays::not_found(error) {
+    if *reported || !crate::displays::lost(error) {
         return None;
     }
     *reported = true;
-    Some(display.clone())
+    let reason = if crate::displays::unavailable(error).is_some() {
+        "display_unavailable"
+    } else {
+        "display_removed"
+    };
+    Some((display.clone(), reason))
 }
 
 /// `frame` is the picture last encoded: numbered, the same number and the same size. A different
@@ -1085,8 +1098,18 @@ mod tests {
         let gone = || anyhow::Error::from(crate::displays::DisplayNotFound("2".into()));
         let shown = Some("2".to_string());
         let mut reported = false;
-        assert_eq!(lost_display(&shown, &mut reported, &gone()), Some("2".into()));
+        assert_eq!(
+            lost_display(&shown, &mut reported, &gone()),
+            Some(("2".into(), "display_removed"))
+        );
         assert_eq!(lost_display(&shown, &mut reported, &gone()), None);
+        // Attached but not capturable now (an injected failure): its own reason.
+        let unavailable =
+            anyhow::Error::from(crate::displays::DisplayUnavailable("2".into())).context("frame");
+        assert_eq!(
+            lost_display(&shown, &mut false, &unavailable),
+            Some(("2".into(), "display_unavailable"))
+        );
         // Another failure (a locked screen) is not a lost display.
         let mut reported = false;
         assert_eq!(lost_display(&shown, &mut reported, &anyhow!("locked")), None);

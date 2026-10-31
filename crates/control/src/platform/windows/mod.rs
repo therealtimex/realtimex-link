@@ -121,6 +121,11 @@ impl Input {
         Some(self.screen)
     }
 
+    /// The displays as they are now; only GNOME Wayland's differ from `displays` (its session's).
+    pub fn current(&mut self) -> Result<Vec<crate::displays::Display>> {
+        self.displays()
+    }
+
     /// The displays come from the platform's list, not through input (only GNOME Wayland's do).
     pub fn displays(&mut self) -> Result<Vec<crate::displays::Display>> {
         crate::platform::displays()

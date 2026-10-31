@@ -10,7 +10,7 @@ pub mod window;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-pub use display::{find_display, sort_displays, DisplayInfo, DisplayNotFound};
+pub use display::{find_display, sort_displays, DisplayInfo, DisplayNotFound, DisplayUnavailable};
 pub use window::WindowInfo;
 
 /// One window screenshot, ready to keep or drop.

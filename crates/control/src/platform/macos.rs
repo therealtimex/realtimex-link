@@ -186,6 +186,13 @@ fn app_name(path: &str) -> Option<String> {
         })
 }
 
+/// What a display's capture depends on (realtimex-link#12): 1 while the session is locked
+/// (CGDisplayCreateImage), else 0. A display that can't be captured is unlisted until it
+/// changes.
+pub fn capture_state() -> u64 {
+    u64::from(locked::screen_locked())
+}
+
 /// macOS screenshots need Screen Recording only, not the input session.
 pub fn screenshot_needs_input() -> bool {
     false
@@ -604,6 +611,11 @@ impl Input {
     /// The main display in points; screenshot pixels are scaled onto it.
     pub fn screen_size(&self) -> Option<(f64, f64)> {
         Some((self.bounds.size.width, self.bounds.size.height))
+    }
+
+    /// The displays as they are now; only GNOME Wayland's differ from `displays` (its session's).
+    pub fn current(&mut self) -> Result<Vec<crate::displays::Display>> {
+        self.displays()
     }
 
     /// The displays come from the platform's list, not through input (only GNOME Wayland's do).

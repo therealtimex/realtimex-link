@@ -144,6 +144,8 @@ pub struct WaylandInput {
     /// monitors changed (written by the MonitorsChanged watch).
     connectors: Vec<String>,
     monitors_changed: Arc<Mutex<Option<Instant>>>,
+    /// When the monitors' places and primary flag were last read (DisplayConfig).
+    placed_at: Option<Instant>,
     /// What the clipboard serves, per MIME type, as last announced.
     clipboard_data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     clipboard_enabled: bool,
@@ -477,6 +479,7 @@ impl WaylandInput {
             headless,
             connectors: physical(&monitors),
             monitors_changed: Arc::new(Mutex::new(None)),
+            placed_at: Some(Instant::now()),
             clipboard_data: Arc::new(Mutex::new(HashMap::new())),
             clipboard_enabled: false,
             selection: Arc::new(Mutex::new(Selection::default())),
@@ -553,13 +556,40 @@ impl WaylandInput {
         }
     }
 
-    /// The listed places of the monitors, which may move without a new session.
+    /// The listed places of the monitors and which one is the primary, which may change
+    /// without a new session.
     fn replace_monitors(&mut self, now: &[DisplayInfo]) {
-        for recorded in self.recorded.iter_mut().filter(|r| r.virtual_size.is_none()) {
-            if let Some(place) = now.iter().find(|m| m.id == recorded.info.id) {
-                recorded.info = place.clone();
+        replace_places(
+            self.recorded
+                .iter_mut()
+                .filter(|r| r.virtual_size.is_none())
+                .map(|r| &mut r.info),
+            now,
+        );
+    }
+
+    /// Read the monitors again when the last read is 2 s old (or `now`), after a new session if
+    /// the monitors changed. Capture and the pointer both
+    /// resolve "the primary" from what this leaves (review of !15, finding 1).
+    fn refresh(&mut self, now: bool) -> Result<()> {
+        self.restart_if_due()?;
+        let stale = self
+            .placed_at
+            .is_none_or(|at| at.elapsed() >= crate::displays::REFRESH);
+        if !self.headless && (now || stale) {
+            let conn = self.session.connection().clone();
+            if let Ok(listed) = monitors(&conn) {
+                self.replace_monitors(&listed);
             }
+            self.placed_at = Some(Instant::now());
         }
+        Ok(())
+    }
+
+    /// The displays as this session resolves them now, for capture and the pointer.
+    pub fn current(&mut self) -> Result<Vec<Display>> {
+        self.refresh(false)?;
+        Ok(self.listed())
     }
 
     /// The primary display's frame pixels; known after the first screenshot.
@@ -574,13 +604,7 @@ impl WaylandInput {
     /// pointer takes. When the connected monitors are not the ones this session was made for
     /// (one plugged in or out), the session starts again with the new set first.
     pub fn displays(&mut self) -> Result<Vec<Display>> {
-        self.restart_if_due()?;
-        if !self.headless {
-            let conn = self.session.connection().clone();
-            if let Ok(now) = monitors(&conn) {
-                self.replace_monitors(&now);
-            }
-        }
+        self.refresh(true)?;
         Ok(self.listed())
     }
 
@@ -623,17 +647,13 @@ impl WaylandInput {
         let _ = self.session.call::<_, _, ()>("Stop", &());
     }
 
-    /// The recorded display `display` names (None: the primary), in a new session first when
-    /// the monitors changed.
+    /// The recorded display `display` names (None: the current primary, as `current` says),
+    /// in a new session first when the monitors changed.
     fn index_of(&mut self, display: Option<&str>) -> Result<usize> {
-        self.restart_if_due()?;
-        let Some(id) = display else {
-            return Ok(0);
-        };
-        self.recorded
-            .iter()
-            .position(|r| r.info.id == id)
-            .ok_or_else(|| DisplayNotFound(id.to_string()).into())
+        self.refresh(false)?;
+        stream_for(self.recorded.iter().map(|r| &r.info), display).ok_or_else(|| {
+            DisplayNotFound(display.unwrap_or("primary").to_string()).into()
+        })
     }
 
     /// Stop the frame pipelines no request used for STREAM_IDLE (a virtual monitor outlives
@@ -1152,6 +1172,32 @@ fn primary_of(monitors: &[DisplayInfo]) -> DisplayInfo {
         })
 }
 
+/// Bring the recorded monitors' places and primary flags up to date with `now` (a monitor
+/// not listed keeps its last; its stream only freezes until the next session).
+fn replace_places<'a>(recorded: impl Iterator<Item = &'a mut DisplayInfo>, now: &[DisplayInfo]) {
+    for info in recorded {
+        match now.iter().find(|m| m.id == info.id) {
+            Some(place) => *info = place.clone(),
+            None => info.primary = false,
+        }
+    }
+}
+
+/// Which recorded stream a request means: the display named, or for none the one flagged
+/// primary now (else the first). Stream order is the session's, not the primary's.
+fn stream_for<'a>(
+    recorded: impl Iterator<Item = &'a DisplayInfo> + Clone,
+    display: Option<&str>,
+) -> Option<usize> {
+    match display {
+        Some(id) => recorded.clone().position(|info| info.id == id),
+        None => recorded
+            .clone()
+            .position(|info| info.primary)
+            .or_else(|| recorded.clone().next().map(|_| 0)),
+    }
+}
+
 /// The monitors a new session records: every one, the primary first.
 fn to_record(monitors: &[DisplayInfo]) -> Vec<DisplayInfo> {
     let primary = primary_of(monitors);
@@ -1263,8 +1309,8 @@ fn frame_size_from_caps(text: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::{
         connector_number, die_with_parent, frame_size_from_caps, monitors_of, no_monitor, physical,
-        pipeline_args, settled, to_record, virtual_displays, CurrentState, FrameStream,
-        RESTART_SETTLE,
+        pipeline_args, replace_places, settled, stream_for, to_record, virtual_displays,
+        CurrentState, FrameStream, RESTART_SETTLE,
     };
     use std::collections::HashMap;
     use std::process::Command;
@@ -1365,6 +1411,45 @@ mod tests {
         assert_eq!(physical(&a), physical(&b));
         // Virtual monitors' vendor name is no name.
         assert_eq!(plugged.iter().find(|m| m.id == "Meta-0").unwrap().name, "");
+    }
+
+    /// Review of !15, finding 1: the primary changes (A to B) with both monitors attached. The
+    /// session isn't made again; the list, the stream a screenshot or frame without a display
+    /// reads, and the stream the pointer goes to all follow B.
+    #[test]
+    fn a_new_primary_is_shown_and_pointed_at_alike() {
+        let before = monitors_of(&state(&[
+            ("A", "", 0, 0, (1920, 1080), 1.0, 0, true),
+            ("B", "", 1920, 0, (1920, 1080), 1.0, 0, false),
+        ]));
+        // The session's streams, primary first as made: A, B.
+        let mut recorded = to_record(&before);
+        assert_eq!(stream_for(recorded.iter(), None), Some(0));
+        let after = monitors_of(&state(&[
+            ("A", "", 0, 0, (1920, 1080), 1.0, 0, false),
+            ("B", "", 1920, 0, (1920, 1080), 1.0, 0, true),
+        ]));
+        assert_eq!(physical(&before), physical(&after), "no new session");
+        replace_places(recorded.iter_mut(), &after);
+        // The list (`current`, what /displays and info say).
+        let listed: Vec<crate::displays::Display> = recorded
+            .iter()
+            .map(|info| crate::displays::Display {
+                info: info.clone(),
+                rect: crate::displays::Rect::of(info),
+            })
+            .collect();
+        let primary = crate::displays::find(&listed, None).unwrap();
+        assert_eq!(primary.info.id, "B");
+        // The capture source without a display, and the pointer's (it moves on the display the
+        // controller resolved from that list).
+        let shown = stream_for(recorded.iter(), None).unwrap();
+        let pointed = stream_for(recorded.iter(), Some(&primary.info.id)).unwrap();
+        assert_eq!(recorded[shown].id, "B");
+        assert_eq!(shown, pointed);
+        // A monitor no longer listed is not the primary any more.
+        replace_places(recorded.iter_mut(), &after[1..]);
+        assert_eq!(recorded[stream_for(recorded.iter(), None).unwrap()].id, "B");
     }
 
     /// C-W1: a change waits RESTART_SETTLE without another before it counts.

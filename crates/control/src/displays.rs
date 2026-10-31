@@ -6,10 +6,11 @@
 //! again when a request names a display it doesn't have, so a moved, added or removed display
 //! is seen without asking the system on every pointer move.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-pub use rtx_screens::{DisplayInfo, DisplayNotFound};
+pub use rtx_screens::{DisplayInfo, DisplayNotFound, DisplayUnavailable};
 
 /// How long a display table is used before it is read again.
 pub const REFRESH: Duration = Duration::from_secs(2);
@@ -112,6 +113,53 @@ pub fn not_found(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<DisplayNotFound>())
 }
 
+/// The display `error` says is attached but can't be captured now, if that is what it is.
+pub fn unavailable(error: &anyhow::Error) -> Option<&str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DisplayUnavailable>())
+        .map(|gone| gone.0.as_str())
+}
+
+/// A display a request named that this computer can't show, either way: its viewer moves on.
+pub fn lost(error: &anyhow::Error) -> bool {
+    not_found(error) || unavailable(error).is_some()
+}
+
+/// The displays that can't be captured in the current state (design risk 2, Addendum 1: Link
+/// lists only the displays it can capture now). One whose capture failed as unavailable stays
+/// out of the list until the state changes (the screen unlocks, the login window goes).
+#[derive(Default)]
+pub struct Unavailable {
+    /// The state they failed in, and the displays.
+    state: Option<u64>,
+    ids: HashSet<String>,
+}
+
+impl Unavailable {
+    /// `id` failed as unavailable in `state`.
+    pub fn note(&mut self, id: &str, state: u64) {
+        self.forget_unless(state);
+        self.state = Some(state);
+        self.ids.insert(id.to_string());
+    }
+
+    /// The list without the displays that can't be captured in `state`; a new state forgets them.
+    pub fn filter(&mut self, list: Vec<Display>, state: u64) -> Vec<Display> {
+        self.forget_unless(state);
+        list.into_iter()
+            .filter(|display| !self.ids.contains(&display.info.id))
+            .collect()
+    }
+
+    fn forget_unless(&mut self, state: u64) {
+        if self.state != Some(state) {
+            self.state = None;
+            self.ids.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +243,30 @@ mod tests {
         ];
         assert_eq!(find(&list, None).unwrap().info.id, "a");
         assert!(find(&[], None).is_err());
+    }
+
+    /// Review of !15, finding 3: a display whose capture failed as unavailable (injected here)
+    /// leaves the list while the state lasts and comes back with the next state.
+    #[test]
+    fn a_display_that_cannot_be_captured_now_is_not_listed_until_the_state_changes() {
+        let list = || {
+            vec![
+                display("main", true, rect(0.0, 0.0, 10.0, 10.0)),
+                display("2", false, rect(10.0, 0.0, 10.0, 10.0)),
+            ]
+        };
+        let injected = anyhow::Error::from(DisplayUnavailable("2".into())).context("frame");
+        assert_eq!(unavailable(&injected), Some("2"));
+        assert!(lost(&injected) && !not_found(&injected));
+        let (locked, unlocked) = (1, 0);
+        let mut gone = Unavailable::default();
+        gone.note(unavailable(&injected).unwrap(), locked);
+        let ids = |list: Vec<Display>| -> Vec<String> { list.into_iter().map(|d| d.info.id).collect() };
+        assert_eq!(ids(gone.filter(list(), locked)), ["main"]);
+        assert_eq!(ids(gone.filter(list(), locked)), ["main"]);
+        assert_eq!(ids(gone.filter(list(), unlocked)), ["main", "2"]);
+        // Locked again: listed until its capture fails again.
+        assert_eq!(ids(gone.filter(list(), locked)), ["main", "2"]);
     }
 
     #[test]

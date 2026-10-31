@@ -33,6 +33,9 @@ impl Input {
     pub fn displays(&mut self) -> Result<Vec<crate::displays::Display>> {
         unreachable!()
     }
+    pub fn current(&mut self) -> Result<Vec<crate::displays::Display>> {
+        unreachable!()
+    }
     pub fn screenshot(
         &mut self,
         _max_width: u32,

@@ -69,6 +69,15 @@ impl Input {
         }
     }
 
+    /// The displays as the session resolves them for capture and the pointer now: GNOME
+    /// Wayland's primary is its session's current one (no new list read more than every 2 s).
+    pub fn current(&mut self) -> Result<Vec<Display>> {
+        match self {
+            Self::Wayland(input) => input.current(),
+            Self::X11(_) => super::displays(),
+        }
+    }
+
     /// Only Wayland takes screenshots through input (`screenshot_needs_input`).
     pub fn screenshot(&mut self, max_width: u32, live: bool, display: Option<&str>) -> Result<Shot> {
         match self {

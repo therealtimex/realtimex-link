@@ -40,6 +40,20 @@ impl std::fmt::Display for DisplayNotFound {
 
 impl std::error::Error for DisplayNotFound {}
 
+/// A request named a display that is attached but can't be captured in the current state (a
+/// macOS lock screen or login window may show only the main display, design risk 2). Like
+/// [`DisplayNotFound`], whoever asked decides what to show instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayUnavailable(pub String);
+
+impl std::fmt::Display for DisplayUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "display {} can't be captured right now", self.0)
+    }
+}
+
+impl std::error::Error for DisplayUnavailable {}
+
 /// Left to right, then top to bottom: a display's place in the list is its "Screen n" in the
 /// picker (realtimex-ai-app#2970). Equal positions keep their order.
 pub fn sort_displays(list: &mut [DisplayInfo]) {
