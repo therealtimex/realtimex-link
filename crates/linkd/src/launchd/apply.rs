@@ -136,7 +136,7 @@ pub fn apply(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Whether the owner's session job got a process (launchd removes it within about a second when
+/// Whether the owner's session job runs (launchd removes it within about a second when
 /// Login Items refuse it). Still starting after ten seconds counts as started.
 fn session_started(uid: u32) -> bool {
     let target = format!("gui/{uid}/{SESSION_LABEL}");
