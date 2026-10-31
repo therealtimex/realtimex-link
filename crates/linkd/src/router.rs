@@ -1380,13 +1380,19 @@ fn spawn_event_loop(shared: &Arc<Shared>) -> JoinHandle<()> {
                     tokio::spawn(on_peer_message(shared, session, data));
                 }
                 // Its display went away (realtimex-link#12): the view falls back at once.
+                // Bound to the display that failed: a view that shows another by the time it is
+                // handled (a poll or its viewer moved it already) is left alone.
                 Some("peer_display_lost") => {
-                    let reason = event
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or(displays::DISPLAY_REMOVED)
-                        .to_string();
-                    tokio::spawn(async move { check_views(&shared, Some((session, reason))).await });
+                    let text = |name: &str| event.get(name).and_then(Value::as_str);
+                    let Some(display) = text("display") else {
+                        continue;
+                    };
+                    let lost = Lost {
+                        session,
+                        display: display.to_string(),
+                        reason: text("reason").unwrap_or(displays::DISPLAY_REMOVED).to_string(),
+                    };
+                    tokio::spawn(async move { check_views(&shared, Some(lost)).await });
                 }
                 Some("peer_state")
                     if event.get("state").and_then(Value::as_str) == Some("closed") =>
@@ -1700,12 +1706,20 @@ fn ensure_display_poll(shared: &Arc<Shared>) {
     }));
 }
 
+/// rtx-control lost the display a view showed (`peer_display_lost`): which view, which display,
+/// and why.
+struct Lost {
+    session: u64,
+    display: String,
+    reason: String,
+}
+
 /// Read the display list and bring each open view (or only the one in `lost`, whose display
 /// rtx-control just lost, and why) up to date. A view whose display went away, or that follows
 /// the primary when the primary changed, is handed over: its running actions finish, its held
 /// keys and buttons are let go, then rtx-control shows the new display. A view whose list or
 /// display changed gets a `displays` push.
-async fn check_views(shared: &Arc<Shared>, lost: Option<(u64, String)>) {
+async fn check_views(shared: &Arc<Shared>, lost: Option<Lost>) {
     let Ok(list) = fresh_displays(shared).await else {
         return;
     };
@@ -1715,7 +1729,7 @@ async fn check_views(shared: &Arc<Shared>, lost: Option<(u64, String)>) {
     }
     let peers: Vec<(u64, Arc<Peer>)> = lock(&shared.peers)
         .iter()
-        .filter(|(session, _)| lost.as_ref().is_none_or(|(lost, _)| lost == *session))
+        .filter(|(session, _)| lost.as_ref().is_none_or(|lost| lost.session == **session))
         .map(|(session, peer)| (*session, peer.clone()))
         .collect();
     for (session, peer) in peers {
@@ -1723,12 +1737,15 @@ async fn check_views(shared: &Arc<Shared>, lost: Option<(u64, String)>) {
         let follows = peer.follows.load(Ordering::SeqCst);
         let (told, told_list) = lock(&peer.told).clone();
         let checked = match &lost {
-            Some((_, reason)) => displays::lost(shown.as_deref(), reason, &list),
+            // A loss of a display this view no longer shows: already handled (review of !15).
+            Some(lost) if shown.as_deref() != Some(lost.display.as_str()) => continue,
+            Some(lost) => displays::lost(Some(&lost.display), &lost.reason, &list),
             None => displays::check(shown.as_deref(), follows, told.as_deref(), &told_list, &list),
         };
         if let Some(target) = &checked.switch_to {
             let _idle = peer.running.write().await;
-            // Closed, or switched by its viewer meanwhile: nothing to undo.
+            // Closed, or moved meanwhile (a switch, another check, the same loss seen by a
+            // poll): what was decided is about a display it no longer shows.
             if peer.closed.load(Ordering::SeqCst) || *lock(&peer.display) != shown {
                 continue;
             }
@@ -1751,6 +1768,11 @@ async fn check_views(shared: &Arc<Shared>, lost: Option<(u64, String)>) {
                 "[remote-control] live view (session {session}) shows display {target} (was {})",
                 shown.as_deref().unwrap_or("the primary")
             ));
+        }
+        // Moved meanwhile without a switch here: this push would tell of an older display.
+        let expected = checked.switch_to.clone().or(shown.clone());
+        if *lock(&peer.display) != expected {
+            continue;
         }
         let fallback = checked
             .push
@@ -2625,7 +2647,7 @@ done
         lock(&fake.peer.held_keys).push("ControlLeft".into());
         std::fs::write(fake.dir.path().join("displays.json"), list_of(&[("1", true)]).to_string())
             .unwrap();
-        check_views(&fake.shared, Some((7, displays::DISPLAY_UNAVAILABLE.into()))).await;
+        check_views(&fake.shared, Some(lost_event("2", displays::DISPLAY_UNAVAILABLE))).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let ops = ops_of(fake.dir.path());
         assert_eq!(&ops[ops.len() - 2..], ["key ControlLeft false", "peer_display \"1\""]);
@@ -2637,11 +2659,116 @@ done
         // A lost display still listed (the list not yet filtered) is left out all the same.
         let fake = fake_view(&list_of(&[("1", true), ("2", false)]));
         *lock(&fake.peer.display) = Some("2".into());
-        check_views(&fake.shared, Some((7, displays::DISPLAY_UNAVAILABLE.into()))).await;
+        check_views(&fake.shared, Some(lost_event("2", displays::DISPLAY_UNAVAILABLE))).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let push = pushed(fake.dir.path()).pop().unwrap();
         assert_eq!(push["displays"], list_of(&[("1", true)]));
         assert_eq!(push["fallback"]["reason"], "display_unavailable");
+    }
+
+    #[cfg(unix)]
+    fn lost_event(display: &str, reason: &str) -> Lost {
+        Lost {
+            session: 7,
+            display: display.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Fallbacks the viewer was told of, and the switches the helper got, so far.
+    #[cfg(unix)]
+    fn fallbacks_and_switches(dir: &std::path::Path) -> (Vec<Value>, usize) {
+        let fallbacks = pushed(dir)
+            .into_iter()
+            .filter_map(|push| push.get("fallback").cloned())
+            .collect();
+        let switches = ops_of(dir).iter().filter(|op| op.starts_with("peer_display")).count();
+        (fallbacks, switches)
+    }
+
+    /// Review of !15 (second), regression a: display 1's loss event is held up while the view
+    /// moves to 2 (by a poll's fallback, or its viewer's switch; done before the event is
+    /// handled, or while it waits for the view's actions). With 2 and 3 attached, the old event
+    /// changes nothing: 2 stays, no input is let go again, no switch, and no push says 2 was
+    /// lost or leaves it out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_late_loss_event_leaves_a_view_that_moved_on_alone() {
+        for how in ["poll", "switch", "while-waiting"] {
+            let fake = fake_view(&list_of(&[("1", false), ("2", true), ("3", false)]));
+            match how {
+                // 1 unplugged; the poll hands the view to the primary, 2.
+                "poll" => {
+                    std::fs::write(
+                        fake.dir.path().join("displays.json"),
+                        list_of(&[("2", true), ("3", false)]).to_string(),
+                    )
+                    .unwrap();
+                    check_views(&fake.shared, None).await;
+                }
+                "switch" => {
+                    let answer = select_display(&fake.shared, 7, &fake.peer, Some("2".into())).await;
+                    assert_eq!(answer["ok"], true);
+                }
+                // The event is handled while a switch holds the view: it waits, then finds 2.
+                _ => {
+                    let held = fake.peer.running.write().await;
+                    let shared = fake.shared.clone();
+                    let late = tokio::spawn(async move {
+                        check_views(&shared, Some(lost_event("1", displays::DISPLAY_REMOVED))).await
+                    });
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    assert!(!late.is_finished(), "it waits for the switch");
+                    *lock(&fake.peer.display) = Some("2".into());
+                    drop(held);
+                    late.await.unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(lock(&fake.peer.display).as_deref(), Some("2"), "{how}");
+            let before_ops = ops_of(fake.dir.path());
+            let before_pushes = pushed(fake.dir.path()).len();
+            lock(&fake.peer.held_keys).push("ShiftLeft".into());
+            check_views(&fake.shared, Some(lost_event("1", displays::DISPLAY_REMOVED))).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(lock(&fake.peer.display).as_deref(), Some("2"), "{how}");
+            assert_eq!(ops_of(fake.dir.path()), before_ops, "{how}: nothing let go or switched");
+            assert_eq!(lock(&fake.peer.held_keys).len(), 1, "{how}");
+            assert_eq!(pushed(fake.dir.path()).len(), before_pushes, "{how}: nothing pushed");
+            for push in pushed(fake.dir.path()) {
+                assert_ne!(push["fallback"]["from"], "2", "{how}: {push}");
+                assert!(displays::has(&displays::list_of(&push), "2"), "{how}: {push}");
+            }
+        }
+    }
+
+    /// Review of !15 (second), regression b: one loss, seen by the poll and by the event in
+    /// either order, is one fallback and one switch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_loss_is_one_fallback_whoever_sees_it_first() {
+        for event_first in [true, false] {
+            let fake = fake_view(&list_of(&[("1", true), ("2", false)]));
+            std::fs::write(fake.dir.path().join("displays.json"), list_of(&[("2", true)]).to_string())
+                .unwrap();
+            let event = || Some(lost_event("1", displays::DISPLAY_REMOVED));
+            if event_first {
+                check_views(&fake.shared, event()).await;
+                check_views(&fake.shared, None).await;
+            } else {
+                check_views(&fake.shared, None).await;
+                check_views(&fake.shared, event()).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let (fallbacks, switches) = fallbacks_and_switches(fake.dir.path());
+            assert_eq!(switches, 1, "event first: {event_first}");
+            assert_eq!(
+                fallbacks,
+                [json!({ "from": "1", "reason": "display_removed" })],
+                "event first: {event_first}"
+            );
+            assert_eq!(lock(&fake.peer.display).as_deref(), Some("2"));
+        }
     }
 
     #[test]
