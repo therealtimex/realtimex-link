@@ -518,9 +518,11 @@ pub fn displays() -> Result<Vec<DisplayInfo>> {
     Ok(list)
 }
 
-/// Each monitor's name, area on the root window and whether it is the primary one; the whole
-/// screen alone (named WHOLE_SCREEN) when RandR lists none.
-fn monitors(x: &X) -> Result<Vec<(String, (i16, i16, u16, u16), bool)>> {
+/// A monitor's name, area on the root window and whether it is the primary one.
+type Monitor = (String, (i16, i16, u16, u16), bool);
+
+/// Each monitor; the whole screen alone (named WHOLE_SCREEN) when RandR lists none.
+fn monitors(x: &X) -> Result<Vec<Monitor>> {
     let mut list = Vec::new();
     if let Ok(reply) = x.conn.randr_get_monitors(x.root, true)?.reply() {
         for m in reply.monitors {

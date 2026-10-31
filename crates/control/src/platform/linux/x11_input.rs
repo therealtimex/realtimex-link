@@ -130,8 +130,7 @@ struct Pressed {
 pub struct X11Input {
     conn: RustConnection,
     root: Window,
-    /// The primary monitor's top-left corner and size, in root-window pixels.
-    origin: (i16, i16),
+    /// The primary monitor's size when the session started (`start`'s answer).
     size: (u16, u16),
     keymap: Keymap,
     pressed: HashMap<u32, Pressed>,
@@ -154,12 +153,11 @@ impl X11Input {
         }
         conn.xtest_get_version(2, 2)?.reply()?;
         let root = conn.setup().roots[screen].root;
-        let (origin, size) = primary_monitor(&conn, root)?;
+        let (_, size) = primary_monitor(&conn, root)?;
         let keymap = read_keymap(&conn)?;
         Ok(Self {
             conn,
             root,
-            origin,
             size,
             keymap,
             pressed: HashMap::new(),
@@ -939,11 +937,11 @@ mod tests {
         conn.flush()?;
 
         let mut input = X11Input::new()?;
-        let (origin_x, origin_y) = input.origin;
         let primary = crate::platform::displays()?
             .into_iter()
             .find(|d| d.info.primary)
             .expect("a primary monitor");
+        let (origin_x, origin_y) = (primary.info.x as i16, primary.info.y as i16);
         input.move_to(&primary, origin_x as f64 + 50.0, origin_y as f64 + 60.0)?;
         input.button(Button::Left, true)?;
         input.button(Button::Left, false)?;

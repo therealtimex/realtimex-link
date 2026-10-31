@@ -151,7 +151,7 @@ pub struct Shared {
     streams: Mutex<Vec<Stream>>,
     next_stream: AtomicU64,
     /// The latest screenshot's size per client and display (None: the primary).
-    shot_sizes: Mutex<HashMap<(String, Option<String>), (u64, u64)>>,
+    shot_sizes: Mutex<HashMap<ShotOf, (u64, u64)>>,
     peers: Mutex<HashMap<u64, Arc<Peer>>>,
     /// Reads the display list every displays::POLL while a WebRTC view is open.
     display_poll: Mutex<Option<JoinHandle<()>>>,
@@ -325,6 +325,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 type Ctx = Arc<Shared>;
+/// A client's screenshots of one display (None: the primary).
+type ShotOf = (String, Option<String>);
 
 fn host_of(shared: &Shared) -> ApiResult<Arc<Host>> {
     shared
