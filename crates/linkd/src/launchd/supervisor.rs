@@ -149,6 +149,7 @@ impl Supervisor {
         let uid = self.config.owner_uid.unwrap_or_default();
         let mut missing_since: Option<Instant> = None;
         let mut failures = 0u32;
+        let mut owner_waits = 0u32;
         while !self.stopping.load(Ordering::Relaxed) {
             let installed = apply::bundle_version(Path::new(APPLICATIONS_APP));
             if installed.is_none() {
@@ -183,13 +184,21 @@ impl Supervisor {
             if self.stopping.load(Ordering::Relaxed) {
                 return;
             }
+            if !matches!(outcome, Outcome::OwnerRunning) {
+                owner_waits = 0;
+            }
             let wait = match outcome {
                 Outcome::Uninstalled => {
                     self.turn_off();
                     return;
                 }
                 Outcome::Restart => Duration::from_secs(1),
-                Outcome::OwnerRunning => Duration::from_secs(5),
+                // Right after turning on, the owner's own daemon is still handing over: try
+                // again soon, then less often.
+                Outcome::OwnerRunning => {
+                    owner_waits += 1;
+                    Duration::from_secs(if owner_waits <= 10 { 1 } else { 5 })
+                }
                 Outcome::Unavailable => Duration::from_secs(60),
                 Outcome::Exited => {
                     failures = if started.elapsed() > Duration::from_secs(60) { 0 } else { failures + 1 };
