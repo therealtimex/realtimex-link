@@ -206,6 +206,12 @@ fn console_bridge() -> Option<Arc<Bridge>> {
         .cloned()
 }
 
+/// Whether a bridge has the console now (realtimex-link#13): without one, remote control can't
+/// start (`no-session-bridge`).
+pub fn console_bridge_present() -> bool {
+    console_bridge().is_some()
+}
+
 /// The console bridge's id, for follow_console.
 pub fn console_session() -> Option<u32> {
     console_bridge().map(|bridge| bridge.id)
@@ -220,7 +226,8 @@ pub fn via_job(op: &str) -> bool {
 
 /// Start the helper in the console's session, through its bridge.
 pub async fn spawn() -> std::io::Result<Spawned> {
-    let bridge = console_bridge().ok_or_else(|| std::io::Error::other("no session has the console"))?;
+    // The error is the code itself: backend.rs answers it as `no-session-bridge`.
+    let bridge = console_bridge().ok_or_else(|| std::io::Error::other(crate::unattended::NO_SESSION_BRIDGE))?;
     if bridge.version != env!("CARGO_PKG_VERSION") {
         return Err(std::io::Error::other(crate::unattended::UNATTENDED_UPDATING));
     }

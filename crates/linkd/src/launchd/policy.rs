@@ -214,9 +214,262 @@ pub fn wait_for_start(checks: u32, mut print: impl FnMut() -> Option<String>, mu
     Startup::TimedOut
 }
 
+/// The session jobs to restart after the root copy was refreshed (realtimex-link#13): each GUI
+/// user's, then the login window's (the domain apply.rs boots it out of). A bridge left running
+/// from the old copy can't reach the new daemon: its code on disk is gone, so the supervisor's
+/// signature check refuses it.
+pub fn session_jobs(gui_users: &[u32]) -> Vec<String> {
+    let label = super::plist::SESSION_LABEL;
+    gui_users
+        .iter()
+        .map(|uid| format!("gui/{uid}/{label}"))
+        .chain(std::iter::once(format!("loginwindow/{label}")))
+        .collect()
+}
+
+/// How one session job's restart went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kickstart {
+    /// `launchctl kickstart -k` succeeded.
+    Restarted,
+    /// It runs from the current root copy: left alone.
+    Current,
+    /// launchd has no such job (no login window showing, or a session without it).
+    NoJob,
+    /// `launchctl kickstart -k` failed.
+    Failed,
+}
+
+/// Restart the jobs in `targets` that need it with `launchctl kickstart -k`, best effort:
+/// `needs_restart` says, for one job, None when launchd has no such job, else whether to restart
+/// it; `launchctl` runs one command. Every job is tried, whatever the others did; nothing here
+/// fails the update.
+pub fn restart_session_jobs(
+    targets: &[String],
+    mut needs_restart: impl FnMut(&str) -> Option<bool>,
+    mut launchctl: impl FnMut(&[&str]) -> bool,
+) -> Vec<(String, Kickstart)> {
+    targets
+        .iter()
+        .map(|target| {
+            let outcome = match needs_restart(target) {
+                None => Kickstart::NoJob,
+                Some(false) => Kickstart::Current,
+                Some(true) if launchctl(&["kickstart", "-k", target.as_str()]) => Kickstart::Restarted,
+                Some(true) => Kickstart::Failed,
+            };
+            (target.clone(), outcome)
+        })
+        .collect()
+}
+
+/// The pid in `launchctl print <job>`'s text, while the job runs.
+pub fn job_pid(print: &str) -> Option<i32> {
+    print
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = ")?.trim().parse().ok())
+}
+
+/// Whether a session job runs from something else than `program` (the root copy's main
+/// executable): a job left from before an update, whose copy is gone (realtimex-link#13). Its
+/// process's path (proc_pidpath) is then the removed copy's, or unknown. A job that isn't running
+/// isn't stale: launchd starts it from the plist, that is from the current copy.
+pub fn job_is_stale(print: &str, path_of: impl FnOnce(i32) -> Option<String>, program: &str) -> bool {
+    job_pid(print).is_some_and(|pid| path_of(pid).as_deref() != Some(program))
+}
+
+/// A file's identity (device, inode): a bridge's own executable when it started, to tell later
+/// whether an update replaced or removed it. Its path stays the same across an update (the new
+/// root copy is put where the old one was), so only the identity tells.
+#[cfg(unix)]
+pub fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Whether the executable a bridge started from is no longer the one at its path: another file
+/// is there now, or none. Unknown at the start (None) never counts.
+pub fn executable_replaced(at_start: Option<(u64, u64)>, now: Option<(u64, u64)>) -> bool {
+    at_start.is_some_and(|start| now != Some(start))
+}
+
+/// How many connections in a row the supervisor may close without an answer before a bridge
+/// exits, so launchd starts it again (realtimex-link#13).
+pub const UNANSWERED_LIMIT: u32 = 10;
+
+/// What a bridge does after its connection to the owner's daemon closed without an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterClose {
+    /// Try again in a moment.
+    Retry,
+    /// Exit non-zero (launchd's KeepAlive starts it again from the current root copy): its own
+    /// executable was replaced or removed, an update.
+    ExecutableReplaced,
+    /// Exit non-zero: closed without an answer [`UNANSWERED_LIMIT`] times in a row.
+    TooManyCloses,
+}
+
+/// The bridge's decision after a connection that ended without an answer (realtimex-link#13).
+/// The signature check stays as strict as it is: the bridge restarts instead.
+pub fn after_unanswered(executable_replaced: bool, unanswered_in_a_row: u32) -> AfterClose {
+    if executable_replaced {
+        AfterClose::ExecutableReplaced
+    } else if unanswered_in_a_row >= UNANSWERED_LIMIT {
+        AfterClose::TooManyCloses
+    } else {
+        AfterClose::Retry
+    }
+}
+
+/// Whether the `n`th failed attempt in a row (from 1) is logged: the first three, then the
+/// 4th, 8th, 16th… and every 1000th, so a bridge that can't connect doesn't write the same line
+/// every 3 seconds forever.
+pub fn log_attempt(n: u32) -> bool {
+    n <= 3 || n.is_power_of_two() || n % 1000 == 0
+}
+
+/// Peers the supervisor refused, so each is logged once (realtimex-link#13): by pid, forgotten
+/// all at once past [`RefusedPeers::LIMIT`].
+#[derive(Default)]
+pub struct RefusedPeers {
+    pids: std::collections::HashSet<u32>,
+}
+
+impl RefusedPeers {
+    pub const LIMIT: usize = 256;
+
+    /// True the first time `pid` is refused.
+    pub fn first(&mut self, pid: u32) -> bool {
+        if self.pids.contains(&pid) {
+            return false;
+        }
+        if self.pids.len() >= Self::LIMIT {
+            self.pids.clear();
+        }
+        self.pids.insert(pid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_gui_users_session_job_and_the_login_windows_are_restarted() {
+        assert_eq!(
+            session_jobs(&[501, 502]),
+            [
+                "gui/501/ai.realtimex.link.session",
+                "gui/502/ai.realtimex.link.session",
+                "loginwindow/ai.realtimex.link.session",
+            ]
+        );
+        assert_eq!(session_jobs(&[]), ["loginwindow/ai.realtimex.link.session"]);
+    }
+
+    #[test]
+    fn a_restart_is_kickstart_dash_k_tried_for_every_job_and_never_fails_the_rest() {
+        let targets = session_jobs(&[501, 502, 503]);
+        let mut commands: Vec<Vec<String>> = Vec::new();
+        let outcomes = restart_session_jobs(
+            &targets,
+            // 503's runs from the current copy; no login window showing.
+            |target| (!target.starts_with("loginwindow/")).then_some(!target.contains("/503/")),
+            |args| {
+                commands.push(args.iter().map(|arg| arg.to_string()).collect());
+                // 502's fails; 501's still counts, and nothing stops early.
+                !args[2].contains("/502/")
+            },
+        );
+        assert_eq!(
+            commands,
+            [
+                ["kickstart", "-k", "gui/501/ai.realtimex.link.session"],
+                ["kickstart", "-k", "gui/502/ai.realtimex.link.session"],
+            ]
+        );
+        assert_eq!(
+            outcomes,
+            [
+                ("gui/501/ai.realtimex.link.session".to_string(), Kickstart::Restarted),
+                ("gui/502/ai.realtimex.link.session".to_string(), Kickstart::Failed),
+                ("gui/503/ai.realtimex.link.session".to_string(), Kickstart::Current),
+                ("loginwindow/ai.realtimex.link.session".to_string(), Kickstart::NoJob),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_job_running_from_a_removed_copy_is_stale() {
+        let program = super::super::plist::root_program();
+        let print = "gui/501/ai.realtimex.link.session = {\n\tactive count = 1\n\tstate = running\n\tpid = 10129\n}";
+        assert_eq!(job_pid(print), Some(10129));
+        // The current copy: left alone.
+        assert!(!job_is_stale(print, |pid| (pid == 10129).then(|| program.clone()), &program));
+        // QA of #13: the old copy moved to staging and removed, or no path at all.
+        let old = "/Library/Application Support/RealTimeX Link/staging/0b1c/old.app/Contents/MacOS/rtx-link";
+        assert!(job_is_stale(print, |_| Some(old.to_string()), &program));
+        assert!(job_is_stale(print, |_| None, &program));
+        // Not running: launchd starts it from the current copy.
+        let waiting = "gui/501/ai.realtimex.link.session = {\n\tstate = not running\n}";
+        assert_eq!(job_pid(waiting), None);
+        assert!(!job_is_stale(waiting, |_| None, &program));
+    }
+
+    #[test]
+    fn a_bridge_exits_when_its_executable_was_replaced_or_after_ten_unanswered_closes() {
+        let start = Some((1, 100));
+        assert!(!executable_replaced(start, start));
+        // The update put a new copy at the same path, or the old one is gone.
+        assert!(executable_replaced(start, Some((1, 200))));
+        assert!(executable_replaced(start, None));
+        // Unknown at the start: never a reason to exit.
+        assert!(!executable_replaced(None, None));
+        assert!(!executable_replaced(None, Some((1, 100))));
+
+        assert_eq!(after_unanswered(true, 1), AfterClose::ExecutableReplaced);
+        assert_eq!(after_unanswered(false, 1), AfterClose::Retry);
+        assert_eq!(after_unanswered(false, UNANSWERED_LIMIT - 1), AfterClose::Retry);
+        assert_eq!(after_unanswered(false, UNANSWERED_LIMIT), AfterClose::TooManyCloses);
+        assert_eq!(after_unanswered(true, UNANSWERED_LIMIT), AfterClose::ExecutableReplaced);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_renamed_over_the_path_has_another_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtx-linkd");
+        std::fs::write(&path, "old").unwrap();
+        let start = file_identity(&path);
+        assert!(start.is_some());
+        assert!(!executable_replaced(start, file_identity(&path)));
+        // As install_root_copy does: the new copy renamed into the same place.
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, "new").unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        assert!(executable_replaced(start, file_identity(&path)));
+        std::fs::remove_file(&path).unwrap();
+        assert!(executable_replaced(start, file_identity(&path)));
+    }
+
+    #[test]
+    fn repeated_failures_are_logged_less_and_less() {
+        let logged: Vec<u32> = (1..=2000).filter(|&n| log_attempt(n)).collect();
+        assert_eq!(logged, [1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 1000, 1024, 2000]);
+    }
+
+    #[test]
+    fn a_refused_peer_is_logged_once_per_pid() {
+        let mut refused = RefusedPeers::default();
+        assert!(refused.first(60351));
+        assert!(!refused.first(60351));
+        assert!(refused.first(60352));
+        // Bounded: past the limit it starts over.
+        for pid in 0..RefusedPeers::LIMIT as u32 {
+            refused.first(pid);
+        }
+        assert!(refused.pids.len() <= RefusedPeers::LIMIT);
+    }
 
     /// Answers `prints` in turn (the last one again after that), counting the sleeps.
     fn wait_over(prints: &[Option<&str>], checks: u32) -> (Startup, usize) {

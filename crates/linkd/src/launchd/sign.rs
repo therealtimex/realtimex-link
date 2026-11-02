@@ -126,12 +126,19 @@ mod platform {
         .clone()
     }
 
-    /// Whether the process behind a socket's audit token satisfies `requirement` (M4).
-    pub fn peer_satisfies(audit_token: &[u8; 32], requirement: &str) -> bool {
+    /// What [`peer_check`] answers when a CF object couldn't even be made (not an OSStatus the
+    /// Security framework returned).
+    pub const NOT_CHECKED: i32 = -1;
+
+    /// Whether the process behind a socket's audit token satisfies `requirement` (M4): `Err`
+    /// holds the OSStatus of the call that refused it, for the supervisor's log
+    /// (realtimex-link#13; e.g. a process whose code on disk an update removed).
+    pub fn peer_check(audit_token: &[u8; 32], requirement: &str) -> Result<(), i32> {
+        let status = |status: i32| if status == 0 { Ok(()) } else { Err(status) };
         // SAFETY: CF objects made here and released on drop; the token's bytes are copied.
         unsafe {
             let Some(token) = Owned::new(CFDataCreate(std::ptr::null(), audit_token.as_ptr(), 32)) else {
-                return false;
+                return Err(NOT_CHECKED);
             };
             let keys = [kSecGuestAttributeAudit];
             let values = [token.0];
@@ -143,20 +150,17 @@ mod platform {
                 (&raw const kCFTypeDictionaryKeyCallBacks).cast(),
                 (&raw const kCFTypeDictionaryValueCallBacks).cast(),
             )) else {
-                return false;
+                return Err(NOT_CHECKED);
             };
             let mut guest: CFTypeRef = std::ptr::null();
-            if SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes.0, 0, &mut guest) != 0 {
-                return false;
-            }
-            let Some(guest) = Owned::new(guest) else { return false };
-            let Some(text) = cf_string(requirement) else { return false };
+            status(SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes.0, 0, &mut guest))?;
+            let Some(guest) = Owned::new(guest) else { return Err(NOT_CHECKED) };
+            let Some(text) = cf_string(requirement) else { return Err(NOT_CHECKED) };
             let mut compiled: CFTypeRef = std::ptr::null();
-            if SecRequirementCreateWithString(text.0, 0, &mut compiled) != 0 {
-                return false;
-            }
-            let Some(compiled) = Owned::new(compiled) else { return false };
-            SecCodeCheckValidity(guest.0, 0, compiled.0) == 0
+            status(SecRequirementCreateWithString(text.0, 0, &mut compiled))?;
+            let Some(compiled) = Owned::new(compiled) else { return Err(NOT_CHECKED) };
+            // Flags 0: the code on disk is checked too, deliberately (M4).
+            status(SecCodeCheckValidity(guest.0, 0, compiled.0))
         }
     }
 

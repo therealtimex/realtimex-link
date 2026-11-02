@@ -86,7 +86,7 @@ fn console() -> Console {
         let login_window = libc::getuid() == 0;
         let screen_locked = number(locked).is_some_and(|value| value != 0);
         let secure_input = (login_window || screen_locked)
-            && number(secure).is_some_and(|pid| pid > 0 && process_path(pid).as_deref().is_some_and(policy::login_ui));
+            && number(secure).is_some_and(|pid| pid > 0 && os::process_path(pid).as_deref().is_some_and(policy::login_ui));
         CFRelease(on_key);
         CFRelease(secure_key);
         CFRelease(locked_key);
@@ -128,14 +128,26 @@ fn log(line: &str) {
     }
 }
 
-fn process_path(pid: i32) -> Option<String> {
-    let mut buffer = [0u8; 4 * 1024];
-    // SAFETY: the buffer's size is passed (PROC_PIDPATHINFO_MAXSIZE).
-    let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
-    (length > 0).then(|| String::from_utf8_lossy(&buffer[..length as usize]).into_owned())
+/// A connection that lasted this long was taken by the owner's daemon: a refused one (the
+/// supervisor's signature check, or no daemon yet) closes at once.
+const ANSWERED_AFTER: Duration = Duration::from_secs(5);
+
+/// How one connection to the owner's daemon ended.
+enum Ended {
+    /// It was taken (it lasted, or the daemon sent something), then closed; with the error that
+    /// ended it, if one did.
+    Answered(Option<String>),
+    /// Closed, or failed after connecting, without an answer.
+    Unanswered(String),
+    /// No supervisor to connect to.
+    NoSupervisor(std::io::Error),
 }
 
 pub fn run(args: &[String]) -> ! {
+    // This bridge's own executable as it started: an update puts a new root copy at the same
+    // path and removes this one (realtimex-link#13).
+    let executable = std::env::current_exe().ok();
+    let started_as = executable.as_deref().and_then(policy::file_identity);
     let input: Option<RawFd> = args
         .iter()
         .position(|arg| arg == "--input-fd")
@@ -148,27 +160,92 @@ pub fn run(args: &[String]) -> ! {
     }
     let input = Arc::new(input);
     log(&format!("started (input channel: {})", input.is_some()));
+    // Failed attempts in a row (for the log), and connections closed without an answer in a row.
+    let (mut failures, mut unanswered) = (0u32, 0u32);
     loop {
-        match serve(&input) {
-            Ok(()) => log("the connection to the owner's daemon closed"),
-            Err(error) => log(&format!("connection: {error}")),
+        let quiet = !policy::log_attempt(failures + 1);
+        let ended = serve(&input, quiet);
+        let why = match ended {
+            Ended::Answered(error) => {
+                match error {
+                    None => log("the connection to the owner's daemon closed"),
+                    Some(error) => log(&format!("connection: {error}")),
+                }
+                (failures, unanswered) = (0, 0);
+                None
+            }
+            Ended::Unanswered(why) => {
+                unanswered += 1;
+                Some(why)
+            }
+            Ended::NoSupervisor(error) => Some(format!("no supervisor: {error}")),
+        };
+        if let Some(why) = why {
+            failures += 1;
+            if policy::log_attempt(failures) {
+                log(&format!("connection: {why} ({failures} in a row)"));
+            }
+            let replaced = policy::executable_replaced(
+                started_as,
+                executable.as_deref().and_then(policy::file_identity),
+            );
+            match policy::after_unanswered(replaced, unanswered) {
+                policy::AfterClose::Retry => {}
+                policy::AfterClose::ExecutableReplaced => {
+                    log("this bridge's executable was replaced or removed (an update): exiting so launchd starts the new copy");
+                    release(&input);
+                    std::process::exit(1);
+                }
+                policy::AfterClose::TooManyCloses => {
+                    log(&format!(
+                        "the supervisor closed {unanswered} connections in a row without an answer: exiting so launchd starts this bridge again"
+                    ));
+                    release(&input);
+                    std::process::exit(1);
+                }
+            }
         }
         // No supervisor yet, or no owner's daemon: try again.
         std::thread::sleep(Duration::from_secs(3));
     }
 }
 
-/// One connection to the owner's daemon, until it closes.
-fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
-    let stream = UnixStream::connect(MACOS_SOCKET)?;
+/// One connection to the owner's daemon, until it closes. `quiet`: don't log the hello (a
+/// repeated failure).
+fn serve(input: &Arc<Option<OwnedFd>>, quiet: bool) -> Ended {
+    let stream = match UnixStream::connect(MACOS_SOCKET) {
+        Ok(stream) => stream,
+        Err(error) => return Ended::NoSupervisor(error),
+    };
+    let connected = std::time::Instant::now();
+    let answered = std::sync::atomic::AtomicBool::new(false);
+    let result = converse(&stream, input, quiet, &answered);
+    if answered.load(std::sync::atomic::Ordering::Relaxed) || connected.elapsed() >= ANSWERED_AFTER {
+        return Ended::Answered(result.err().map(|error| error.to_string()));
+    }
+    Ended::Unanswered(match result {
+        Ok(()) => "closed without an answer".into(),
+        Err(error) => error.to_string(),
+    })
+}
+
+/// The conversation on one connection; `answered` is set once the daemon sends anything.
+fn converse(
+    stream: &UnixStream,
+    input: &Arc<Option<OwnedFd>>,
+    quiet: bool,
+    answered: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
     let mut now = console();
     let hello = Request::Bridge {
         version: env!("CARGO_PKG_VERSION").to_string(),
         on_console: now.on_console,
     };
-    send(&stream, &serde_json::to_value(&hello).unwrap_or_default())?;
-    send_status(&stream, now)?;
-    log(&format!("hello sent (on console: {}, secure input: {})", now.on_console, now.secure_input));
+    send(stream, &serde_json::to_value(&hello).unwrap_or_default())?;
+    send_status(stream, now)?;
+    if !quiet {
+        log(&format!("hello sent (on console: {}, secure input: {})", now.on_console, now.secure_input));
+    }
     let helper: Arc<Mutex<Option<Helper>>> = Arc::new(Mutex::new(None));
     // Until this connection ends: the console thread stops with it.
     let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -206,6 +283,7 @@ fn serve(input: &Arc<Option<OwnedFd>>) -> std::io::Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
     for line in reader.lines() {
         let line = line?;
+        answered.store(true, std::sync::atomic::Ordering::Relaxed);
         let message: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
         match message.get("op").and_then(|op| op.as_str()) {
             Some("start") => {
