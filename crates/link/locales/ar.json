@@ -273,6 +273,7 @@
   "activity.tryAgain": "حاول مرة أخرى",
   "activity.olderFailed": "تعذّر تحميل النشاط الأقدم. حاول مرة أخرى.",
   "activity.showOlder": "عرض الأقدم",
+  "activity.loadingOlder": "جارٍ التحميل…",
   "activity.end": "هذا كل شيء من آخر 30 يومًا.",
   "activity.droppedTitle": "لم يُحفظ بعض النشاط",
   "activity.droppedText": "منذ بدء RealTimeX Link تعذّر حفظ إدخالات عددها {count}، غالبًا لأن القرص كان ممتلئًا أو مشغولًا. استمر التحكم عن بُعد في العمل.",

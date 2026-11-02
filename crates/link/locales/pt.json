@@ -273,6 +273,7 @@
   "activity.tryAgain": "Tentar novamente",
   "activity.olderFailed": "Não foi possível carregar a atividade anterior. Tente novamente.",
   "activity.showOlder": "Mostrar anteriores",
+  "activity.loadingOlder": "Carregando…",
   "activity.end": "Isso é tudo dos últimos 30 dias.",
   "activity.droppedTitle": "Parte da atividade não foi salva",
   "activity.droppedText": "Desde que o RealTimeX Link foi iniciado, {count} registros não puderam ser salvos, geralmente porque o disco estava cheio ou ocupado. O controle remoto continuou funcionando.",

@@ -273,6 +273,7 @@
   "activity.tryAgain": "重试",
   "activity.olderFailed": "无法加载更早的活动。请重试。",
   "activity.showOlder": "显示更早的",
+  "activity.loadingOlder": "加载中…",
   "activity.end": "以上是过去 30 天的全部活动。",
   "activity.droppedTitle": "部分活动没有保存",
   "activity.droppedText": "自 RealTimeX Link 启动以来，有 {count} 条记录无法保存，通常是因为磁盘已满或繁忙。远程控制一直正常工作。",

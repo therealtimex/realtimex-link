@@ -273,6 +273,7 @@
   "activity.tryAgain": "נסה שוב",
   "activity.olderFailed": "לא ניתן לטעון פעילות ישנה יותר. נסה שוב.",
   "activity.showOlder": "הצג ישנים יותר",
+  "activity.loadingOlder": "טוען…",
   "activity.end": "זה הכול מ-30 הימים האחרונים.",
   "activity.droppedTitle": "חלק מהפעילות לא נשמר",
   "activity.droppedText": "מאז ש-RealTimeX Link הופעל, לא ניתן היה לשמור רשומות: {count}, בדרך כלל כי הדיסק היה מלא או עסוק. השליטה מרחוק המשיכה לעבוד.",

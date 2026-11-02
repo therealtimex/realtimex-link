@@ -273,6 +273,7 @@
   "activity.tryAgain": "Erneut versuchen",
   "activity.olderFailed": "Ältere Aktivität konnte nicht geladen werden. Versuchen Sie es erneut.",
   "activity.showOlder": "Ältere anzeigen",
+  "activity.loadingOlder": "Wird geladen…",
   "activity.end": "Das ist alles aus den letzten 30 Tagen.",
   "activity.droppedTitle": "Einige Aktivität wurde nicht gespeichert",
   "activity.droppedText": "Seit dem Start von RealTimeX Link konnten {count} Einträge nicht gespeichert werden, meist weil die Festplatte voll oder ausgelastet war. Die Fernsteuerung lief weiter.",

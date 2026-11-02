@@ -273,6 +273,7 @@
   "activity.tryAgain": "دوباره تلاش کنید",
   "activity.olderFailed": "بارگیری فعالیت‌های قدیمی‌تر ممکن نشد. دوباره تلاش کنید.",
   "activity.showOlder": "نمایش قدیمی‌ترها",
+  "activity.loadingOlder": "در حال بارگیری…",
   "activity.end": "این همهٔ فعالیت ۳۰ روز گذشته است.",
   "activity.droppedTitle": "بخشی از فعالیت ذخیره نشد",
   "activity.droppedText": "از زمان شروع RealTimeX Link، {count} مورد ذخیره نشد؛ معمولاً چون دیسک پر یا مشغول بود. کنترل از راه دور به کار خود ادامه داد.",

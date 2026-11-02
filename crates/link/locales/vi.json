@@ -273,6 +273,7 @@
   "activity.tryAgain": "Thử lại",
   "activity.olderFailed": "Không tải được hoạt động cũ hơn. Hãy thử lại.",
   "activity.showOlder": "Xem cũ hơn",
+  "activity.loadingOlder": "Đang tải…",
   "activity.end": "Đó là toàn bộ hoạt động trong 30 ngày qua.",
   "activity.droppedTitle": "Một số hoạt động chưa được lưu",
   "activity.droppedText": "Từ khi RealTimeX Link khởi động, {count} mục không lưu được, thường do ổ đĩa đầy hoặc đang bận. Điều khiển từ xa vẫn hoạt động bình thường.",

@@ -273,6 +273,7 @@
   "activity.tryAgain": "Prøv igen",
   "activity.olderFailed": "Ældre aktivitet kunne ikke indlæses. Prøv igen.",
   "activity.showOlder": "Vis ældre",
+  "activity.loadingOlder": "Indlæser…",
   "activity.end": "Det er alt fra de sidste 30 dage.",
   "activity.droppedTitle": "Noget aktivitet blev ikke gemt",
   "activity.droppedText": "Siden RealTimeX Link startede, kunne {count} poster ikke gemmes, som regel fordi disken var fuld eller optaget. Fjernstyring virkede fortsat.",

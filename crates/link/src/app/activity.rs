@@ -52,7 +52,7 @@ pub struct Activity {
     pub generation: u64,
     pub polled: Option<Instant>,
     pub polling: bool,
-    /// The filter takes the focus (after a clear, and after Show older loaded the last page).
+    /// The filter takes the focus (after a clear).
     pub focus_filter: bool,
     /// Agents on this computer seen in the log (`via:"local"`): (client id, thread name), for the
     /// filter (contract Addendum 1).
@@ -276,16 +276,38 @@ fn shown_again(seen: Option<u64>, frame: u64) -> bool {
     seen.is_some_and(|seen| frame > seen + 1)
 }
 
+/// Show older pressed: the cursor to load from, or None while a page is still on its way (the
+/// button stays enabled to keep its focus, and the press is ignored: review C4).
+fn start_older(activity: &mut Activity) -> Option<i64> {
+    let before = activity.next?;
+    if activity.older == Load::Loading {
+        return None;
+    }
+    activity.older = Load::Loading;
+    Some(before)
+}
+
+/// Show older's page, appended below: the list stays where it is and nothing takes the focus,
+/// on the last page too, where the end caption replaces the button (contract Addendum 2).
+/// False when the list started over meanwhile (a new load or refresh): the page isn't for it.
+fn took_older(activity: &mut Activity, before: i64, page: &Value) -> bool {
+    if activity.next != Some(before) {
+        return false;
+    }
+    let more = entries_of(page);
+    remember_local(activity, &more);
+    activity.entries.extend(more);
+    activity.next = next_of(page);
+    activity.older = Load::Idle;
+    true
+}
+
 /// Show older: the next page after `next`, appended (runs fold again across the boundary).
 fn older(shared: &Shared, ctx: &egui::Context) {
     let (generation, client, before) = {
         let mut state = lock(shared);
         let activity = &mut state.activity;
-        let Some(before) = activity.next else { return };
-        if activity.older == Load::Loading {
-            return;
-        }
-        activity.older = Load::Loading;
+        let Some(before) = start_older(activity) else { return };
         (activity.generation, activity.client.clone(), before)
     };
     let (shared, ctx) = (shared.clone(), ctx.clone());
@@ -300,13 +322,7 @@ fn older(shared: &Shared, ctx: &egui::Context) {
             }
             match answer {
                 Ok(page) => {
-                    let more = entries_of(&page);
-                    remember_local(activity, &more);
-                    activity.entries.extend(more);
-                    activity.next = next_of(&page);
-                    activity.older = Load::Idle;
-                    // The last page: Show older goes, and the focus with it to the filter.
-                    activity.focus_filter = activity.next.is_none();
+                    took_older(activity, before, &page);
                 }
                 Err(_) => activity.older = Load::Failed,
             }
@@ -1160,7 +1176,15 @@ impl LinkApp {
             }
         });
         if next.is_some() {
-            let more = ui.add_enabled(older_state != Load::Loading, egui::Button::new(t("activity.showOlder")));
+            // Enabled while it loads: egui drops a disabled widget's focus, and Space would then
+            // do nothing (review C4). older() ignores a press until the page is in. One id in
+            // both states, so the focus stays with it.
+            let label = if older_state == Load::Loading {
+                t("activity.loadingOlder")
+            } else {
+                t("activity.showOlder")
+            };
+            let more = ui.push_id("activity-show-older", |ui| ui.button(label)).inner;
             if more.clicked() {
                 older(&self.shared, ctx);
             }
@@ -1526,6 +1550,29 @@ mod tests {
         activity.client = None;
         merge(&mut activity, &json!({ "entries": [local(1, "local:w2:t9", "New run")], "next": null }));
         assert_eq!(activity.local, vec![("local:w2:t9".to_string(), "New run".to_string())]);
+    }
+
+    #[test]
+    fn show_older_keeps_its_place_and_ignores_presses_while_loading() {
+        let mut activity = Activity::default();
+        fresh_page(&mut activity, &page(201..=300, true));
+        // Pressed: loading from 201. Pressed again before the page is in: ignored (review C4).
+        assert_eq!(start_older(&mut activity), Some(201));
+        assert_eq!(activity.older, Load::Loading);
+        assert_eq!(start_older(&mut activity), None);
+        // The page goes below; nothing takes the focus (contract Addendum 2).
+        assert!(took_older(&mut activity, 201, &page(101..=200, true)));
+        assert_eq!((ids(&activity).len(), activity.next, activity.older), (200, Some(101), Load::Idle));
+        assert!(!activity.focus_filter);
+        // The last page: no `next`, so the end caption replaces the button; still no focus move.
+        assert_eq!(start_older(&mut activity), Some(101));
+        assert!(took_older(&mut activity, 101, &page(1..=100, false)));
+        assert_eq!((activity.next, activity.focus_filter), (None, false));
+        assert_eq!(start_older(&mut activity), None);
+        // A page for a list that started over meanwhile is dropped.
+        fresh_page(&mut activity, &page(301..=400, true));
+        assert!(!took_older(&mut activity, 101, &page(1..=100, false)));
+        assert_eq!(ids(&activity).len(), 100);
     }
 
     #[test]

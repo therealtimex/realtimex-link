@@ -273,6 +273,7 @@
   "activity.tryAgain": "重試",
   "activity.olderFailed": "無法載入較早的活動。請重試。",
   "activity.showOlder": "顯示較早的",
+  "activity.loadingOlder": "載入中…",
   "activity.end": "以上是過去 30 天的所有活動。",
   "activity.droppedTitle": "部分活動沒有儲存",
   "activity.droppedText": "自 RealTimeX Link 啟動以來，有 {count} 筆紀錄無法儲存，通常是因為磁碟已滿或忙碌。遠端控制一直正常運作。",

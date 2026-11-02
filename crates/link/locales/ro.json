@@ -273,6 +273,7 @@
   "activity.tryAgain": "Încearcă din nou",
   "activity.olderFailed": "Activitatea mai veche nu a putut fi încărcată. Încercați din nou.",
   "activity.showOlder": "Afișează mai vechi",
+  "activity.loadingOlder": "Se încarcă…",
   "activity.end": "Asta e tot din ultimele 30 de zile.",
   "activity.droppedTitle": "O parte din activitate nu a fost salvată",
   "activity.droppedText": "De la pornirea RealTimeX Link, intrări nesalvate: {count}, de obicei pentru că discul era plin sau ocupat. Controlul la distanță a funcționat în continuare.",

@@ -273,6 +273,7 @@
   "activity.tryAgain": "Try again",
   "activity.olderFailed": "Couldn't load older activity. Try again.",
   "activity.showOlder": "Show older",
+  "activity.loadingOlder": "Loading…",
   "activity.end": "That's everything from the last 30 days.",
   "activity.droppedTitle": "Some activity wasn't saved",
   "activity.droppedText": "Since RealTimeX Link started, {count} entries couldn't be saved, usually because the disk was full or busy. Remote control kept working.",

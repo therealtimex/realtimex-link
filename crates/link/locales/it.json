@@ -273,6 +273,7 @@
   "activity.tryAgain": "Riprova",
   "activity.olderFailed": "Impossibile caricare l'attività precedente. Riprova.",
   "activity.showOlder": "Mostra precedenti",
+  "activity.loadingOlder": "Caricamento…",
   "activity.end": "È tutto per gli ultimi 30 giorni.",
   "activity.droppedTitle": "Parte dell'attività non è stata salvata",
   "activity.droppedText": "Dall'avvio di RealTimeX Link non è stato possibile salvare {count} voci, di solito perché il disco era pieno o occupato. Il controllo remoto ha continuato a funzionare.",

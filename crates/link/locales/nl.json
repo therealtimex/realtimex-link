@@ -273,6 +273,7 @@
   "activity.tryAgain": "Opnieuw proberen",
   "activity.olderFailed": "Kan oudere activiteit niet laden. Probeer het opnieuw.",
   "activity.showOlder": "Oudere tonen",
+  "activity.loadingOlder": "Laden…",
   "activity.end": "Dat is alles van de afgelopen 30 dagen.",
   "activity.droppedTitle": "Sommige activiteit is niet opgeslagen",
   "activity.droppedText": "Sinds RealTimeX Link is gestart, konden {count} items niet worden opgeslagen, meestal omdat de schijf vol of bezet was. Bediening op afstand bleef werken.",

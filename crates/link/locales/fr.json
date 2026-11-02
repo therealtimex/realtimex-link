@@ -273,6 +273,7 @@
   "activity.tryAgain": "Réessayer",
   "activity.olderFailed": "Impossible de charger l'activité plus ancienne. Réessayez.",
   "activity.showOlder": "Afficher plus ancien",
+  "activity.loadingOlder": "Chargement…",
   "activity.end": "C'est tout pour les 30 derniers jours.",
   "activity.droppedTitle": "Une partie de l'activité n'a pas été enregistrée",
   "activity.droppedText": "Depuis le démarrage de RealTimeX Link, {count} entrées n'ont pas pu être enregistrées, en général parce que le disque était plein ou occupé. Le contrôle à distance a continué de fonctionner.",

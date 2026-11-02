@@ -273,6 +273,7 @@
   "activity.tryAgain": "Tekrar dene",
   "activity.olderFailed": "Daha eski etkinlik yüklenemedi. Tekrar deneyin.",
   "activity.showOlder": "Daha eskileri göster",
+  "activity.loadingOlder": "Yükleniyor…",
   "activity.end": "Son 30 güne ait her şey bu kadar.",
   "activity.droppedTitle": "Bazı etkinlikler kaydedilmedi",
   "activity.droppedText": "RealTimeX Link başladığından beri {count} kayıt kaydedilemedi; genellikle disk dolu veya meşgul olduğu için. Uzaktan kontrol çalışmaya devam etti.",

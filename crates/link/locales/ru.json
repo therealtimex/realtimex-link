@@ -273,6 +273,7 @@
   "activity.tryAgain": "Попробовать снова",
   "activity.olderFailed": "Не удалось загрузить более раннюю активность. Попробуйте снова.",
   "activity.showOlder": "Показать более ранние",
+  "activity.loadingOlder": "Загрузка…",
   "activity.end": "Это всё за последние 30 дней.",
   "activity.droppedTitle": "Часть активности не сохранена",
   "activity.droppedText": "С запуска RealTimeX Link не удалось сохранить записей: {count}. Обычно диск был заполнен или занят. Удалённое управление продолжало работать.",

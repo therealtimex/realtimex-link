@@ -273,6 +273,7 @@
   "activity.tryAgain": "다시 시도",
   "activity.olderFailed": "이전 활동을 불러오지 못했습니다. 다시 시도하세요.",
   "activity.showOlder": "이전 항목 보기",
+  "activity.loadingOlder": "불러오는 중…",
   "activity.end": "지난 30일 동안의 활동은 여기까지입니다.",
   "activity.droppedTitle": "일부 활동이 저장되지 않았습니다",
   "activity.droppedText": "RealTimeX Link가 시작된 후 {count}개 항목을 저장하지 못했습니다. 보통 디스크가 가득 찼거나 사용 중이었기 때문입니다. 원격 제어는 계속 작동했습니다.",

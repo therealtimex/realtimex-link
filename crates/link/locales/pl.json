@@ -273,6 +273,7 @@
   "activity.tryAgain": "Spróbuj ponownie",
   "activity.olderFailed": "Nie udało się wczytać starszej aktywności. Spróbuj ponownie.",
   "activity.showOlder": "Pokaż starsze",
+  "activity.loadingOlder": "Wczytywanie…",
   "activity.end": "To wszystko z ostatnich 30 dni.",
   "activity.droppedTitle": "Część aktywności nie została zapisana",
   "activity.droppedText": "Od uruchomienia RealTimeX Link nie udało się zapisać wpisów: {count}, zwykle przez pełny lub zajęty dysk. Zdalne sterowanie działało dalej.",

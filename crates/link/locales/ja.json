@@ -273,6 +273,7 @@
   "activity.tryAgain": "もう一度試す",
   "activity.olderFailed": "以前のアクティビティを読み込めませんでした。もう一度お試しください。",
   "activity.showOlder": "以前のものを表示",
+  "activity.loadingOlder": "読み込み中…",
   "activity.end": "過去 30 日間のアクティビティはこれですべてです。",
   "activity.droppedTitle": "一部のアクティビティが保存されませんでした",
   "activity.droppedText": "RealTimeX Link の起動後、{count} 件の記録を保存できませんでした。主な原因はディスクの容量不足か使用中です。リモート操作は動作し続けました。",

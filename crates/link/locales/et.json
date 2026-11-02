@@ -273,6 +273,7 @@
   "activity.tryAgain": "Proovi uuesti",
   "activity.olderFailed": "Vanemaid tegevusi ei õnnestunud laadida. Proovi uuesti.",
   "activity.showOlder": "Näita vanemaid",
+  "activity.loadingOlder": "Laadimine…",
   "activity.end": "See on kõik viimase 30 päeva kohta.",
   "activity.droppedTitle": "Osa tegevusi jäi salvestamata",
   "activity.droppedText": "Pärast seda, kui RealTimeX Link käivitus, jäi salvestamata kirjeid: {count}. Tavaliselt oli ketas täis või hõivatud. Kaugjuhtimine töötas edasi.",

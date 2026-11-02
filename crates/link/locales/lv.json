@@ -273,6 +273,7 @@
   "activity.tryAgain": "Mēģināt vēlreiz",
   "activity.olderFailed": "Neizdevās ielādēt vecākas darbības. Mēģiniet vēlreiz.",
   "activity.showOlder": "Rādīt vecākas",
+  "activity.loadingOlder": "Ielādē…",
   "activity.end": "Tas ir viss no pēdējām 30 dienām.",
   "activity.droppedTitle": "Dažas darbības netika saglabātas",
   "activity.droppedText": "Kopš RealTimeX Link palaišanas neizdevās saglabāt ierakstus: {count}, parasti tāpēc, ka disks bija pilns vai aizņemts. Attālā vadība turpināja darboties.",
