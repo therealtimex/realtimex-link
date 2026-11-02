@@ -248,13 +248,21 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
 }
 
 /// The same windows for an agent's window list (Remote Control's `windows` and accessibility):
-/// small ones too, down to 40×20.
+/// small ones too, down to 40×20, but not apps' hidden helper windows (off screen and untitled,
+/// such as each app's menu bar strip). A minimized window keeps its title.
 pub fn list_agent_windows() -> Result<Vec<WindowInfo>> {
-    list_windows_at_least(AGENT_MIN)
+    let mut list = list_windows_at_least(AGENT_MIN)?;
+    list.retain(|w| agent_window(w.on_screen, &w.title));
+    Ok(list)
 }
 
 fn big_enough(width: f64, height: f64, (min_width, min_height): (f64, f64)) -> bool {
     width >= min_width && height >= min_height
+}
+
+/// Whether an agent is shown a window: on screen, or off it with a title (minimized).
+fn agent_window(on_screen: bool, title: &str) -> bool {
+    on_screen || !title.trim().is_empty()
 }
 
 fn list_windows_at_least(min: (f64, f64)) -> Result<Vec<WindowInfo>> {
@@ -831,5 +839,9 @@ mod tests {
         assert!(big_enough(198.0, 350.0, AGENT_MIN));
         assert!(!big_enough(30.0, 350.0, AGENT_MIN));
         assert!(!big_enough(198.0, 10.0, AGENT_MIN));
+        // Hidden, untitled helpers (an app's 1280×24 menu bar strip) stay out; minimized ones in.
+        assert!(!agent_window(false, ""));
+        assert!(agent_window(false, "fixture.txt"));
+        assert!(agent_window(true, ""));
     }
 }
