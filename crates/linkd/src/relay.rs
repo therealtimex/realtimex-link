@@ -1945,7 +1945,9 @@ async fn too_large(id: u32, send: &Sender) {
         send.refuse(id, TOO_LARGE);
         return;
     }
-    let body = json!({ "error": "Request body too large" }).to_string();
+    let body = crate::error::ApiError::new(413, "Request body too large")
+        .body()
+        .to_string();
     if send.data(frame::DATA, id, body.as_bytes(), 0).await {
         send.raw(frame::END, id, &[], 0).await;
     }

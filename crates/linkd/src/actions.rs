@@ -347,6 +347,7 @@ pub async fn run_actions(
     display: Option<&str>,
 ) -> Result<usize, ApiError> {
     let plans = plan_actions(actions, live_view)?;
+    let mut sent = 0usize;
     for ops in &plans {
         for step in ops {
             let mut params = step.as_object().cloned().unwrap_or_default();
@@ -359,11 +360,28 @@ pub async fn run_actions(
                 let ms = params.get("ms").and_then(Value::as_u64).unwrap_or(0);
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             } else {
-                backend.call(&name, Value::Object(params)).await?;
+                backend
+                    .call(&name, Value::Object(params))
+                    .await
+                    .map_err(|error| delivered(error, sent))?;
+                sent += 1;
             }
         }
     }
     Ok(plans.len())
+}
+
+/// A failed input op as the caller must read it (realtimex-ai-app#3055): input may have landed
+/// when an earlier op of the batch ran, or when the helper never answered (a timeout), so the
+/// batch must not be repeated by itself.
+fn delivered(error: ApiError, sent: usize) -> ApiError {
+    if sent > 0 || error.code_or_status() == "timeout" {
+        error
+            .with_retry(crate::error::Retry::No)
+            .with_delivery(crate::error::Delivery::Unknown)
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]
@@ -576,5 +594,19 @@ mod tests {
         assert!(plan_actions(Some(&batch), true).is_ok());
         // The combo still works over HTTP.
         assert!(plan_actions(Some(&json!([{ "type": "key", "keys": "ctrl+l" }])), false).is_ok());
+    }
+
+    #[test]
+    fn a_batch_that_failed_after_input_went_out_is_never_repeated_by_itself() {
+        // Nothing ran yet: the code's own rule (input-blocked: delivery none).
+        let first = delivered(ApiError::coded(409, "input-blocked", "x"), 0).body();
+        assert_eq!((first["retry"].as_str(), first["delivery"].as_str()), (Some("no"), Some("none")));
+        let first = delivered(ApiError::new(502, "exited"), 0).body();
+        assert_eq!(first["retry"], "after");
+        // An op of it already ran, or the helper never answered: it may have landed.
+        let later = delivered(ApiError::new(502, "exited"), 2).body();
+        assert_eq!((later["retry"].as_str(), later["delivery"].as_str()), (Some("no"), Some("unknown")));
+        let timeout = delivered(ApiError::new(504, "timed out"), 0).body();
+        assert_eq!((timeout["retry"].as_str(), timeout["delivery"].as_str()), (Some("no"), Some("unknown")));
     }
 }

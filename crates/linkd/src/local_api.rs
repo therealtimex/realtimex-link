@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -160,11 +159,7 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
         }
     });
     if name != "127.0.0.1" && name != "localhost" {
-        return (
-            StatusCode::MISDIRECTED_REQUEST,
-            Json(json!({ "error": "Not a local request" })),
-        )
-            .into_response();
+        return ApiError::coded(421, "not-local", "Not a local request").into_response();
     }
     // Asked before the client trusts this port with its token: it carries none.
     if request.uri().path() == HELLO_PATH {
@@ -177,11 +172,7 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
         .map(|value| strip_bearer(value).to_string())
         .unwrap_or_default();
     if !same_bytes(given.as_bytes(), state.token.as_bytes()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Unauthorized" })),
-        )
-            .into_response();
+        return ApiError::coded(401, "unauthorized", "Unauthorized").into_response();
     }
     next.run(request).await
 }
