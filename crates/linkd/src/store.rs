@@ -76,7 +76,13 @@ impl Store {
         }
         // What the file has: an older Link writes schema_version only (and back to its own after
         // a newer one added tables), so the level is the larger of the two.
-        let version = compatible.max(read("schema_level")?);
+        // A schema_version below the compatible one was written by a Link from before levels:
+        // the file has that schema, whatever level a later one recorded.
+        let version = if compatible < COMPATIBLE_VERSION {
+            compatible
+        } else {
+            compatible.max(read("schema_level")?)
+        };
         if version < 1 {
             db.execute_batch(
                 "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)",
