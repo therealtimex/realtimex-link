@@ -126,6 +126,34 @@ pub fn lost(error: &anyhow::Error) -> bool {
     not_found(error) || unavailable(error).is_some()
 }
 
+/// Where a window is (realtimex-ai-app#3055): the display holding most of it, and its frame in
+/// that display's native pixels from the display's top-left. `frame` is x, y, width, height in
+/// the system's window coordinates: global points on macOS (`points`: a display's points are its
+/// pixels over its scale), virtual-desktop pixels on Windows and X11. None when it is on no
+/// display (a minimized window on Windows).
+pub fn place_window(frame: [f64; 4], list: &[DisplayInfo], points: bool) -> Option<(String, [i64; 4])> {
+    let [x, y, width, height] = frame;
+    list.iter()
+        .filter_map(|display| {
+            let scale = if points && display.scale > 0.0 { display.scale } else { 1.0 };
+            let (dx, dy) = (display.x as f64, display.y as f64);
+            let (dw, dh) = (display.width as f64 / scale, display.height as f64 / scale);
+            let overlap = |a: f64, size: f64, b: f64, other: f64| {
+                ((a + size).min(b + other) - a.max(b)).max(0.0)
+            };
+            let area = overlap(x, width, dx, dw) * overlap(y, height, dy, dh);
+            (area > 0.0).then_some((area, display, scale, dx, dy))
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, display, scale, dx, dy)| {
+            let pixels = |value: f64| (value * scale).round() as i64;
+            (
+                display.id.clone(),
+                [pixels(x - dx), pixels(y - dy), pixels(width), pixels(height)],
+            )
+        })
+}
+
 /// The displays that can't be captured in the current state (design risk 2, Addendum 1: Link
 /// lists only the displays it can capture now). One whose capture failed as unavailable stays
 /// out of the list until the state changes (the screen unlocks, the login window goes).
@@ -280,6 +308,40 @@ mod tests {
         assert!(table.cached(Some("a")).is_none());
         table.read_at = Some(Instant::now() - REFRESH);
         assert!(table.cached(Some("a")).is_none());
+    }
+
+    #[test]
+    fn a_window_is_on_the_display_holding_most_of_it_in_its_native_pixels() {
+        let info = |id: &str, x: i32, width: u32, height: u32, scale: f64| DisplayInfo {
+            id: id.into(),
+            name: String::new(),
+            primary: x == 0,
+            x,
+            y: 0,
+            width,
+            height,
+            scale,
+        };
+        // macOS: a Retina laptop (1512×982 points) and a 4K display at 2× to its right.
+        let mac = [info("1", 0, 3024, 1964, 2.0), info("2", 1512, 3840, 2160, 2.0)];
+        assert_eq!(
+            place_window([100.0, 50.0, 800.0, 600.0], &mac, true),
+            Some(("1".into(), [200, 100, 1600, 1200]))
+        );
+        // Mostly on the second display: there, from its own origin.
+        assert_eq!(
+            place_window([1400.0, 10.0, 600.0, 400.0], &mac, true),
+            Some(("2".into(), [-224, 20, 1200, 800]))
+        );
+        // Windows and X11: pixels of the virtual desktop.
+        let win = [info("\\\\.\\DISPLAY1", 0, 1920, 1080, 1.5), info("\\\\.\\DISPLAY2", 1920, 2560, 1440, 1.0)];
+        assert_eq!(
+            place_window([2000.0, 100.0, 800.0, 600.0], &win, false),
+            Some(("\\\\.\\DISPLAY2".into(), [80, 100, 800, 600]))
+        );
+        // A minimized Windows window sits far off every display.
+        assert_eq!(place_window([-32000.0, -32000.0, 160.0, 28.0], &win, false), None);
+        assert_eq!(place_window([0.0, 0.0, 10.0, 10.0], &[], false), None);
     }
 
     /// The wire form agreed with realtimex-ai-app#2970: camelCase, native pixels.

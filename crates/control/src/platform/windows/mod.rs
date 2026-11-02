@@ -48,6 +48,9 @@ use crate::platform::{Button, InputError, PasteGap, Shot};
 mod clipboard;
 mod desktop;
 mod keymap;
+/// The window list and focus (realtimex-ai-app#3055).
+mod wins;
+pub use self::wins::{focus_window, list_windows, screen_locked};
 
 pub use self::desktop::follow_input_desktop;
 

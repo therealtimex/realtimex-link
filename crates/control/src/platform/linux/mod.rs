@@ -13,6 +13,9 @@ use crate::codes::PhysicalKey;
 
 mod terminal;
 mod wayland_input;
+/// The window list and focus on X11 (realtimex-ai-app#3055).
+mod wins;
+pub use wins::{focus_window, list_windows, screen_locked};
 mod x11_clipboard;
 mod x11_input;
 

@@ -68,3 +68,18 @@ fn desktop_name(desktop: HDESK) -> Option<String> {
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     Some(String::from_utf16_lossy(&buffer[..len]))
 }
+
+/// Whether the desktop receiving input is the user's own ("Default"): not the lock or sign-in
+/// screen nor a UAC prompt's secure desktop (realtimex-ai-app#3055). Run as the signed-in user,
+/// those can't even be opened, which counts as not.
+pub fn input_desktop_is_default() -> bool {
+    // SAFETY: a handle this function opens and closes.
+    let Ok(desktop) =
+        (unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x0001)) })
+    else {
+        return false;
+    };
+    let name = desktop_name(desktop);
+    let _ = unsafe { CloseDesktop(desktop) };
+    name.is_some_and(|name| name.eq_ignore_ascii_case("Default"))
+}
