@@ -109,9 +109,3 @@ pub fn focus_window(window: &Listed) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-
-/// X11 has no lock state Link can read for every desktop; the lock screen is a window above the
-/// rest, so nothing is reported locked here.
-pub fn screen_locked() -> bool {
-    false
-}

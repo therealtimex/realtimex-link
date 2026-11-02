@@ -184,9 +184,16 @@ pub fn follow_input_desktop() -> Option<String> {
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    control_permissions, focus_window, list_windows, permission_owner, request_control_permission,
-    screen_locked, screenshot_needs_input, set_virtual_displays, Input,
+    control_permissions, focus_window, list_windows, lock_state, permission_owner,
+    request_control_permission, screen_locked, screenshot_needs_input, set_virtual_displays, Input,
 };
+
+/// Locked or not; elsewhere the platform always knows. Linux answers `None` when no lock screen
+/// answers on D-Bus (linux/lock.rs).
+#[cfg(not(target_os = "linux"))]
+pub fn lock_state() -> Option<bool> {
+    Some(screen_locked())
+}
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod unsupported;

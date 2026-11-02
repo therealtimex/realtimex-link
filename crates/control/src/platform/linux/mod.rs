@@ -11,11 +11,14 @@ use super::{Button, Frame, Shot};
 use crate::displays::Display;
 use crate::codes::PhysicalKey;
 
+/// Whether the screen is locked, from GNOME and logind over D-Bus (realtimex-ai-app#3055).
+mod lock;
+pub use lock::{lock_state, screen_locked};
 mod terminal;
 mod wayland_input;
 /// The window list and focus on X11 (realtimex-ai-app#3055).
 mod wins;
-pub use wins::{focus_window, list_windows, screen_locked};
+pub use wins::{focus_window, list_windows};
 mod x11_clipboard;
 mod x11_input;
 

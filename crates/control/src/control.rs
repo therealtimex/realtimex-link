@@ -647,15 +647,23 @@ impl Controller {
     }
 }
 
-/// `screen-locked` while the screen is locked: window titles must not leak from behind it.
+/// `screen-locked` while the screen is locked: window titles and app contents must not leak from
+/// behind it. When Link can't tell (Linux with no lock screen answering on D-Bus), the same:
+/// a guard that can't see the lock would not guard anything.
 fn refuse_when_locked() -> Result<()> {
-    if platform::screen_locked() {
-        return Err(platform::refused(
+    match platform::lock_state() {
+        Some(false) => Ok(()),
+        Some(true) => Err(platform::refused(
             "screen-locked",
             "The screen is locked. Unlock it to see its windows.",
-        ));
+        )),
+        None => Err(platform::refused(
+            "screen-locked",
+            "Link can't tell whether the screen is locked here (neither the desktop's screensaver \
+             nor logind answered on D-Bus), so it shows no windows or app contents. Check that \
+             the session bus and systemd-logind are reachable.",
+        )),
     }
-    Ok(())
 }
 
 /// A window as rtx-linkd and agents get it (realtimex-ai-app#3055).
