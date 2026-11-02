@@ -278,6 +278,13 @@ fn routes(shared: &Arc<Shared>) -> Router {
         .route("/remote-control/peer/offer", post(peer_offer))
         .route("/remote-control/transfer", post(transfer))
         .route("/remote-control/stop", post(stop))
+        // The accessibility layer (ax.rs, realtimex-ai-app#3055 Phase 2): feature "ax".
+        .route("/remote-control/ax/apps", get(ax_apps))
+        .route("/remote-control/ax/snapshot", post(ax_snapshot))
+        .route("/remote-control/ax/find", post(ax_find))
+        .route("/remote-control/ax/get", post(ax_get))
+        .route("/remote-control/ax/act", post(ax_act))
+        .route("/remote-control/ax/batch", post(ax_batch))
         .fallback(|| async { ApiError::new(404, "Not found") })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(shared.clone())
@@ -512,8 +519,13 @@ fn too_many() -> Response {
 
 /// Unauthenticated so a controller can find the App ID among its Tailscale peers.
 async fn hello(State(shared): State<Ctx>) -> ApiResult<Json<Value>> {
+    let mut features = FEATURES.to_vec();
+    // Only where this platform serves it and the CLI is bundled (ax.rs).
+    if crate::ax::enabled() {
+        features.push("ax");
+    }
     let mut answer =
-        json!({ "service": SERVICE, "version": PROTOCOL_VERSION, "features": FEATURES });
+        json!({ "service": SERVICE, "version": PROTOCOL_VERSION, "features": features });
     if let (Some(target), Some(identity)) = (
         answer.as_object_mut(),
         host_of(&shared)?.identity().as_object(),
@@ -1121,7 +1133,20 @@ async fn list_windows(
     let display = query.get("display").filter(|d| !d.is_empty()).cloned();
     let listed = async {
         require_display(&shared, display.as_deref()).await?;
-        shared.backend.call("windows", json!({})).await
+        match shared.backend.call("windows", json!({})).await {
+            // appKey on every window (Addendum 2).
+            Ok(mut answer) => {
+                crate::appkey::add_keys(&mut answer);
+                Ok(answer)
+            }
+            // GNOME Wayland: agent-desktop lists them, under `a:` ids (§1.2).
+            Err(error) if error.code.as_deref() == Some("unsupported") && crate::ax::enabled() => {
+                let host = host_of(&shared)?;
+                let live = crate::ax::Live { backend: &shared.backend, ax: &host.ax };
+                Ok(json!({ "windows": crate::ax::wayland_windows(&live, &host.ax).await? }))
+            }
+            Err(error) => Err(error),
+        }
     };
     let listed = listed.await;
     audit_row(&shared, &signed.client, "windows", &listed, json!({ "display": display }));
@@ -2773,6 +2798,47 @@ async fn transfer(
         Ok(result) => no_store(Json(result).into_response()),
         Err(error) => error.into_response(),
     }
+}
+
+// --- the accessibility layer (ax.rs) ------------------------------------------------------
+
+/// One `ax/*` route: signed in with view at least (acts need control, ax.rs checks), then the
+/// layer for this client, writing its Activity rows.
+async fn ax_call(shared: Ctx, peer: SocketAddr, headers: HeaderMap, body: Value, op: crate::ax::Op) -> Response {
+    let signed = signed_with!(shared, headers, peer, "view");
+    let host = match host_of(&shared) {
+        Ok(host) => host,
+        Err(error) => return error.into_response(),
+    };
+    let caller = crate::ax::Caller::remote(&signed.client, via_of(&shared));
+    match crate::ax::serve(&shared.backend, &host.ax, &host.audit, &caller, op, &body).await {
+        Ok(answer) => no_store(Json(answer).into_response()),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn ax_apps(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
+    ax_call(shared, peer, headers, json!({}), crate::ax::Op::Apps).await
+}
+
+async fn ax_snapshot(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Snapshot).await
+}
+
+async fn ax_find(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Find).await
+}
+
+async fn ax_get(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Get).await
+}
+
+async fn ax_act(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Act).await
+}
+
+async fn ax_batch(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Batch).await
 }
 
 /// Stop the desktop helper, which ends every live view and session on this computer: that takes

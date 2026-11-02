@@ -958,6 +958,11 @@ pub fn run() -> Result<()> {
         let op = request["op"].as_str().unwrap_or("");
         // Accessibility calls run on a worker thread and answer later, by id (ax.rs).
         if op == "ax" {
+            // A tree read shows what is behind the lock screen, which a screenshot can't (§2.2).
+            if let Err(error) = refuse_when_locked() {
+                write_line(&mut out, &response(id, Err(error)));
+                continue;
+            }
             let to_main = controller.to_main.clone();
             let answer = controller.ax.start(id.clone(), &request, move |done| {
                 let _ = to_main.send(Msg::AxDone(done));

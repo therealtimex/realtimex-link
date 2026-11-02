@@ -298,7 +298,12 @@ fn helper_error(message: &Value, fallback: &str) -> ApiError {
         .and_then(Value::as_str)
         .unwrap_or(fallback);
     match message.get("code").and_then(Value::as_str) {
-        Some(code) => ApiError::coded(helper_status(code), code, text),
+        Some(code) => {
+            let mut error = ApiError::coded(helper_status(code), code, text);
+            // The helper's own wait (the accessibility runner's breaker, ax.rs).
+            error.retry_after_ms = message.get("retryAfterMs").and_then(Value::as_u64);
+            error
+        }
         None => ApiError::new(502, text),
     }
 }
@@ -309,6 +314,10 @@ fn helper_status(code: &str) -> u16 {
         DISPLAY_NOT_FOUND | WINDOW_NOT_FOUND => 404,
         UNSUPPORTED => 501,
         SCREEN_LOCKED => 423,
+        // The accessibility runner's (ax.rs).
+        "bad-request" => 400,
+        "busy" | "unavailable" => 503,
+        "timeout" => 504,
         _ => 409,
     }
 }
@@ -598,6 +607,35 @@ impl Backend {
     }
 
     async fn send(self: &Arc<Self>, op: &str, params: &Value) -> Result<Value, ApiError> {
+        self.send_within(op, params, REQUEST_TIMEOUT).await
+    }
+
+    /// One op of the long-lived helper without starting a capture or input session (the
+    /// accessibility layer and the window list need none: no GNOME sharing prompt, no capture),
+    /// answered within `timeout` (realtimex-ai-app#3055 §2.2: the call's own + 2 s).
+    pub async fn call_unstarted(
+        self: &Arc<Self>,
+        op: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ApiError> {
+        if !self.available() {
+            return Err(ApiError::coded(
+                503,
+                "unavailable",
+                "Remote Control's helper isn't available here",
+            ));
+        }
+        self.touch();
+        self.send_within(op, &params, timeout).await
+    }
+
+    async fn send_within(
+        self: &Arc<Self>,
+        op: &str,
+        params: &Value,
+        timeout: Duration,
+    ) -> Result<Value, ApiError> {
         self.ensure_child().await?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut line = Map::new();
@@ -635,7 +673,7 @@ impl Backend {
                 .remove(&id);
             return Err(ApiError::new(502, "Remote Control helper exited"));
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+        match tokio::time::timeout(timeout, answer).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ApiError::new(502, "Remote Control helper exited")),
             Err(_) => {

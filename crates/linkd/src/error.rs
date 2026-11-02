@@ -182,6 +182,33 @@ pub fn defaults(code: &str, status: u16) -> Defaults {
             Some("Remote control is starting or restarting here; try again shortly."),
         ),
         "busy" => after(500, NONE, Some("Too many waits at once: let one finish first.")),
+        // Phase 2, the accessibility layer (ax.rs).
+        "stale-ref" => plain(
+            Retry::Refresh,
+            NONE,
+            Some("Take a new snapshot (or find) of the window and use a ref from it."),
+        ),
+        "ambiguous-target" => plain(
+            Retry::Refresh,
+            NONE,
+            Some("Several elements match: narrow role, name or text, or pick a ref from candidates."),
+        ),
+        "no-tree" => plain(
+            Retry::No,
+            NONE,
+            Some("This window has no accessibility tree here: use a screenshot and pixel clicks."),
+        ),
+        "needs-pixels" => plain(
+            Retry::No,
+            NONE,
+            Some("Click the centre of `bounds` with click --native --display, or use a screenshot and pixels."),
+        ),
+        "app-unresponsive" => after(500, NONE, Some("The app isn't answering yet: try again shortly.")),
+        "ax-failed" => plain(
+            Retry::No,
+            None,
+            Some("Take a new snapshot to see the element's state before trying anything else."),
+        ),
         "timeout" => plain(Retry::Safe, NONE, None),
         "internal" => plain(Retry::No, Some(Delivery::Unknown), None),
         _ => match status {

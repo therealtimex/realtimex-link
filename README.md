@@ -54,6 +54,18 @@ control other computers from.
   {display?, since?, timeoutMs?, settleMs?, region?}` answers once the screen changed since that
   picture (`{changed, elapsedMs, frame, display, area?}`; `changed:false` at the timeout), from
   rtx-control's change thumbnail every 250 ms, at most two waits per client.
+  **Accessibility** (feature `ax`, realtimex-ai-app#3055 Phase 2): `GET /remote-control/ax/apps`
+  and `POST /remote-control/ax/{snapshot,find,get,act,batch}` read and act on app controls by
+  ref through the bundled, pinned agent-desktop CLI (third_party/agent-desktop.json), which
+  rtx-control runs one at a time with hard timeouts. Nodes are Link's own shape (`ref, role,
+  name, value?, states, secret?, bounds?, actions, children?`; bounds in that display's native
+  pixels); refs belong to the client that got them (15 minutes); a password field's value is
+  never returned (`secret:true`); reads need view and acts control; a locked screen is
+  `screen-locked`. `type` falls back to `set-value`, then a click and paste, and stops when a
+  step may have landed. Codes: `stale-ref`, `ambiguous-target`, `no-tree`, `needs-pixels`,
+  `app-unresponsive`, `ax-failed`. Each platform is switched in `crates/linkd/src/ax.rs`
+  (`PLATFORMS`; `RTX_LINK_AX=0|1` overrides on one computer). Every window and app carries
+  `appKey` (`bundle:`, `pkg:`, `exe:`, `flatpak:`, `snap:`, `desktop:`).
   **Start with this computer on macOS** (0.4.1, realtimex-link#11): one administrator's prompt
   installs a root LaunchDaemon that runs its owner's daemon from boot, and a session agent at the
   login window and in each user's session, so allowed computers connect at the login window and
@@ -235,6 +247,14 @@ kebab-case.
   and at most 50,000 rows; rows that couldn't be saved count in `dropped` (also the overview's
   `auditDropped`): remote control never waits on the log. Schema 3 of `remote-host.db` only adds
   the table, so an older Link still opens the file.
+- **`local-ax`** (realtimex-ai-app#3055 Addendum 2): `GET /v1/ax/apps`, `GET /v1/ax/windows`,
+  `POST /v1/ax/{snapshot,find,get,act,batch}`, the same handlers and answers as the remote `ax`
+  routes for an agent on this computer, with hosting on or off. `X-RTX-Caller:
+  {"id":"<workspaceId>:<threadId>","name":"<thread name>"}` (≤ 512 bytes) is required (else
+  400); refs belong to that caller; Activity rows are `actor:"agent"`, `via:"local"`,
+  `clientId:"local:<id>"`, `clientName` the thread's name. No pixel fallback for these (it would
+  move the person's own pointer). Link holds no per-app policy: a local agent runs as the same
+  OS user, so any allow-list is a guard rail with full visibility, not containment.
 - `PUT /v1/origin`, `/v1/shared`, `/v1/artifacts`, `/v1/webhooks` and `POST /v1/inbox/ack` name the
   adopted exposure; any other is 409 `exposure-mismatch`.
 - **Public request bodies** (413 beyond): `a` and `e` 1 MiB, `h` 15 MiB, `m` 50 MiB, `p` 10 MiB.

@@ -104,6 +104,9 @@ pub struct Host {
     pub store: Arc<Store>,
     /// The activity log (audit.rs, realtimex-ai-app#3055 §1.4).
     pub audit: Audit,
+    /// The accessibility layer's refs and queue (ax.rs, Phase 2), shared by remote clients and
+    /// agents on this computer.
+    pub ax: crate::ax::Ax,
     secrets: SecretBox,
     pub clients: ClientStore,
     pub requests: RequestStore,
@@ -179,6 +182,7 @@ impl Host {
                     }),
                 ),
                 audit,
+                ax: crate::ax::Ax::new(ax_state_dir()),
                 store,
                 secrets,
                 backend,
@@ -1405,6 +1409,16 @@ impl Host {
             "updatedAt": iso_now(),
         })
     }
+}
+
+/// agent-desktop's state (its refs between calls): `<data dir>/agent-desktop/<user>`, private.
+fn ax_state_dir() -> Option<std::path::PathBuf> {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_alphanumeric() || "-_.$".contains(c)))
+        .unwrap_or_else(|| "default".into());
+    crate::paths::data_dir().map(|dir| dir.join("agent-desktop").join(user))
 }
 
 /// Who a connection request is from, for its activity rows: the saved client with that client
