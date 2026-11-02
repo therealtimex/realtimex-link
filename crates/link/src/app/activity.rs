@@ -265,6 +265,35 @@ fn merge(activity: &mut Activity, page: &Value) {
     activity.entries = added;
 }
 
+/// Room the open filter list leaves at each side of the window.
+const LIST_MARGIN: f32 = 24.0;
+
+/// The closed filter's width: the row less Clear… and the gap before it, so Clear… always fits
+/// beside it however long the chosen name (review C1).
+fn filter_width(row: f32, clear: f32, spacing: f32) -> f32 {
+    (row - clear - spacing).max(0.0)
+}
+
+/// The open filter list's widest: the window less a margin at each side, so a long name wraps
+/// inside the window instead of running past it (review C1).
+fn list_width(window: f32) -> f32 {
+    (window - 2.0 * LIST_MARGIN).max(0.0)
+}
+
+/// What a ComboBox adds around its text: the padding, the gap and the arrow.
+fn combo_chrome(ui: &egui::Ui) -> f32 {
+    let spacing = ui.spacing();
+    2.0 * spacing.button_padding.x + spacing.item_spacing.x + spacing.icon_width
+}
+
+/// How wide `text` is on one line, in the button font.
+fn text_width(ui: &egui::Ui, text: &str) -> f32 {
+    egui::WidgetText::from(text)
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button)
+        .size()
+        .x
+}
+
 /// Read the newest page again now: every 5 s while the tab shows, and at once when it is shown
 /// again after another tab (or the window was away), quietly, without the spinner (review C2).
 fn refresh_due(load: Load, polled: Option<Instant>, shown_again: bool) -> bool {
@@ -1083,17 +1112,39 @@ impl LinkApp {
                 .as_deref()
                 .and_then(name_of_choice)
                 .unwrap_or_else(|| all.clone());
+            // The closed filter keeps its width and cuts a long name with "…" (the full name on
+            // hover and in the list), so Clear… and the rows below never leave the window: a wider
+            // row widened everything under it (review C1).
+            let width = filter_width(ui.available_width(), clear_width, spacing);
+            let whole = text_width(ui, &selected) + combo_chrome(ui) <= width;
             ui.add_enabled_ui(ready, |ui| {
+                ui.set_max_width(width);
                 let combo = egui::ComboBox::from_id_salt("activity-computer")
-                    .width((ui.available_width() - clear_width - spacing).max(120.0))
-                    .selected_text(selected)
+                    .width(width)
+                    .truncate()
+                    .selected_text(selected.as_str())
                     .show_ui(ui, |ui| {
+                        // The full names, wrapped inside the window.
+                        let widest = std::iter::once(all.as_str())
+                            .chain(options.iter().map(|(_, label, _)| label.as_str()))
+                            .map(|label| text_width(ui, label))
+                            .fold(0.0, f32::max)
+                            + 2.0 * ui.spacing().button_padding.x;
+                        let room = list_width(ui.ctx().content_rect().width());
+                        ui.set_min_width(widest.min(room));
+                        ui.set_max_width(room);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         theme::selectable_value(ui, &mut chosen, None, &all);
                         for (id, label, _) in &options {
                             theme::selectable_value(ui, &mut chosen, Some(id.clone()), label);
                         }
                     });
-                keep_focus(&mut self.open_combo, ctx, &combo.response);
+                let combo_response = if whole {
+                    combo.response.clone()
+                } else {
+                    combo.response.clone().on_hover_text(selected.as_str())
+                };
+                keep_focus(&mut self.open_combo, ctx, &combo_response);
                 if focus_filter && ready {
                     combo.response.request_focus();
                     focus_filter = false;
@@ -1573,6 +1624,21 @@ mod tests {
         fresh_page(&mut activity, &page(301..=400, true));
         assert!(!took_older(&mut activity, 101, &page(1..=100, false)));
         assert_eq!(ids(&activity).len(), 100);
+    }
+
+    #[test]
+    fn the_filter_and_its_list_stay_inside_the_window() {
+        // 380 pt: the row is what the window's margins leave; Clear… always fits beside the
+        // filter, however long the chosen name (review C1).
+        for (row, clear) in [(348.0, 92.0), (408.0, 92.0), (348.0, 120.0)] {
+            let width = filter_width(row, clear, 8.0);
+            assert!(width + 8.0 + clear <= row, "{row} {clear}");
+            assert!(width > 0.0);
+        }
+        assert_eq!(filter_width(80.0, 92.0, 8.0), 0.0);
+        // The open list: inside the window at each side.
+        assert_eq!(list_width(380.0), 380.0 - 2.0 * LIST_MARGIN);
+        assert_eq!(list_width(10.0), 0.0);
     }
 
     #[test]
