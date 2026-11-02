@@ -64,6 +64,81 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(8);
 const ACT_TIMEOUT: Duration = Duration::from_secs(8);
+/// How much longer than the CLI's own deadline rtx-linkd waits for rtx-control's answer (§2.2).
+const ANSWER_GRACE: Duration = Duration::from_secs(2);
+/// rtx-control's version check, run before a call when it is due, has this budget of its own
+/// (crates/control/src/ax.rs `VERSION_CHECK`), so it never eats into the call's deadline.
+const VERSION_CHECK: Duration = Duration::from_secs(5);
+
+/// How long a call may still take: a batch's 20 s are a deadline, and each step's CLI call is
+/// capped by what is left of them (§2.3). Single calls have none.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Budget {
+    deadline: Option<Instant>,
+}
+
+impl Budget {
+    pub fn until(deadline: Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+        }
+    }
+
+    /// `timeout` capped by what is left; None when nothing is.
+    pub fn cap(&self, timeout: Duration) -> Option<Duration> {
+        match self.deadline {
+            None => Some(timeout),
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                (!left.is_zero()).then(|| timeout.min(left))
+            }
+        }
+    }
+}
+
+/// The batch's 20 s are over before this call could start: nothing was sent.
+fn out_of_time() -> ApiError {
+    ApiError::coded(504, "timeout", "The batch ran out of its 20 s").with_delivery(Delivery::None)
+}
+
+/// A failure of the runner itself (not one agent-desktop answered with), as a read or an action
+/// sees it (§1.1, §2.2 "Crashes"):
+/// - `ax-crashed` (it ended without an answer) is `unavailable` for a read, and `ax-failed` with
+///   `delivery:"unknown"` for an action, which may have happened before it ended;
+/// - `timeout` of an action is `retry:"no"`, `delivery:"unknown"`, so the agent never types twice.
+fn runner_failure(error: ApiError, acting: bool) -> ApiError {
+    match (error.code_or_status().as_str(), acting) {
+        ("ax-crashed", false) => {
+            let mut unavailable = ApiError::coded(503, "unavailable", "agent-desktop ended without an answer");
+            unavailable.retry_after_ms = error.retry_after_ms;
+            unavailable
+        }
+        ("ax-crashed", true) => ApiError::coded(409, "ax-failed", "agent-desktop ended without an answer; the action may have happened")
+            .with_delivery(Delivery::Unknown)
+            .with_retry(Retry::No)
+            .with_suggestion("Read the element's state with get or a new snapshot before trying anything else."),
+        ("timeout", true) => ApiError {
+            code: Some("timeout".into()),
+            ..error
+        }
+        .with_delivery(Delivery::Unknown)
+        .with_retry(Retry::No)
+        .with_suggestion("The action may have happened: read the element's state with get or a new snapshot before trying again."),
+        _ => error,
+    }
+}
+
+/// A reading CLI call within `budget`.
+async fn read_cli<D: Desktop>(desktop: &D, argv: Vec<String>, timeout: Duration, budget: Budget) -> ApiResult<Value> {
+    let timeout = budget.cap(timeout).ok_or_else(out_of_time)?;
+    desktop.cli(argv, timeout).await.map_err(|error| runner_failure(error, false))
+}
+
+/// An acting CLI call within `budget`.
+async fn act_cli<D: Desktop>(desktop: &D, argv: Vec<String>, timeout: Duration, budget: Budget) -> ApiResult<Value> {
+    let timeout = budget.cap(timeout).ok_or_else(out_of_time)?;
+    desktop.cli(argv, timeout).await.map_err(|error| runner_failure(error, true))
+}
 
 /// The actions an element may be asked for, exactly (§2.3).
 pub const ACTIONS: [&str; 8] = [
@@ -230,14 +305,20 @@ pub fn map_error(error: &CliError, acting: bool, bounds: Option<&Value>) -> ApiE
         "timeout" => {
             api.retry = Some(if acting { Retry::No } else { Retry::Safe });
         }
-        "ax-failed" => {
-            api.retry = Some(if delivery == Delivery::None {
-                Retry::Safe
-            } else {
-                Retry::No
-            });
-        }
         _ => {}
+    }
+    // An action that timed out may have happened, whatever agent-desktop's delivery says (§1.1).
+    let delivery = if acting && code == "timeout" {
+        Delivery::Unknown
+    } else {
+        delivery
+    };
+    if code == "ax-failed" {
+        api.retry = Some(if delivery == Delivery::None {
+            Retry::Safe
+        } else {
+            Retry::No
+        });
     }
     if acting {
         api.delivery = Some(delivery);
@@ -303,10 +384,34 @@ fn truncated(text: &str) -> (String, bool) {
     (text[..end].to_string(), true)
 }
 
+/// Roles that are password fields by themselves. agent-desktop 1.0.2 reports these as
+/// `textfield` plus the `secure` state; a raw role is honoured too, should one ever come through.
+const SECRET_ROLES: [&str; 4] = ["passwordtext", "securetextfield", "axsecuretextfield", "password"];
+
+/// A password field, by any reliable signal agent-desktop 1.0.2 gives (§2.5, G2): the `secure`
+/// state, which its state vocabulary (`core/src/tree/state.rs`) sets from the platform's own
+/// marker:
+/// - macOS: role or subrole `AXSecureTextField` (`macos/src/tree/query/node_read.rs`);
+/// - Windows: UI Automation `IsPassword` (`windows/src/tree/states.rs`);
+/// - Linux: AT-SPI role `password text`, number 40 (`linux/src/tree/vocabulary/states.rs`).
+///
+/// Or a password role, should one come through raw. Never a guess from the name.
 fn is_secret(raw: &Value) -> bool {
-    raw.get("states")
+    let secure_state = raw
+        .get("states")
         .and_then(Value::as_array)
-        .is_some_and(|states| states.iter().any(|s| s.as_str() == Some("secure")))
+        .is_some_and(|states| states.iter().any(|s| s.as_str() == Some("secure")));
+    let secret_role = |key: &str| {
+        raw.get(key).and_then(Value::as_str).is_some_and(|role| {
+            let plain: String = role
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            SECRET_ROLES.contains(&plain.as_str())
+        })
+    };
+    secure_state || secret_role("role") || secret_role("subrole")
 }
 
 /// A frame in global coordinates (points on macOS, pixels elsewhere) as `{display, x, y, width,
@@ -511,7 +616,8 @@ impl Ax {
             error.retry_after_ms = Some(500);
             error.with_suggestion("Wait a moment and try again.")
         };
-        if self.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_QUEUED + 1 {
+        // `waiting` counts the calls not yet holding the slot: at most MAX_QUEUED of them.
+        if self.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_QUEUED {
             self.waiting.fetch_sub(1, Ordering::SeqCst);
             return Err(busy());
         }
@@ -604,9 +710,10 @@ impl Desktop for Live<'_> {
         if let Some(dir) = &self.ax.state_dir {
             params["stateDir"] = json!(dir);
         }
+        // rtx-control may run its version check first, within its own budget.
         let answer = self
             .backend
-            .call_unstarted("ax", params, timeout + Duration::from_secs(2))
+            .call_unstarted("ax", params, timeout + ANSWER_GRACE + VERSION_CHECK)
             .await?;
         Ok(answer.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -661,9 +768,11 @@ fn listed(windows: &Value) -> Vec<Value> {
 }
 
 /// Link's window `id` as agent-desktop knows it (G2): macOS and Windows windows by their native
-/// number (`w-<CGWindowID>`, `w-<HWND, decimal>`); X11 by pid (and title when one app has
-/// several), since agent-desktop lists AT-SPI windows there; `a:` ids from the Wayland list.
-pub async fn target<D: Desktop>(desktop: &D, ax: &Ax, id: &str) -> ApiResult<Target> {
+/// number (`w-<CGWindowID>`; `w-<HWND>` in decimal, as agent-desktop 1.0.2 writes and parses it:
+/// `windows/src/system/window/window_ops.rs`, while Link's own `w:` id is hex); X11 by pid (and
+/// title when one app has several), since agent-desktop lists AT-SPI windows there; `a:` ids
+/// from the Wayland list.
+pub async fn target<D: Desktop>(desktop: &D, ax: &Ax, id: &str, budget: Budget) -> ApiResult<Target> {
     let not_found = || {
         ApiError::coded(
             404,
@@ -673,7 +782,7 @@ pub async fn target<D: Desktop>(desktop: &D, ax: &Ax, id: &str) -> ApiResult<Tar
     };
     if id.starts_with("a:") {
         let cli_window = ax.wayland_window(id).ok_or_else(not_found)?;
-        let apps = wayland_windows(desktop, ax).await?;
+        let apps = wayland_listed(desktop, ax, budget).await?;
         let found = apps.iter().find(|w| w["id"] == id).ok_or_else(not_found)?;
         return Ok(Target {
             window: id.to_string(),
@@ -702,7 +811,7 @@ pub async fn target<D: Desktop>(desktop: &D, ax: &Ax, id: &str) -> ApiResult<Tar
         WindowId::Win(hwnd) => format!("w-{hwnd}"),
         WindowId::X11(_) => {
             let title = window["title"].as_str().unwrap_or("");
-            let list = data(&desktop.cli(vec!["list-windows".into()], LIST_TIMEOUT).await?)
+            let list = data(&read_cli(desktop, vec!["list-windows".into()], LIST_TIMEOUT, budget).await?)
                 .map_err(|e| map_error(&e, false, None))?;
             let theirs: Vec<&Value> = list
                 .as_array()
@@ -737,7 +846,11 @@ pub async fn target<D: Desktop>(desktop: &D, ax: &Ax, id: &str) -> ApiResult<Tar
 
 /// GNOME Wayland: Link can't list windows; agent-desktop can, under `a:` ids.
 pub async fn wayland_windows<D: Desktop>(desktop: &D, ax: &Ax) -> ApiResult<Vec<Value>> {
-    let list = data(&desktop.cli(vec!["list-windows".into()], LIST_TIMEOUT).await?)
+    wayland_listed(desktop, ax, Budget::default()).await
+}
+
+async fn wayland_listed<D: Desktop>(desktop: &D, ax: &Ax, budget: Budget) -> ApiResult<Vec<Value>> {
+    let list = data(&read_cli(desktop, vec!["list-windows".into()], LIST_TIMEOUT, budget).await?)
         .map_err(|e| map_error(&e, false, None))?;
     Ok(list
         .as_array()
@@ -852,7 +965,7 @@ fn depth_of(body: &Value) -> ApiResult<u64> {
 pub async fn snapshot<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value) -> ApiResult<(Value, Target)> {
     let window = text_field(body, "window").ok_or_else(|| ApiError::bad_request("window is required"))?;
     let depth = depth_of(body)?;
-    let target = target(desktop, ax, window).await?;
+    let target = target(desktop, ax, window, Budget::default()).await?;
     let mut argv = vec![
         "snapshot".to_string(),
         format!("--window-id={}", target.cli_window),
@@ -869,7 +982,7 @@ pub async fn snapshot<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &
         }
         argv.push(format!("--root={root}"));
     }
-    let envelope = desktop.cli(argv, SNAPSHOT_TIMEOUT).await?;
+    let envelope = read_cli(desktop, argv, SNAPSHOT_TIMEOUT, Budget::default()).await?;
     let answer = match data(&envelope) {
         Ok(answer) => answer,
         Err(error) if error.code == "APP_NOT_FOUND" && cfg!(target_os = "linux") => {
@@ -919,8 +1032,8 @@ pub async fn find<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Valu
             .filter(|n| (1..=FIND_LIMIT_MAX).contains(n))
             .ok_or_else(|| ApiError::bad_request("limit must be from 1 to 50"))?,
     };
-    let target = target(desktop, ax, window).await?;
-    let matches = find_in(desktop, ax, caller, &target, body, limit).await?;
+    let target = target(desktop, ax, window, Budget::default()).await?;
+    let matches = find_in(desktop, ax, caller, &target, body, limit, Budget::default()).await?;
     Ok((json!({ "matches": matches }), target))
 }
 
@@ -931,6 +1044,7 @@ async fn find_in<D: Desktop>(
     target: &Target,
     query: &Value,
     limit: u64,
+    budget: Budget,
 ) -> ApiResult<Vec<Value>> {
     let mut argv = vec!["find".to_string(), format!("--window-id={}", target.cli_window)];
     let mut any = false;
@@ -944,12 +1058,18 @@ async fn find_in<D: Desktop>(
         return Err(ApiError::bad_request("find needs role, name or text"));
     }
     argv.push(format!("--limit={limit}"));
-    let answer = data(&desktop.cli(argv, READ_TIMEOUT).await?).map_err(|e| map_error(&e, false, None))?;
+    let answer = data(&read_cli(desktop, argv, READ_TIMEOUT, budget).await?).map_err(|e| map_error(&e, false, None))?;
     let raw: Vec<Value> = match answer.get("matches").and_then(Value::as_array) {
         Some(list) => list.clone(),
         None => answer.get("match").cloned().into_iter().filter(|m| !m.is_null()).collect(),
     };
-    let displays: Vec<Value> = Vec::new();
+    // agent-desktop 1.0.2 gives bounds only for matches without a ref; place them when it does.
+    // A ref's bounds are read when needs-pixels wants them (`bounds_for`).
+    let displays = if raw.iter().any(|m| m.get("bounds").is_some()) {
+        desktop.displays().await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut walk = Walk {
         owner: &caller.owner,
         window: &target.window,
@@ -974,7 +1094,7 @@ pub async fn get<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value
     let reference = text_field(body, "ref").ok_or_else(|| ApiError::bad_request("ref is required"))?;
     let property = text_field(body, "property").unwrap_or("value");
     let entry = ax.lookup(&caller.owner, reference)?;
-    let value = get_property(desktop, &entry, reference, property).await?;
+    let value = get_property(desktop, &entry, reference, property, Budget::default()).await?;
     let mut answer = json!({ "ref": reference, "property": property, "value": value });
     if entry.secret && property == "value" {
         answer["secret"] = json!(true);
@@ -982,10 +1102,18 @@ pub async fn get<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value
     Ok((answer, entry))
 }
 
-async fn get_property<D: Desktop>(desktop: &D, entry: &RefEntry, reference: &str, property: &str) -> ApiResult<Value> {
+async fn get_property<D: Desktop>(
+    desktop: &D,
+    entry: &RefEntry,
+    reference: &str,
+    property: &str,
+    budget: Budget,
+) -> ApiResult<Value> {
+    // agent-desktop 1.0.2's `get --property`: `title` is the element's name, while `text` is its
+    // value for a field (core/src/commands/get.rs), so `name` must never ask for `text`.
     let cli_property = match property {
         "value" => "value",
-        "name" => "text",
+        "name" => "title",
         "states" => "states",
         "bounds" => "bounds",
         _ => return Err(ApiError::bad_request("property must be value, name, states or bounds")),
@@ -1000,7 +1128,7 @@ async fn get_property<D: Desktop>(desktop: &D, entry: &RefEntry, reference: &str
         "--".to_string(),
         reference.to_string(),
     ];
-    let answer = data(&desktop.cli(argv, READ_TIMEOUT).await?).map_err(|e| map_error(&e, false, None))?;
+    let answer = data(&read_cli(desktop, argv, READ_TIMEOUT, budget).await?).map_err(|e| map_error(&e, false, None))?;
     let value = answer.get("value").cloned().unwrap_or(Value::Null);
     Ok(match property {
         "bounds" => {
@@ -1027,7 +1155,40 @@ fn landed(answer: &Value) -> Delivery {
     delivery_of(answer["disposition"]["delivery"].as_str())
 }
 
-/// The type fallback chain and every other action (§2.4.3, §2.4.5).
+/// The element's bounds for a pixel fallback: from its snapshot, else read now (a ref from
+/// `find` has none: agent-desktop 1.0.2 gives bounds only for matches without a ref).
+async fn bounds_for<D: Desktop>(desktop: &D, entry: &RefEntry, reference: &str, budget: Budget) -> Option<Value> {
+    if let Some(bounds) = &entry.bounds {
+        return Some(bounds.clone());
+    }
+    get_property(desktop, entry, reference, "bounds", budget)
+        .await
+        .ok()
+        .filter(|bounds| bounds.is_object())
+}
+
+/// needs-pixels for `entry`, with its `bounds` and `display` when they can be had (§2.4.5).
+async fn needs_pixels<D: Desktop>(
+    desktop: &D,
+    entry: &RefEntry,
+    reference: &str,
+    budget: Budget,
+    error: ApiError,
+) -> ApiError {
+    if error.details.is_some() {
+        return error;
+    }
+    match bounds_for(desktop, entry, reference, budget).await {
+        Some(bounds) => {
+            let display = bounds.get("display").cloned();
+            error.with_details(json!({ "bounds": bounds, "display": display }))
+        }
+        None => error,
+    }
+}
+
+/// The type fallback chain and every other action (§2.4.3, §2.4.5). `budget`: what is left of a
+/// batch's 20 s.
 pub async fn act_on<D: Desktop>(
     desktop: &D,
     entry: &RefEntry,
@@ -1035,6 +1196,7 @@ pub async fn act_on<D: Desktop>(
     action: &str,
     value: Option<&str>,
     pixels_allowed: bool,
+    budget: Budget,
 ) -> ApiResult<Acted> {
     if !ACTIONS.contains(&action) {
         return Err(ApiError::bad_request(format!(
@@ -1048,26 +1210,21 @@ pub async fn act_on<D: Desktop>(
         (true, None) => return Err(ApiError::bad_request(format!("{action} needs value"))),
         (false, _) => None,
     };
-    let needs_pixels = || {
-        let mut error = ApiError::coded(422, "needs-pixels", format!("This element can't {action} through accessibility"));
-        if let Some(bounds) = &entry.bounds {
-            error = error.with_details(json!({ "bounds": bounds, "display": bounds.get("display") }));
-        }
-        error.with_delivery(Delivery::None)
-    };
     let advertised = |name: &str| entry.actions.as_ref().is_none_or(|list| list.iter().any(|a| a == name));
     if action == "type" {
-        return type_chain(desktop, entry, reference, value.unwrap_or(""), pixels_allowed).await;
+        return type_chain(desktop, entry, reference, value.unwrap_or(""), pixels_allowed, budget).await;
     }
     // Not something this element does: the agent clicks its centre instead.
     if !advertised(action) {
-        return Err(needs_pixels());
+        let error = ApiError::coded(422, "needs-pixels", format!("This element can't {action} through accessibility"))
+            .with_delivery(Delivery::None);
+        return Err(needs_pixels(desktop, entry, reference, budget, error).await);
     }
     let mut argv = vec![action.to_string(), "--".to_string(), reference.to_string()];
     if let Some(value) = value {
         argv.push(value.to_string());
     }
-    let envelope = desktop.cli(argv, ACT_TIMEOUT).await?;
+    let envelope = act_cli(desktop, argv, ACT_TIMEOUT, budget).await?;
     match data(&envelope) {
         Ok(answer) => Ok(Acted {
             // How text went in; any other action went through accessibility as itself.
@@ -1075,12 +1232,20 @@ pub async fn act_on<D: Desktop>(
             delivery: landed(&answer),
             value: read_back(&answer, entry),
         }),
-        Err(error) => Err(map_error(&error, true, entry.bounds.as_ref())),
+        Err(error) => {
+            let error = map_error(&error, true, entry.bounds.as_ref());
+            if error.code.as_deref() == Some("needs-pixels") {
+                return Err(needs_pixels(desktop, entry, reference, budget, error).await);
+            }
+            Err(error)
+        }
     }
 }
 
+/// The value an action left, for the answer: never a password's (marked in the snapshot, or in
+/// the state agent-desktop read after acting).
 fn read_back(answer: &Value, entry: &RefEntry) -> Option<Value> {
-    if entry.secret {
+    if entry.secret || is_secret(&answer["post_state"]) {
         return None;
     }
     answer["post_state"]["value"]
@@ -1104,10 +1269,15 @@ async fn type_chain<D: Desktop>(
     reference: &str,
     text: &str,
     pixels_allowed: bool,
+    budget: Budget,
 ) -> ApiResult<Acted> {
-    let envelope = desktop
-        .cli(vec!["type".into(), "--".into(), reference.into(), text.into()], ACT_TIMEOUT)
-        .await?;
+    let envelope = act_cli(
+        desktop,
+        vec!["type".into(), "--".into(), reference.into(), text.into()],
+        ACT_TIMEOUT,
+        budget,
+    )
+    .await?;
     let refused = match data(&envelope) {
         Ok(answer) => {
             let delivery = landed(&answer);
@@ -1132,14 +1302,18 @@ async fn type_chain<D: Desktop>(
     // 2. set-value with the text appended (at the end, not the caret).
     let settable = entry.actions.as_ref().is_some_and(|a| a.iter().any(|x| x == "set-value"));
     if settable && !entry.secret {
-        if let Ok(Value::String(old)) = get_property(desktop, entry, reference, "value").await {
+        if let Ok(Value::String(old)) = get_property(desktop, entry, reference, "value", budget).await {
             let wanted = format!("{old}{text}");
-            let set = desktop
-                .cli(vec!["set-value".into(), "--".into(), reference.into(), wanted.clone()], ACT_TIMEOUT)
-                .await?;
+            let set = act_cli(
+                desktop,
+                vec!["set-value".into(), "--".into(), reference.into(), wanted.clone()],
+                ACT_TIMEOUT,
+                budget,
+            )
+            .await?;
             match data(&set) {
                 Ok(_) => {
-                    let now = get_property(desktop, entry, reference, "value").await;
+                    let now = get_property(desktop, entry, reference, "value", budget).await;
                     return match now {
                         Ok(Value::String(now)) if now == wanted => Ok(Acted {
                             via: "set-value",
@@ -1156,8 +1330,9 @@ async fn type_chain<D: Desktop>(
         }
     }
     // 3. A click at its centre and a paste (the real pointer moves); not for local agents.
+    let bounds = bounds_for(desktop, entry, reference, budget).await;
     if pixels_allowed {
-        if let Some(bounds) = &entry.bounds {
+        if let Some(bounds) = &bounds {
             desktop.paste_at(bounds, text).await.map_err(|error| {
                 ApiError {
                     delivery: Some(Delivery::Unknown),
@@ -1175,8 +1350,9 @@ async fn type_chain<D: Desktop>(
     // 4. The agent does it with pixels.
     let mut error = ApiError::coded(422, "needs-pixels", "This element takes no typing through accessibility")
         .with_delivery(Delivery::None);
-    if let Some(bounds) = &entry.bounds {
-        error = error.with_details(json!({ "bounds": bounds, "display": bounds.get("display") }));
+    if let Some(bounds) = bounds {
+        let display = bounds.get("display").cloned();
+        error = error.with_details(json!({ "bounds": bounds, "display": display }));
     }
     Err(error)
 }
@@ -1187,7 +1363,7 @@ pub async fn act<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value
     let action = text_field(body, "action").ok_or_else(|| ApiError::bad_request("action is required"))?;
     let value = body.get("value").and_then(Value::as_str);
     let entry = ax.lookup(&caller.owner, reference)?;
-    let acted = act_on(desktop, &entry, reference, action, value, !caller.local).await?;
+    let acted = act_on(desktop, &entry, reference, action, value, !caller.local, Budget::default()).await?;
     let mut answer = json!({
         "ref": reference,
         "action": action,
@@ -1239,15 +1415,32 @@ fn error_json(error: &ApiError) -> Value {
     body
 }
 
-/// One step's activity: an act's row, or a read of the window.
+/// One step's activity: an act's row, or a read of the window. `via` only when the act
+/// happened (how it went in); a failed act names none.
 pub enum Note {
     Read { window: String, app: String },
-    Act { entry: RefEntry, action: String, via: &'static str, error: Option<ApiError> },
+    Act { entry: Option<RefEntry>, action: String, via: Option<&'static str>, error: Option<ApiError> },
 }
+
+/// A batch step that would run past the deadline is cut off this long after it, as rtx-linkd
+/// waits for any CLI answer (its CLI calls are already capped by what is left).
+const STEP_GRACE: Duration = ANSWER_GRACE;
 
 /// `POST ax/batch {window, steps:[…≤10], stopOnError=true}` → `{results:[{ok, data|error}]}`,
 /// within 20 s in all. The rows to write come back with it.
 pub async fn batch<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value) -> ApiResult<(Value, Vec<Note>)> {
+    batch_until(desktop, ax, caller, body, Instant::now() + BATCH_TIMEOUT).await
+}
+
+/// The batch with its deadline: each step's CLI calls are capped by what is left of it, and a
+/// step still running at the deadline (plus the answer grace) is cut off as a timeout.
+async fn batch_until<D: Desktop>(
+    desktop: &D,
+    ax: &Ax,
+    caller: &Caller,
+    body: &Value,
+    deadline: Instant,
+) -> ApiResult<(Value, Vec<Note>)> {
     let window = text_field(body, "window").ok_or_else(|| ApiError::bad_request("window is required"))?;
     let steps = body
         .get("steps")
@@ -1256,99 +1449,144 @@ pub async fn batch<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Val
         .ok_or_else(|| ApiError::bad_request("steps must be 1 to 10 steps"))?;
     let parsed: Vec<Step> = steps.iter().map(step_of).collect::<ApiResult<_>>()?;
     let stop_on_error = body.get("stopOnError") != Some(&Value::Bool(false));
-    let target = target(desktop, ax, window).await?;
-    let deadline = Instant::now() + BATCH_TIMEOUT;
+    let budget = Budget::until(deadline);
+    let target = target(desktop, ax, window, budget).await?;
     let mut results = Vec::new();
     let mut notes = Vec::new();
-    let mut stopped = false;
     for step in parsed {
-        if stopped {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            results.push(json!({ "ok": false, "error": error_json(&out_of_time()) }));
             break;
         }
-        if Instant::now() >= deadline {
-            results.push(json!({ "ok": false, "error": error_json(&ApiError::coded(504, "timeout", "The batch ran out of its 20 s")) }));
-            break;
-        }
-        let outcome: ApiResult<Value> = match step {
-            Step::Get(get_step) => {
-                let reference = text_field(get_step, "ref").unwrap_or("");
-                let property = text_field(get_step, "property").unwrap_or("value");
-                match ax.lookup(&caller.owner, reference) {
-                    Ok(entry) if entry.window != target.window => Err(ApiError::coded(409, "stale-ref", "This ref is from another window")),
-                    Ok(entry) => {
-                        notes.push(Note::Read { window: target.window.clone(), app: target.app.clone() });
-                        get_property(desktop, &entry, reference, property).await.map(|value| {
-                            let mut answer = json!({ "ref": reference, "property": property, "value": value });
-                            if entry.secret && property == "value" {
-                                answer["secret"] = json!(true);
-                            }
-                            answer
-                        })
-                    }
-                    Err(error) => Err(error),
+        let acting = step.acts();
+        let mut step_notes = Vec::new();
+        let ran = tokio::time::timeout(
+            left + STEP_GRACE,
+            run_step(desktop, ax, caller, &target, &step, budget, &mut step_notes),
+        )
+        .await;
+        let outcome = match ran {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let late = runner_failure(out_of_time(), acting);
+                if let Some((entry, action)) = step.act_target(ax, caller) {
+                    step_notes.push(Note::Act { entry, action, via: None, error: Some(late.clone()) });
                 }
-            }
-            Step::Act(act_step) => {
-                let reference = text_field(act_step, "ref").unwrap_or("");
-                let action = text_field(act_step, "action").unwrap_or("");
-                let value = act_step.get("value").and_then(Value::as_str);
-                match ax.lookup(&caller.owner, reference) {
-                    Ok(entry) if entry.window != target.window => Err(ApiError::coded(409, "stale-ref", "This ref is from another window")),
-                    Ok(entry) => {
-                        let acted = act_on(desktop, &entry, reference, action, value, !caller.local).await;
-                        notes.push(Note::Act {
-                            entry: entry.clone(),
-                            action: action.to_string(),
-                            via: acted.as_ref().map_or("type", |a| a.via),
-                            error: acted.as_ref().err().cloned(),
-                        });
-                        acted.map(|acted| acted_json(reference, action, acted))
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            Step::Find { query, then } => {
-                notes.push(Note::Read { window: target.window.clone(), app: target.app.clone() });
-                match find_in(desktop, ax, caller, &target, query, CANDIDATES as u64 + 1).await {
-                    Err(error) => Err(error),
-                    Ok(matches) => match then.filter(|t| !t.is_null()) {
-                        None => Ok(json!({ "matches": matches })),
-                        Some(then) => match matches.as_slice() {
-                            [] => Err(ApiError::coded(409, "stale-ref", "Nothing matched to act on")),
-                            [one] => {
-                                let reference = one["ref"].as_str().unwrap_or("").to_string();
-                                let action = text_field(then, "action").unwrap_or("");
-                                let value = then.get("value").and_then(Value::as_str);
-                                match ax.lookup(&caller.owner, &reference) {
-                                    Err(error) => Err(error),
-                                    Ok(entry) => {
-                                        let acted = act_on(desktop, &entry, &reference, action, value, !caller.local).await;
-                                        notes.push(Note::Act {
-                                            entry: entry.clone(),
-                                            action: action.to_string(),
-                                            via: acted.as_ref().map_or("type", |a| a.via),
-                                            error: acted.as_ref().err().cloned(),
-                                        });
-                                        acted.map(|acted| acted_json(&reference, action, acted))
-                                    }
-                                }
-                            }
-                            many => Err(ApiError::coded(409, "ambiguous-target", "More than one element matched")
-                                .with_details(json!({ "candidates": many.iter().take(CANDIDATES).cloned().collect::<Vec<_>>() }))),
-                        },
-                    },
-                }
+                Err(late)
             }
         };
+        notes.append(&mut step_notes);
         match outcome {
             Ok(data) => results.push(json!({ "ok": true, "data": data })),
             Err(error) => {
                 results.push(json!({ "ok": false, "error": error_json(&error) }));
-                stopped = stop_on_error;
+                if stop_on_error {
+                    break;
+                }
             }
         }
     }
     Ok((json!({ "results": results }), notes))
+}
+
+impl Step<'_> {
+    fn acts(&self) -> bool {
+        match self {
+            Step::Act(_) => true,
+            Step::Find { then, .. } => (*then).is_some_and(|t| !t.is_null()),
+            Step::Get(_) => false,
+        }
+    }
+
+    /// The ref and action of an acting step cut off before it said: for its Activity row.
+    fn act_target(&self, ax: &Ax, caller: &Caller) -> Option<(Option<RefEntry>, String)> {
+        match self {
+            Step::Act(act) => Some((
+                ax.lookup(&caller.owner, text_field(act, "ref").unwrap_or("")).ok(),
+                text_field(act, "action").unwrap_or("").to_string(),
+            )),
+            Step::Find { then: Some(then), .. } if !then.is_null() => {
+                Some((None, text_field(then, "action").unwrap_or("").to_string()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One act of a batch, its row noted.
+async fn act_step<D: Desktop>(
+    desktop: &D,
+    entry: RefEntry,
+    reference: &str,
+    act: &Value,
+    caller: &Caller,
+    budget: Budget,
+    notes: &mut Vec<Note>,
+) -> ApiResult<Value> {
+    let action = text_field(act, "action").unwrap_or("");
+    let value = act.get("value").and_then(Value::as_str);
+    let acted = act_on(desktop, &entry, reference, action, value, !caller.local, budget).await;
+    notes.push(Note::Act {
+        entry: Some(entry),
+        action: action.to_string(),
+        via: acted.as_ref().ok().map(|a| a.via),
+        error: acted.as_ref().err().cloned(),
+    });
+    acted.map(|acted| acted_json(reference, action, acted))
+}
+
+/// One step of a batch, within `budget`; its rows go to `notes` as they happen.
+async fn run_step<D: Desktop>(
+    desktop: &D,
+    ax: &Ax,
+    caller: &Caller,
+    target: &Target,
+    step: &Step<'_>,
+    budget: Budget,
+    notes: &mut Vec<Note>,
+) -> ApiResult<Value> {
+    let other_window = || ApiError::coded(409, "stale-ref", "This ref is from another window");
+    match step {
+        Step::Get(get_step) => {
+            let reference = text_field(get_step, "ref").unwrap_or("");
+            let property = text_field(get_step, "property").unwrap_or("value");
+            let entry = ax.lookup(&caller.owner, reference)?;
+            if entry.window != target.window {
+                return Err(other_window());
+            }
+            notes.push(Note::Read { window: target.window.clone(), app: target.app.clone() });
+            let value = get_property(desktop, &entry, reference, property, budget).await?;
+            let mut answer = json!({ "ref": reference, "property": property, "value": value });
+            if entry.secret && property == "value" {
+                answer["secret"] = json!(true);
+            }
+            Ok(answer)
+        }
+        Step::Act(act) => {
+            let reference = text_field(act, "ref").unwrap_or("");
+            let entry = ax.lookup(&caller.owner, reference)?;
+            if entry.window != target.window {
+                return Err(other_window());
+            }
+            act_step(desktop, entry, reference, act, caller, budget, notes).await
+        }
+        Step::Find { query, then } => {
+            notes.push(Note::Read { window: target.window.clone(), app: target.app.clone() });
+            let matches = find_in(desktop, ax, caller, target, query, CANDIDATES as u64 + 1, budget).await?;
+            match ((*then).filter(|t| !t.is_null()), matches.as_slice()) {
+                (None, _) => Ok(json!({ "matches": matches })),
+                (Some(_), []) => Err(ApiError::coded(409, "stale-ref", "Nothing matched to act on")),
+                (Some(then), [one]) => {
+                    let reference = one["ref"].as_str().unwrap_or("").to_string();
+                    let entry = ax.lookup(&caller.owner, &reference)?;
+                    act_step(desktop, entry, &reference, then, caller, budget, notes).await
+                }
+                (Some(_), many) => Err(ApiError::coded(409, "ambiguous-target", "More than one element matched")
+                    .with_details(json!({ "candidates": many.iter().take(CANDIDATES).cloned().collect::<Vec<_>>() }))),
+            }
+        }
+    }
 }
 
 fn acted_json(reference: &str, action: &str, acted: Acted) -> Value {
@@ -1475,9 +1713,10 @@ pub async fn run<D: Desktop>(desktop: &D, ax: &Ax, audit: &Audit, caller: &Calle
             let action = text_field(body, "action").unwrap_or("").to_string();
             let entry = ax.lookup(&caller.owner, reference).ok();
             let answer = act(desktop, ax, caller, body).await;
+            // How it went in, when it did; a failed act names no way.
             let (via, error) = match &answer {
-                Ok((_, _, via)) => (*via, None),
-                Err(error) => ("type", Some(error.clone())),
+                Ok((_, _, via)) => (Some(*via), None),
+                Err(error) => (None, Some(error.clone())),
             };
             note_act(audit, caller, entry.as_ref(), &action, via, error.as_ref());
             answer.map(|(answer, _, _)| answer)
@@ -1490,7 +1729,7 @@ pub async fn run<D: Desktop>(desktop: &D, ax: &Ax, audit: &Audit, caller: &Calle
                         match note {
                             Note::Read { window, app } => audit.ax_read(caller.who.clone(), window, Some(app)),
                             Note::Act { entry, action, via, error } => {
-                                note_act(audit, caller, Some(entry), action, via, error.as_ref())
+                                note_act(audit, caller, entry.as_ref(), action, *via, error.as_ref())
                             }
                         }
                     }
@@ -1510,8 +1749,11 @@ fn window_app_hint(_window: &str) -> Option<String> {
 }
 
 /// An `ax-act` row: app (process or bundle name), action, role, and how; never a value or name.
-fn note_act(audit: &Audit, caller: &Caller, entry: Option<&RefEntry>, action: &str, via: &str, error: Option<&ApiError>) {
-    let mut detail = json!({ "action": action, "via": via });
+fn note_act(audit: &Audit, caller: &Caller, entry: Option<&RefEntry>, action: &str, via: Option<&str>, error: Option<&ApiError>) {
+    let mut detail = json!({ "action": action });
+    if let Some(via) = via {
+        detail["via"] = json!(via);
+    }
     if let Some(entry) = entry {
         detail["app"] = json!(entry.app);
         detail["role"] = json!(entry.role);
@@ -1538,6 +1780,7 @@ mod tests {
         windows: Value,
         answers: Mutex<VecDeque<Value>>,
         calls: Mutex<Vec<Vec<String>>>,
+        timeouts: Mutex<Vec<Duration>>,
         pasted: Mutex<Vec<String>>,
     }
 
@@ -1547,9 +1790,11 @@ mod tests {
                 windows: json!({ "windows": [
                     { "id": "m:42", "pid": 7, "app": "com.apple.calculator", "appName": "Calculator", "appKey": "bundle:com.apple.calculator", "title": "Calculator", "display": "1", "minimized": false },
                     { "id": "w:2a", "pid": 9, "app": "notepad.exe", "appName": "Notepad", "title": "Untitled", "display": "1", "minimized": true },
+                    { "id": "w:2a0c46", "pid": 11, "app": "excel.exe", "appName": "Excel", "title": "Book1", "display": "1", "minimized": false },
                 ]}),
                 answers: Mutex::new(answers.into()),
                 calls: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
                 pasted: Mutex::new(Vec::new()),
             }
         }
@@ -1566,13 +1811,26 @@ mod tests {
         async fn displays(&self) -> ApiResult<Vec<Value>> {
             Ok(vec![json!({ "id": "1", "x": 0, "y": 0, "width": 2880, "height": 1800, "scale": 2.0, "primary": true })])
         }
-        async fn cli(&self, argv: Vec<String>, _timeout: Duration) -> ApiResult<Value> {
+        async fn cli(&self, argv: Vec<String>, timeout: Duration) -> ApiResult<Value> {
             self.calls.lock().unwrap().push(argv);
-            self.answers
+            self.timeouts.lock().unwrap().push(timeout);
+            let answer = self
+                .answers
                 .lock()
                 .unwrap()
                 .pop_front()
-                .ok_or_else(|| ApiError::coded(503, "unavailable", "no more answers"))
+                .ok_or_else(|| ApiError::coded(503, "unavailable", "no more answers"))?;
+            // A failure of the runner itself (rtx-control or rtx-linkd's wait), not agent-desktop's.
+            match answer.get("runner") {
+                Some(failure) => {
+                    let status = failure["status"].as_u64().unwrap_or(502) as u16;
+                    Err(match failure["code"].as_str() {
+                        Some(code) => ApiError::coded(status, code, "runner failed"),
+                        None => ApiError::new(status, "runner failed"),
+                    })
+                }
+                None => Ok(answer),
+            }
         }
         async fn paste_at(&self, _bounds: &Value, text: &str) -> ApiResult<()> {
             self.pasted.lock().unwrap().push(text.to_string());
@@ -1763,7 +2021,7 @@ mod tests {
     fn type_falls_back_to_set_value_then_paste_then_pixels() {
         // 1. type works.
         let fake = Fake::new(vec![ok(json!({ "disposition": { "delivery": "delivered_verified" } }))]);
-        let acted = block(act_on(&fake, &entry(&["type"], false, false), "@s1:e2", "type", Some("abc"), true)).unwrap();
+        let acted = block(act_on(&fake, &entry(&["type"], false, false), "@s1:e2", "type", Some("abc"), true, Budget::default())).unwrap();
         assert_eq!((acted.via, acted.delivery), ("type", Delivery::Done));
         // 2. refused, nothing delivered: get, set-value(old + text), get to check.
         let fake = Fake::new(vec![
@@ -1772,25 +2030,25 @@ mod tests {
             ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
             ok(json!({ "value": "Hello world" })),
         ]);
-        let acted = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("world"), true)).unwrap();
+        let acted = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("world"), true, Budget::default())).unwrap();
         assert_eq!(acted.via, "set-value");
         assert_eq!(fake.calls()[2], vec!["set-value", "--", "@s1:e2", "Hello world"]);
         // 3. not settable: a click at its centre and a paste.
         let fake = Fake::new(vec![failed("POLICY_DENIED", "not_delivered")]);
-        let acted = block(act_on(&fake, &entry(&["type"], false, true), "@s1:e2", "type", Some("world"), true)).unwrap();
+        let acted = block(act_on(&fake, &entry(&["type"], false, true), "@s1:e2", "type", Some("world"), true, Budget::default())).unwrap();
         assert_eq!(acted.via, "paste");
         assert_eq!(*fake.pasted.lock().unwrap(), vec!["world".to_string()]);
         // ...never for an agent on this computer (the person's own pointer), nor without bounds.
         let fake = Fake::new(vec![failed("POLICY_DENIED", "not_delivered")]);
-        let error = block(act_on(&fake, &entry(&["type"], false, true), "@s1:e2", "type", Some("x"), false)).unwrap_err();
+        let error = block(act_on(&fake, &entry(&["type"], false, true), "@s1:e2", "type", Some("x"), false, Budget::default())).unwrap_err();
         assert_eq!(error.code.as_deref(), Some("needs-pixels"));
         assert!(fake.pasted.lock().unwrap().is_empty());
         let fake = Fake::new(vec![failed("POLICY_DENIED", "not_delivered")]);
-        let error = block(act_on(&fake, &entry(&["type"], false, false), "@s1:e2", "type", Some("x"), true)).unwrap_err();
+        let error = block(act_on(&fake, &entry(&["type"], false, false), "@s1:e2", "type", Some("x"), true, Budget::default())).unwrap_err();
         assert_eq!(error.code.as_deref(), Some("needs-pixels"));
         // A password is never read back for the set-value path: straight to paste.
         let fake = Fake::new(vec![failed("POLICY_DENIED", "not_delivered")]);
-        let acted = block(act_on(&fake, &entry(&["set-value"], true, true), "@s1:e3", "type", Some("pw"), true)).unwrap();
+        let acted = block(act_on(&fake, &entry(&["set-value"], true, true), "@s1:e3", "type", Some("pw"), true, Budget::default())).unwrap();
         assert_eq!(acted.via, "paste");
         assert_eq!(fake.calls().len(), 1);
     }
@@ -1799,7 +2057,7 @@ mod tests {
     fn type_stops_when_it_may_have_landed() {
         // Typed but unverified (Electron on macOS): stop, no fallback, delivery unknown.
         let fake = Fake::new(vec![ok(json!({ "disposition": { "delivery": "delivered_unverified" } }))]);
-        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("abc"), true)).unwrap_err();
+        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("abc"), true, Budget::default())).unwrap_err();
         let body = error.body();
         assert_eq!((body["code"].as_str(), body["delivery"].as_str(), body["retry"].as_str()), (Some("ax-failed"), Some("unknown"), Some("no")));
         assert!(body["suggestion"].as_str().unwrap().contains("set-value"));
@@ -1807,7 +2065,7 @@ mod tests {
         assert!(fake.pasted.lock().unwrap().is_empty());
         // A failure that may have landed stops too.
         let fake = Fake::new(vec![failed("ACTION_FAILED", "delivered_unverified")]);
-        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("abc"), true)).unwrap_err();
+        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("abc"), true, Budget::default())).unwrap_err();
         assert_eq!(error.delivery, Some(Delivery::Unknown));
         assert_eq!(fake.calls().len(), 1);
         // set-value may have landed half way: stop before pasting.
@@ -1816,7 +2074,7 @@ mod tests {
             ok(json!({ "value": "a" })),
             failed("ACTION_FAILED", "delivery_uncertain"),
         ]);
-        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("b"), true)).unwrap_err();
+        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("b"), true, Budget::default())).unwrap_err();
         assert_eq!(error.delivery, Some(Delivery::Unknown));
         assert!(fake.pasted.lock().unwrap().is_empty());
     }
@@ -1824,14 +2082,14 @@ mod tests {
     #[test]
     fn an_action_the_element_lacks_needs_pixels() {
         let fake = Fake::new(vec![]);
-        let error = block(act_on(&fake, &entry(&["click"], false, true), "@s1:e1", "toggle", None, true)).unwrap_err();
+        let error = block(act_on(&fake, &entry(&["click"], false, true), "@s1:e1", "toggle", None, true, Budget::default())).unwrap_err();
         let body = error_json(&error);
         assert_eq!(body["code"], "needs-pixels");
         assert_eq!(body["display"], "1");
         assert_eq!(body["bounds"]["width"], 100);
         assert!(fake.calls().is_empty());
         // Never anything outside the allow-list.
-        assert!(block(act_on(&fake, &entry(&["click"], false, true), "@s1:e1", "press", None, true)).is_err());
+        assert!(block(act_on(&fake, &entry(&["click"], false, true), "@s1:e1", "press", None, true, Budget::default())).is_err());
     }
 
     #[test]
@@ -1864,11 +2122,11 @@ mod tests {
     fn windows_map_to_agent_desktops_and_minimized_ones_are_not_offered() {
         let ax = Ax::new(None);
         let fake = Fake::new(vec![]);
-        let target = block(target(&fake, &ax, "m:42")).unwrap();
+        let target = block(target(&fake, &ax, "m:42", Budget::default())).unwrap();
         assert_eq!(target.cli_window, "w-42");
-        assert_eq!(block(super::target(&fake, &ax, "w:2a")).unwrap_err().code.as_deref(), Some("window-not-found"));
-        assert_eq!(block(super::target(&fake, &ax, "m:1")).unwrap_err().code.as_deref(), Some("window-not-found"));
-        assert_eq!(block(super::target(&fake, &ax, "nope")).unwrap_err().status, 400);
+        assert_eq!(block(super::target(&fake, &ax, "w:2a", Budget::default())).unwrap_err().code.as_deref(), Some("window-not-found"));
+        assert_eq!(block(super::target(&fake, &ax, "m:1", Budget::default())).unwrap_err().code.as_deref(), Some("window-not-found"));
+        assert_eq!(block(super::target(&fake, &ax, "nope", Budget::default())).unwrap_err().status, 400);
         // An empty tree is no-tree, with a reason.
         let fake = Fake::new(vec![ok(json!({ "complete": true, "snapshot_id": "s9", "tree": { "role": "window" } }))]);
         let error = block(snapshot(&fake, &ax, &caller("c1"), &json!({ "window": "m:42" }))).unwrap_err();
@@ -1899,5 +2157,240 @@ mod tests {
         }
         let kinds: Vec<&str> = page["entries"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
         assert!(kinds.contains(&"ax-act") && kinds.contains(&"ax-read"));
+    }
+
+    /// rtx-control's failure (or rtx-linkd's own wait running out), as the Fake hands it back.
+    fn runner(status: u16, code: Option<&str>) -> Value {
+        json!({ "runner": { "status": status, "code": code } })
+    }
+
+    fn fields(error: &ApiError) -> (Option<String>, Option<String>, Option<String>) {
+        let body = error.body();
+        let text = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
+        (text("code"), text("retry"), text("delivery"))
+    }
+
+    fn strs(code: &str, retry: &str, delivery: &str) -> (Option<String>, Option<String>, Option<String>) {
+        (Some(code.into()), Some(retry.into()), Some(delivery.into()))
+    }
+
+    #[test]
+    fn an_act_that_times_out_may_have_happened() {
+        // rtx-control killed the CLI at its deadline, and rtx-linkd's own wait ran out (no code).
+        for late in [runner(504, Some("timeout")), runner(504, None)] {
+            let fake = Fake::new(vec![late.clone()]);
+            let error = block(act_on(&fake, &entry(&["click"], false, true), "@s1:e1", "click", None, true, Budget::default())).unwrap_err();
+            assert_eq!(fields(&error), strs("timeout", "no", "unknown"));
+            // type too: never a second attempt after a timeout.
+            let fake = Fake::new(vec![late.clone()]);
+            let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("abc"), true, Budget::default())).unwrap_err();
+            assert_eq!(fields(&error), strs("timeout", "no", "unknown"));
+            assert_eq!(fake.calls().len(), 1);
+            assert!(fake.pasted.lock().unwrap().is_empty());
+            // The set-value step of the chain as well.
+            let fake = Fake::new(vec![failed("ACTION_NOT_SUPPORTED", "not_delivered"), ok(json!({ "value": "a" })), late.clone()]);
+            let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("b"), true, Budget::default())).unwrap_err();
+            assert_eq!(fields(&error), strs("timeout", "no", "unknown"));
+            assert!(fake.pasted.lock().unwrap().is_empty());
+        }
+        // agent-desktop's own TIMEOUT on an action: unknown, even when it says not delivered.
+        let api = map_error(&CliError::of(&failed("TIMEOUT", "not_delivered")), true, None);
+        assert_eq!(fields(&api), strs("timeout", "no", "unknown"));
+        // A read that times out stays safe to repeat.
+        let fake = Fake::new(vec![ok(tree()), runner(504, Some("timeout"))]);
+        let ax = Ax::new(None);
+        block(snapshot_of(&fake, &ax, "c1"));
+        let error = block(get(&fake, &ax, &caller("c1"), &json!({ "ref": "@s1:e2", "property": "value" }))).unwrap_err();
+        assert_eq!(fields(&error), strs("timeout", "safe", "none"));
+    }
+
+    #[test]
+    fn a_crashed_runner_is_unavailable_for_reads_and_unknown_for_acts() {
+        // rtx-control's `ax-crashed` (backend.rs passes the code on with a 409).
+        let crashed = || runner(409, Some("ax-crashed"));
+        let ax = Ax::new(None);
+        let fake = Fake::new(vec![ok(tree()), crashed()]);
+        block(snapshot_of(&fake, &ax, "c1"));
+        let error = block(get(&fake, &ax, &caller("c1"), &json!({ "ref": "@s1:e2", "property": "value" }))).unwrap_err();
+        assert_eq!(error.status, 503);
+        let body = error.body();
+        assert_eq!((body["code"].as_str(), body["retry"].as_str()), (Some("unavailable"), Some("after")));
+        assert_eq!(body["retryAfterMs"], 2000);
+        let fake = Fake::new(vec![crashed()]);
+        let error = block(snapshot(&fake, &ax, &caller("c1"), &json!({ "window": "m:42" }))).unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("unavailable"));
+        // An action may have happened before it crashed.
+        let fake = Fake::new(vec![crashed()]);
+        let error = block(act_on(&fake, &entry(&["click"], false, true), "@s1:e1", "click", None, true, Budget::default())).unwrap_err();
+        assert_eq!(error.status, 409);
+        assert_eq!(fields(&error), strs("ax-failed", "no", "unknown"));
+        let fake = Fake::new(vec![crashed()]);
+        let error = block(act_on(&fake, &entry(&["type"], false, true), "@s1:e2", "type", Some("x"), true, Budget::default())).unwrap_err();
+        assert_eq!(fields(&error), strs("ax-failed", "no", "unknown"));
+        assert!(fake.pasted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn passwords_are_hidden_on_every_marker() {
+        // The `secure` state agent-desktop 1.0.2 sets on each platform, and password roles.
+        for raw in [
+            json!({ "role": "textfield", "states": ["secure"], "value": "hunter2" }),
+            json!({ "role": "textfield", "states": ["focused", "secure", "haspopup"], "value": "hunter2" }),
+            json!({ "role": "password text", "value": "hunter2" }),
+            json!({ "role": "AXSecureTextField", "value": "hunter2" }),
+            json!({ "role": "textfield", "subrole": "AXSecureTextField", "value": "hunter2" }),
+        ] {
+            assert!(is_secret(&raw), "{raw}");
+            let mut walk = Walk { owner: "c1", window: "m:42", cli_window: "w-42", app: "a", displays: &[], refs: Vec::new(), nodes: 0 };
+            let node = walk.node(&raw, false);
+            assert_eq!(node["secret"], true);
+            assert!(!node.to_string().contains("hunter2"), "{node}");
+        }
+        // Never a guess from the name, and an unmarked field keeps its value.
+        assert!(!is_secret(&json!({ "role": "textfield", "name": "Password", "value": "x" })));
+        assert!(!is_secret(&json!({ "role": "textfield", "states": ["focused"] })));
+        // T30 (GTK 4.22, agent-desktop 1.0.2): Gtk.PasswordEntry, an InputPurpose.PASSWORD entry
+        // and Adw.PasswordEntryRow are `secure`; an Entry with visibility off shows only bullets.
+        let found = json!({ "matches": [
+            { "interactive": true, "ref_id": "@s3:e1", "role": "textfield", "states": ["secure"], "value": null },
+            { "interactive": true, "ref_id": "@s3:e2", "role": "textfield", "states": ["haspopup"], "value": "••••••••••" },
+            { "interactive": true, "ref_id": "@s3:e3", "role": "textfield", "states": ["secure", "haspopup"], "value": null },
+            { "interactive": true, "name": "AdwRow", "ref_id": "@s3:e4", "role": "textfield", "states": ["secure"], "value": null },
+        ]});
+        let marked: Vec<bool> = found["matches"].as_array().unwrap().iter().map(is_secret).collect();
+        assert_eq!(marked, vec![true, false, true, true]);
+        // What an action reads back is hidden when the state after it says secure.
+        let answer = json!({ "post_state": { "value": "hunter2", "states": ["secure"] } });
+        assert_eq!(read_back(&answer, &entry(&["set-value"], false, false)), None);
+        let answer = json!({ "post_state": { "value": "hello" } });
+        assert_eq!(read_back(&answer, &entry(&["set-value"], false, false)), Some(json!("hello")));
+    }
+
+    #[test]
+    fn get_name_reads_the_name_never_the_value() {
+        let fake = Fake::new(vec![ok(tree()), ok(json!({ "property": "title", "ref": "@s1:e2", "value": "Display" }))]);
+        let ax = Ax::new(None);
+        block(snapshot_of(&fake, &ax, "c1"));
+        let (got, _) = block(get(&fake, &ax, &caller("c1"), &json!({ "ref": "@s1:e2", "property": "name" }))).unwrap();
+        assert_eq!(got["value"], "Display");
+        // agent-desktop's `text` is a field's value; `title` is the name.
+        assert_eq!(fake.calls()[1], vec!["get", "--property=title", "--", "@s1:e2"]);
+    }
+
+    #[test]
+    fn the_queue_holds_at_most_four_waiting_calls() {
+        block(async {
+            let ax = Arc::new(Ax::new(None));
+            let running = ax.enter().await.unwrap();
+            let mut waiting = Vec::new();
+            for _ in 0..MAX_QUEUED {
+                let ax = ax.clone();
+                waiting.push(tokio::spawn(async move { ax.enter().await.map(|_| ()) }));
+            }
+            while ax.waiting.load(Ordering::SeqCst) < MAX_QUEUED {
+                tokio::task::yield_now().await;
+            }
+            // A fifth would wait: busy at once.
+            let busy = ax.enter().await.unwrap_err();
+            assert_eq!((busy.status, busy.code.as_deref()), (503, Some("busy")));
+            assert_eq!(busy.body()["retryAfterMs"], 500);
+            assert_eq!(ax.waiting.load(Ordering::SeqCst), MAX_QUEUED);
+            drop(running);
+            for call in waiting {
+                assert!(call.await.unwrap().is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn a_ref_from_find_gets_its_bounds_when_needs_pixels_wants_them() {
+        // find gives a ref without bounds or actions (agent-desktop 1.0.2); the element refuses
+        // the toggle, and Link reads its bounds for the pixel fallback.
+        let fake = Fake::new(vec![
+            ok(json!({ "matches": [{ "interactive": true, "ref_id": "@s2:e5", "role": "button", "name": "Bold", "states": [] }] })),
+            failed("ACTION_NOT_SUPPORTED", "not_delivered"),
+            ok(json!({ "property": "bounds", "ref": "@s2:e5", "value": { "x": 100.0, "y": 50.0, "width": 40.0, "height": 20.0 } })),
+        ]);
+        let ax = Ax::new(None);
+        let c1 = caller("c1");
+        let (found, _) = block(find(&fake, &ax, &c1, &json!({ "window": "m:42", "name": "Bold" }))).unwrap();
+        assert!(found["matches"][0].get("bounds").is_none());
+        let error = block(act(&fake, &ax, &c1, &json!({ "ref": "@s2:e5", "action": "toggle" }))).unwrap_err();
+        let body = error_json(&error);
+        assert_eq!(body["code"], "needs-pixels");
+        assert_eq!(body["display"], "1");
+        assert!(body["bounds"]["width"].as_i64().unwrap() > 0);
+        assert_eq!(fake.calls()[2], vec!["get", "--property=bounds", "--", "@s2:e5"]);
+        // A match that carries bounds has them placed on a display.
+        let fake = Fake::new(vec![ok(json!({ "matches": [
+            { "interactive": true, "ref_id": "@s4:e1", "role": "button", "name": "OK", "states": [],
+              "bounds": { "x": 10.0, "y": 10.0, "width": 30.0, "height": 10.0 } }] }))]);
+        let (found, _) = block(find(&fake, &ax, &c1, &json!({ "window": "m:42", "name": "OK" }))).unwrap();
+        assert_eq!(found["matches"][0]["bounds"]["display"], "1");
+    }
+
+    #[test]
+    fn a_windows_window_goes_to_agent_desktop_in_decimal() {
+        // Link's `w:` id is the HWND in hex; agent-desktop 1.0.2 writes and parses `w-<decimal>`.
+        let ax = Ax::new(None);
+        let target = block(target(&Fake::new(vec![]), &ax, "w:2a0c46", Budget::default())).unwrap();
+        assert_eq!(target.cli_window, "w-2755654");
+    }
+
+    #[test]
+    fn a_batch_step_gets_only_what_is_left_of_the_20_s() {
+        let ax = Ax::new(None);
+        let c1 = caller("c1");
+        let fake = Fake::new(vec![ok(tree())]);
+        block(snapshot_of(&fake, &ax, "c1"));
+        let body = json!({ "window": "m:42", "steps": [
+            { "get": { "ref": "@s1:e2", "property": "value" } },
+            { "act": { "ref": "@s1:e1", "action": "click" } },
+        ]});
+        // 3 s left: the get's 8 s are capped to them.
+        let fake = Fake::new(vec![ok(json!({ "value": "15" })), ok(json!({ "disposition": { "delivery": "delivered_verified" } }))]);
+        let (answer, _) = block(batch_until(&fake, &ax, &c1, &body, Instant::now() + Duration::from_secs(3))).unwrap();
+        assert_eq!(answer["results"][0]["ok"], true);
+        let timeouts = fake.timeouts.lock().unwrap().clone();
+        assert_eq!(timeouts.len(), 2);
+        assert!(timeouts.iter().all(|t| *t <= Duration::from_secs(3) && *t > Duration::from_secs(2)), "{timeouts:?}");
+        // Nothing left: the step isn't run, and says so.
+        let fake = Fake::new(vec![]);
+        let (answer, notes) = block(batch_until(&fake, &ax, &c1, &body, Instant::now())).unwrap();
+        assert_eq!(answer["results"].as_array().unwrap().len(), 1);
+        assert_eq!(answer["results"][0]["error"]["code"], "timeout");
+        assert_eq!(answer["results"][0]["error"]["delivery"], "none");
+        assert!(fake.calls().is_empty() && notes.is_empty());
+        // A step's own deadline is what is left, not its full 8 s.
+        assert_eq!(Budget::until(Instant::now() + Duration::from_millis(500)).cap(ACT_TIMEOUT).map(|t| t <= Duration::from_millis(500)), Some(true));
+        assert_eq!(Budget::until(Instant::now()).cap(ACT_TIMEOUT), None);
+        assert_eq!(Budget::default().cap(ACT_TIMEOUT), Some(ACT_TIMEOUT));
+    }
+
+    #[test]
+    fn a_failed_act_is_logged_without_a_way_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::Store::open(dir.path()).unwrap());
+        let audit = Audit::start(store);
+        let ax = Ax::new(None);
+        std::env::set_var("RTX_LINK_AX", "1");
+        let fake = Fake::new(vec![
+            ok(tree()),
+            failed("ACTION_FAILED", "not_delivered"),
+            ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
+        ]);
+        let c1 = caller("c1");
+        block(run(&fake, &ax, &audit, &c1, Op::Snapshot, &json!({ "window": "m:42" }))).unwrap();
+        // A failed click: no `via`. A set-value that worked: `via: set-value`.
+        assert!(block(run(&fake, &ax, &audit, &c1, Op::Act, &json!({ "ref": "@s1:e1", "action": "click" }))).is_err());
+        block(run(&fake, &ax, &audit, &c1, Op::Act, &json!({ "ref": "@s1:e2", "action": "set-value", "value": "1" }))).unwrap();
+        audit.flush();
+        let page = audit.page(&crate::audit::Query { limit: 200, ..Default::default() }).unwrap();
+        let acts: Vec<&Value> = page["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "ax-act").collect();
+        assert_eq!(acts.len(), 2, "{page}");
+        let failed_click = acts.iter().find(|e| e["detail"]["action"] == "click").unwrap();
+        assert!(failed_click["detail"].get("via").is_none(), "{failed_click}");
+        let set = acts.iter().find(|e| e["detail"]["action"] == "set-value").unwrap();
+        assert_eq!(set["detail"]["via"], "set-value");
     }
 }
