@@ -157,7 +157,8 @@ pub fn bridge_allows(session: Session, op: &str) -> Result<(), &'static str> {
         "start", "stop", "status", "screenshot", "displays", "move", "button", "keysym", "key",
         "scroll", "paste_text", "clipboard_seq", "permissions",
     ];
-    const OTHER_USER: [&str; 4] = ["paste_image", "clipboard_read", "windows", "focus_window"];
+    // `ax` (#3055 §2.2): user sessions only; the login window has no user apps.
+    const OTHER_USER: [&str; 5] = ["paste_image", "clipboard_read", "windows", "focus_window", "ax"];
     const OWNER_ONLY: [&str; 2] = ["paste_files", "request_permission"];
     let allowed = LOGIN_WINDOW.contains(&op)
         || op.starts_with("peer_")
@@ -408,7 +409,7 @@ mod tests {
         assert!(bridge_allows(Session::LoginWindow, "paste_image").is_err());
         assert!(bridge_allows(Session::LoginWindow, "clipboard_read").is_err());
         // Windows (realtimex-ai-app#3055): a user's session only, never the login window.
-        for op in ["windows", "focus_window"] {
+        for op in ["windows", "focus_window", "ax"] {
             assert_eq!(
                 bridge_allows(Session::LoginWindow, op),
                 Err("not-in-this-session")

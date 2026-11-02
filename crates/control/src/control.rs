@@ -30,6 +30,9 @@
 //! {"id":20,"op":"peer_display","session":1,"display":"<id>"} -> {"display":"<id>","width":..,"height":..}
 //! {"id":21,"op":"windows"}                   -> {"windows":[{"id","pid","app","appName","title","display","frame":{x,y,width,height},"focused","minimized"}…]}
 //! {"id":22,"op":"focus_window","window":"<window id>"} -> {"focused":true,"window":{…}}
+//! {"id":23,"op":"ax","argv":["snapshot","--window-id=w-1"],"timeoutMs":10000,"stateDir":"/…"}
+//!                                            -> {"result":<agent-desktop's envelope>}   (ax.rs; may
+//!                                               answer after later requests, by id)
 //! ```
 //!
 //! Windows (realtimex-ai-app#3055): ids are [`crate::winid`]'s (`m:`, `w:`, `x:`); `display` is
@@ -123,6 +126,8 @@ struct Controller {
     peers: HashMap<u64, Peer>,
     next_peer: u64,
     to_main: Sender<Msg>,
+    /// The accessibility runner (ax.rs, realtimex-ai-app#3055 §2.2).
+    ax: crate::ax::Ax,
     /// AppKit's window-server connection, made on the first request that needs the screen or
     /// input. A permissions check never makes it: on macOS that connection puts the helper in
     /// the Dock for a moment (it lives inside an app bundle), and checks run often.
@@ -136,6 +141,8 @@ enum Msg {
     Eof,
     Peer(ToMain),
     Stalled(CaptureStalled),
+    /// An accessibility call finished on its worker thread: answered by its id.
+    AxDone(crate::ax::Done),
 }
 
 impl Controller {
@@ -863,6 +870,7 @@ pub fn run() -> Result<()> {
         peers: HashMap::new(),
         next_peer: 0,
         to_main: to_main.clone(),
+        ax: crate::ax::Ax::default(),
         window_server: false,
     };
     let stdout = std::io::stdout();
@@ -918,7 +926,15 @@ pub fn run() -> Result<()> {
                 // stdin closes.
                 controller.peers.clear();
                 controller.end_session();
+                crate::ax::kill_running();
                 return Err(stalled.into());
+            }
+            Msg::AxDone(done) => {
+                controller.ax.finished(&done);
+                let mut reply = done.reply.body;
+                reply["id"] = done.id;
+                write_line(&mut out, &reply);
+                continue;
             }
             Msg::Peer(event) => {
                 controller.on_peer(event, &mut out);
@@ -940,6 +956,18 @@ pub fn run() -> Result<()> {
         };
         let id = request["id"].clone();
         let op = request["op"].as_str().unwrap_or("");
+        // Accessibility calls run on a worker thread and answer later, by id (ax.rs).
+        if op == "ax" {
+            let to_main = controller.to_main.clone();
+            let answer = controller.ax.start(id.clone(), &request, move |done| {
+                let _ = to_main.send(Msg::AxDone(done));
+            });
+            if let Some(mut reply) = answer {
+                reply["id"] = id;
+                write_line(&mut out, &reply);
+            }
+            continue;
+        }
         let result = controller.handle(&request);
         let ends_session = result.as_ref().is_err_and(|error| !displays::lost(error));
         if ends_session
@@ -963,6 +991,7 @@ pub fn run() -> Result<()> {
     }
     controller.peers.clear();
     controller.end_session();
+    crate::ax::kill_running();
     Ok(())
 }
 
