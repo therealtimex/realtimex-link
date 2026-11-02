@@ -49,6 +49,10 @@ pub const REF_TTL: Duration = Duration::from_secs(15 * 60);
 /// Refs kept per owner at most (the oldest go first).
 const MAX_REFS: usize = 20_000;
 const MAX_TEXT: usize = 4096;
+/// The longest text agent-desktop 1.0.2 reads whole (`MAX_OBSERVATION_FIELD_BYTES`, Linux
+/// `DEFAULT_MAX_FIELD_BYTES`: 64 KiB). A longer value comes back unknown, or may be cut, so the
+/// `type` fallback never rewrites a field it can't read whole.
+const WHOLE_TEXT: usize = 64 * 1024;
 const MAX_STEPS: usize = 10;
 const MAX_QUEUED: usize = 4;
 const QUEUE_WAIT: Duration = Duration::from_secs(5);
@@ -1095,13 +1099,30 @@ pub async fn get<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value
     let property = text_field(body, "property").unwrap_or("value");
     let entry = ax.lookup(&caller.owner, reference)?;
     let value = get_property(desktop, &entry, reference, property, Budget::default()).await?;
+    Ok((get_answer(reference, property, value, &entry), entry))
+}
+
+/// The answer to a `get`: a value or name over 4 KB cut for the client, with `truncated`.
+fn get_answer(reference: &str, property: &str, value: Value, entry: &RefEntry) -> Value {
+    let (value, cut) = match value.as_str() {
+        Some(text) if matches!(property, "value" | "name") => {
+            let (text, cut) = truncated(text);
+            (json!(text), cut)
+        }
+        _ => (value, false),
+    };
     let mut answer = json!({ "ref": reference, "property": property, "value": value });
+    if cut {
+        answer["truncated"] = json!(true);
+    }
     if entry.secret && property == "value" {
         answer["secret"] = json!(true);
     }
-    Ok((answer, entry))
+    answer
 }
 
+/// A property as agent-desktop reads it, whole: the `type` fallback rewrites and checks a field
+/// from this, so only the answer to the client is cut ([`get_answer`]).
 async fn get_property<D: Desktop>(
     desktop: &D,
     entry: &RefEntry,
@@ -1135,10 +1156,6 @@ async fn get_property<D: Desktop>(
             let displays = desktop.displays().await.unwrap_or_default();
             bounds_of(&json!({ "bounds": value }), &displays).unwrap_or(Value::Null)
         }
-        "value" | "name" => match value.as_str() {
-            Some(text) => json!(truncated(text).0),
-            None => value,
-        },
         _ => value,
     })
 }
@@ -1253,6 +1270,12 @@ fn read_back(answer: &Value, entry: &RefEntry) -> Option<Value> {
         .map(|v| json!(truncated(v).0))
 }
 
+/// Whether `old + text` can go through set-value: `old` can't have been cut by agent-desktop,
+/// and the result can be read back whole to check it.
+fn appendable(old: &str, text: &str) -> bool {
+    old.len() + text.len() < WHOLE_TEXT
+}
+
 fn may_have_typed() -> ApiError {
     ApiError::coded(409, "ax-failed", "The text may have been typed; it wasn't verified")
         .with_delivery(Delivery::Unknown)
@@ -1299,10 +1322,16 @@ async fn type_chain<D: Desktop>(
     if !matches!(refused.code.as_str(), "POLICY_DENIED" | "ACTION_NOT_SUPPORTED") {
         return Err(map_error(&refused, true, entry.bounds.as_ref()));
     }
-    // 2. set-value with the text appended (at the end, not the caret).
+    // 2. set-value with the text appended (at the end, not the caret). It rewrites the whole
+    // field, so only from a value read whole, and only to one that can be read back whole;
+    // otherwise nothing is written here and the chain goes on.
     let settable = entry.actions.as_ref().is_some_and(|a| a.iter().any(|x| x == "set-value"));
     if settable && !entry.secret {
-        if let Ok(Value::String(old)) = get_property(desktop, entry, reference, "value", budget).await {
+        let old = match get_property(desktop, entry, reference, "value", budget).await {
+            Ok(Value::String(old)) if appendable(&old, text) => Some(old),
+            _ => None,
+        };
+        if let Some(old) = old {
             let wanted = format!("{old}{text}");
             let set = act_cli(
                 desktop,
@@ -1557,11 +1586,7 @@ async fn run_step<D: Desktop>(
             }
             notes.push(Note::Read { window: target.window.clone(), app: target.app.clone() });
             let value = get_property(desktop, &entry, reference, property, budget).await?;
-            let mut answer = json!({ "ref": reference, "property": property, "value": value });
-            if entry.secret && property == "value" {
-                answer["secret"] = json!(true);
-            }
-            Ok(answer)
+            Ok(get_answer(reference, property, value, &entry))
         }
         Step::Act(act) => {
             let reference = text_field(act, "ref").unwrap_or("");
@@ -2077,6 +2102,83 @@ mod tests {
         let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("b"), true, Budget::default())).unwrap_err();
         assert_eq!(error.delivery, Some(Delivery::Unknown));
         assert!(fake.pasted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn type_keeps_a_value_over_4_kb_whole() {
+        // 5000+ bytes with a 3-byte '€' across the 4096-byte cut: set-value gets all of it plus
+        // the text, the check compares all of it, and only the answer is cut (at a char boundary).
+        let old = format!("{}€{}", "a".repeat(4095), "b".repeat(1000));
+        let wanted = format!("{old}x");
+        let fake = Fake::new(vec![
+            failed("ACTION_NOT_SUPPORTED", "not_delivered"),
+            ok(json!({ "value": old })),
+            ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
+            ok(json!({ "value": wanted })),
+        ]);
+        let acted = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("x"), true, Budget::default())).unwrap();
+        assert_eq!((acted.via, acted.delivery), ("set-value", Delivery::Done));
+        assert_eq!(fake.calls()[2], vec!["set-value".to_string(), "--".into(), "@s1:e2".into(), wanted.clone()]);
+        assert_eq!(acted.value, Some(json!("a".repeat(4095))));
+        // A read-back cut at 4 KB is not what was asked: never reported as done.
+        let fake = Fake::new(vec![
+            failed("ACTION_NOT_SUPPORTED", "not_delivered"),
+            ok(json!({ "value": old })),
+            ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
+            ok(json!({ "value": truncated(&wanted).0 })),
+        ]);
+        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("x"), true, Budget::default())).unwrap_err();
+        assert_eq!(error.delivery, Some(Delivery::Unknown));
+        // The text itself carries the result over 4 KB, ending in a multi-byte char.
+        let text = format!("{}é", "y".repeat(4094));
+        let fake = Fake::new(vec![
+            failed("ACTION_NOT_SUPPORTED", "not_delivered"),
+            ok(json!({ "value": "z" })),
+            ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
+            ok(json!({ "value": format!("z{text}") })),
+        ]);
+        let acted = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some(&text), true, Budget::default())).unwrap();
+        assert_eq!(fake.calls()[2][3], format!("z{text}"));
+        assert_eq!(acted.value, Some(json!(format!("z{}", "y".repeat(4094)))));
+    }
+
+    #[test]
+    fn type_never_rewrites_a_value_it_cannot_read_whole() {
+        // At agent-desktop's 64 KiB limit the value may be cut: no set-value; nothing written,
+        // so the chain goes on to the paste, or needs-pixels with nothing delivered.
+        let long = "a".repeat(WHOLE_TEXT - 1);
+        let fake = Fake::new(vec![failed("ACTION_NOT_SUPPORTED", "not_delivered"), ok(json!({ "value": long }))]);
+        let acted = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("x"), true, Budget::default())).unwrap();
+        assert_eq!(acted.via, "paste");
+        assert!(fake.calls().iter().all(|call| call[0] != "set-value"));
+        let fake = Fake::new(vec![failed("ACTION_NOT_SUPPORTED", "not_delivered"), ok(json!({ "value": long }))]);
+        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("x"), false, Budget::default())).unwrap_err();
+        assert_eq!((error.code.as_deref(), error.delivery), (Some("needs-pixels"), Some(Delivery::None)));
+        assert!(fake.calls().iter().all(|call| call[0] != "set-value"));
+        // A value agent-desktop couldn't read (unknown, so null): the same.
+        let fake = Fake::new(vec![failed("ACTION_NOT_SUPPORTED", "not_delivered"), ok(json!({ "value": null }))]);
+        let error = block(act_on(&fake, &entry(&["set-value", "type"], false, true), "@s1:e2", "type", Some("x"), false, Budget::default())).unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("needs-pixels"));
+        assert_eq!(fake.calls().len(), 2);
+        assert!(appendable(&"a".repeat(4096), "x"));
+        assert!(!appendable(&"a".repeat(WHOLE_TEXT - 1), "x"));
+    }
+
+    #[test]
+    fn get_cuts_only_the_answer_at_4_kb() {
+        let long = format!("{}€{}", "a".repeat(4095), "b".repeat(1000));
+        let fake = Fake::new(vec![ok(tree()), ok(json!({ "property": "value", "ref": "@s1:e2", "value": long }))]);
+        let ax = Ax::new(None);
+        block(snapshot_of(&fake, &ax, "c1"));
+        let (got, _) = block(get(&fake, &ax, &caller("c1"), &json!({ "ref": "@s1:e2" }))).unwrap();
+        assert_eq!(got["value"], json!("a".repeat(4095)));
+        assert_eq!(got["truncated"], json!(true));
+        let fake = Fake::new(vec![ok(tree()), ok(json!({ "property": "value", "ref": "@s1:e2", "value": "short" }))]);
+        let ax = Ax::new(None);
+        block(snapshot_of(&fake, &ax, "c1"));
+        let (got, _) = block(get(&fake, &ax, &caller("c1"), &json!({ "ref": "@s1:e2" }))).unwrap();
+        assert_eq!(got["value"], "short");
+        assert!(got.get("truncated").is_none());
     }
 
     #[test]
