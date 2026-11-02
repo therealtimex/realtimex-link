@@ -74,6 +74,8 @@ struct Supervisor {
     team: String,
     state: Mutex<State>,
     stopping: AtomicBool,
+    /// Peers already logged as refused.
+    refused: Mutex<policy::RefusedPeers>,
 }
 
 extern "C" fn on_term(_signal: libc::c_int) {
@@ -119,11 +121,15 @@ pub fn run(args: &[String]) -> ! {
         libc::signal(libc::SIGTERM, on_term as libc::sighandler_t);
     }
     log(&format!("started for uid {}", config.owner_uid.unwrap_or_default()));
+    // Bridges left running from a copy an older supervisor refreshed (it didn't restart them):
+    // they can't pass the signature check, so launchd restarts them (realtimex-link#13).
+    restart_bridges(false);
     let supervisor = Arc::new(Supervisor {
         config,
         team,
         state: Mutex::new(State::default()),
         stopping: AtomicBool::new(false),
+        refused: Mutex::new(policy::RefusedPeers::default()),
     });
     let daemon = supervisor.clone();
     std::thread::spawn(move || daemon.owner_daemon());
@@ -167,8 +173,11 @@ impl Supervisor {
                 match apply::install_root_copy(&self.team) {
                     Ok(()) => {
                         log(&format!("root copy refreshed to {}", installed.as_deref().unwrap_or("?")));
-                        // launchd starts this job again, from the new copy; the bridges see the
-                        // new version and restart (M5).
+                        // The bridges still run from the old copy, which is gone: this signature
+                        // check refuses them, so the new daemon can't tell them to restart (M5).
+                        // launchd restarts them now, from the new copy (realtimex-link#13).
+                        restart_bridges(true);
+                        // launchd starts this job again, from the new copy.
                         std::process::exit(1);
                     }
                     Err(error) => log(&format!("the root copy wasn't refreshed: {error:#}")),
@@ -334,10 +343,22 @@ impl Supervisor {
         // An accepted socket keeps the listener's non-blocking mode on macOS.
         let _ = stream.set_nonblocking(false);
         let Ok(peer) = os::peer(stream.as_raw_fd()) else { return };
-        let allowed = sign::requirement(&self.team, &sign::PEER_IDENTIFIERS)
-            .is_some_and(|requirement| sign::peer_satisfies(&peer.token, &requirement));
-        if !allowed {
-            // Closed without an answer.
+        let checked = match sign::requirement(&self.team, &sign::PEER_IDENTIFIERS) {
+            Some(requirement) => sign::peer_check(&peer.token, &requirement),
+            None => Err(sign::NOT_CHECKED),
+        };
+        if let Err(status) = checked {
+            // Closed without an answer; logged once per pid (realtimex-link#13): a bridge left
+            // running from a removed root copy fails here, as its code on disk is gone.
+            let first = self.refused.lock().unwrap_or_else(|p| p.into_inner()).first(peer.pid());
+            if first {
+                log(&format!(
+                    "refused a peer: uid {}, pid {}, OSStatus {status} ({})",
+                    peer.uid,
+                    peer.pid(),
+                    os::process_path(peer.pid() as i32).unwrap_or_else(|| "path unknown".into()),
+                ));
+            }
             return;
         }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -446,6 +467,35 @@ enum Outcome {
     OwnerRunning,
     Unavailable,
     Exited,
+}
+
+/// `launchctl kickstart -k` the session jobs (each GUI user's and the login window's), best
+/// effort: each outcome is logged, and none stops the update (realtimex-link#13). `all`: every
+/// job (the root copy was just refreshed); else only those still running from another copy
+/// than the current one (this supervisor's start: a refresh by an older supervisor, which
+/// didn't restart them).
+fn restart_bridges(all: bool) {
+    let targets = policy::session_jobs(&os::gui_users());
+    let program = super::plist::root_program();
+    let outcomes = policy::restart_session_jobs(
+        &targets,
+        |target| {
+            let print = os::launchctl_print(target)?;
+            Some(all || policy::job_is_stale(&print, os::process_path, &program))
+        },
+        os::launchctl,
+    );
+    for (target, outcome) in outcomes {
+        match outcome {
+            policy::Kickstart::Restarted => log(&format!("restarted the bridge {target}")),
+            policy::Kickstart::Failed => log(&format!(
+                "couldn't restart the bridge {target}: it restarts itself once it sees its copy was replaced"
+            )),
+            // Only worth a line when every job was meant to restart.
+            policy::Kickstart::NoJob if all => log(&format!("no bridge to restart at {target}")),
+            policy::Kickstart::NoJob | policy::Kickstart::Current => {}
+        }
+    }
 }
 
 fn stop(child: &mut std::process::Child) {

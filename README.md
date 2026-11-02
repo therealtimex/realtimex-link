@@ -71,7 +71,10 @@ control other computers from.
   login window and in each user's session, so allowed computers connect at the login window and
   the lock screen and can sign in there. Turning it off needs no prompt. Background items show
   under RealTimeX.AI when the main app is installed; with it off in Login Items, turning on is
-  refused and nothing is left installed.
+  refused and nothing is left installed. After a self-update (0.6.1, realtimex-link#13) the
+  supervisor restarts every session agent from the new copy, and an agent whose executable an
+  update replaced restarts itself. With no session agent at the console, remote control answers
+  503 `no-session-bridge`, and `GET /v1/status` says `remoteControl: {available, reason}`.
   **Start with this computer** (0.3.0, realtimex-link#10, Windows): Link's service (`rtx-linkd
   --service`, LocalSystem, installed by the installer) runs its owner's daemon from boot while
   `POST /v1/unattended {enabled:true}` is on, so allowed computers connect at the sign-in and lock

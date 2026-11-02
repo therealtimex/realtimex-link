@@ -164,6 +164,9 @@ pub const LOGIN_ITEMS_DISABLED: &str = "login-items-disabled";
 /// macOS (#11 M5): the root copy and the owner's daemon are different versions for a moment
 /// (an update); the supervisor refreshes the copy.
 pub const UNATTENDED_UPDATING: &str = "unattended-updating";
+/// macOS (realtimex-link#13): under the supervisor, no session bridge has the console (none
+/// registered, or none says it has the console), so remote control can't start a helper.
+pub const NO_SESSION_BRIDGE: &str = "no-session-bridge";
 /// macOS (#11 M5): pasted files sit in the owner's own temporary folder, so only the owner's
 /// own session can take them.
 pub const FILES_NEED_OWNER_SESSION: &str = "files-need-owner-session";

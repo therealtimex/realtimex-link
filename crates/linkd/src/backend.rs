@@ -496,9 +496,7 @@ impl Backend {
             Self::spawn_helper(&binary).map_err(|error| std::io::Error::other(error.message))
         })
         .await
-        .map_err(|error| {
-            ApiError::new(502, format!("Remote Control helper did not start: {error}"))
-        })?;
+        .map_err(helper_did_not_start)?;
         let crate::helper::Spawned {
             child,
             stdin,
@@ -725,10 +723,26 @@ impl Backend {
         }
     }
 
-    pub async fn status(self: &Arc<Self>) -> Value {
+    /// Whether remote control can run here now, and why not: rtx-control's detection, then
+    /// (macOS under the supervisor) a session bridge at the console (realtimex-link#13).
+    pub fn availability(&self) -> (bool, Option<String>) {
         let detected = self.detected();
         if detected.binary.is_none() {
-            return json!({ "available": false, "reason": detected.reason });
+            return (false, detected.reason);
+        }
+        // A running helper has its bridge.
+        if self.inner().running.is_none() {
+            if let Some(reason) = crate::helper::session_unavailable() {
+                return (false, Some(reason.to_string()));
+            }
+        }
+        (true, None)
+    }
+
+    pub async fn status(self: &Arc<Self>) -> Value {
+        let (available, reason) = self.availability();
+        if !available {
+            return json!({ "available": false, "reason": reason });
         }
         if self.inner().running.is_none() {
             return json!({ "available": true, "backend": "rtx-control", "active": false });
@@ -926,9 +940,51 @@ fn session_closed(message: &str) -> bool {
         || lower.contains("session is closed")
 }
 
+/// A helper that didn't start, as the API answers it: no session bridge at the console
+/// (realtimex-link#13) is its own code, 503 `no-session-bridge`; anything else 502.
+fn helper_did_not_start(error: std::io::Error) -> ApiError {
+    if error.to_string() == crate::unattended::NO_SESSION_BRIDGE {
+        return ApiError::coded(
+            503,
+            crate::unattended::NO_SESSION_BRIDGE,
+            "Remote control isn't available on this computer right now: no session has RealTimeX Link's helper",
+        );
+    }
+    ApiError::new(502, format!("Remote Control helper did not start: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_session_bridge_is_its_own_code_and_other_start_failures_stay_unavailable() {
+        let error = helper_did_not_start(std::io::Error::other(crate::unattended::NO_SESSION_BRIDGE));
+        assert_eq!((error.status, error.code_or_status()), (503, "no-session-bridge".into()));
+        let body = error.body();
+        assert_eq!(body["retry"], "after");
+        assert!(body["suggestion"].as_str().unwrap().contains("isn't available on this computer right now"));
+        let other = helper_did_not_start(std::io::Error::other("the session's bridge didn't start the helper"));
+        assert_eq!((other.status, other.code_or_status()), (502, "unavailable".into()));
+        assert!(other.message.starts_with("Remote Control helper did not start: "));
+    }
+
+    /// Elsewhere than macOS under the supervisor, a detected helper is available.
+    #[test]
+    fn a_detected_helper_is_available_without_a_supervisor() {
+        let backend = Backend::with_detected(Detected {
+            binary: Some(PathBuf::from("/nonexistent/rtx-control")),
+            reason: None,
+            code: None,
+        });
+        assert_eq!(backend.availability(), (true, None));
+        let missing = Backend::with_detected(Detected {
+            binary: None,
+            reason: Some("not installed".into()),
+            code: None,
+        });
+        assert_eq!(missing.availability(), (false, Some("not installed".into())));
+    }
 
     #[test]
     fn helper_failures_answer_with_the_status_of_their_code() {

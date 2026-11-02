@@ -181,6 +181,13 @@ pub fn defaults(code: &str, status: u16) -> Defaults {
             NONE,
             Some("Remote control is starting or restarting here; try again shortly."),
         ),
+        // realtimex-link#13: macOS, no session's bridge has the console (none registered, e.g.
+        // a stale bridge after an update). Not a network problem: the computer is reachable.
+        "no-session-bridge" => after(
+            10_000,
+            NONE,
+            Some("Remote control isn't available on this computer right now: no signed-in session or login window has RealTimeX Link's helper. Ask someone at that computer to sign out and back in, or to restart RealTimeX Link; then try again."),
+        ),
         "busy" => after(500, NONE, Some("Too many waits at once: let one finish first.")),
         // Phase 2, the accessibility layer (ax.rs).
         "stale-ref" => plain(
@@ -520,6 +527,13 @@ mod tests {
             (input["retry"].as_str(), input["delivery"].as_str()),
             (Some("no"), Some("unknown"))
         );
+        // realtimex-link#13: the computer is reachable, its helper isn't.
+        let body = ApiError::coded(503, "no-session-bridge", "x").body();
+        assert_eq!(
+            (body["retry"].as_str(), body["retryAfterMs"].as_u64(), body["delivery"].as_str()),
+            (Some("after"), Some(10_000), Some("none"))
+        );
+        assert!(body["suggestion"].as_str().unwrap().starts_with("Remote control isn't available on this computer right now"));
         // A code the table doesn't list: nothing invented beyond the retry rule.
         let body = ApiError::coded(409, "request-settled", "x").body();
         assert_eq!(body["retry"], "no");

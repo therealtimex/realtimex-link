@@ -284,7 +284,15 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         // running is on), or a login item starts it.
         "realtimexPresent": crate::owner::present(&state.host.store),
         "autostartEnabled": crate::paths::is_standard() && crate::autostart::enabled(),
+        // Whether remote control can run here now, and why not (realtimex-link#13), e.g.
+        // `no-session-bridge` on macOS under the supervisor.
+        "remoteControl": remote_control(&state.host.backend),
     }))
+}
+
+fn remote_control(backend: &crate::backend::Backend) -> Value {
+    let (available, reason) = backend.availability();
+    json!({ "available": available, "reason": reason })
 }
 
 type Answer = ApiResult<Json<Value>>;

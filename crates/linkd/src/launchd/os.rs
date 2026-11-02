@@ -307,6 +307,14 @@ pub fn gui_users() -> Vec<u32> {
     users
 }
 
+/// A process's executable path (proc_pidpath), as the kernel sees it now.
+pub fn process_path(pid: i32) -> Option<String> {
+    let mut buffer = [0u8; 4 * 1024];
+    // SAFETY: the buffer's size is passed (PROC_PIDPATHINFO_MAXSIZE).
+    let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    (length > 0).then(|| String::from_utf8_lossy(&buffer[..length as usize]).into_owned())
+}
+
 /// A Unix socketpair; both ends close on exec.
 pub fn socketpair(kind: libc::c_int) -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];

@@ -99,6 +99,16 @@ pub fn console_session() -> Option<u32> {
     None
 }
 
+/// Why the helper can't start here now, beyond rtx-control's own detection: on macOS under the
+/// supervisor, no session bridge has the console (realtimex-link#13). None elsewhere.
+pub fn session_unavailable() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    if crate::service::supervised() && !crate::bridges::console_bridge_present() {
+        return Some(crate::unattended::NO_SESSION_BRIDGE);
+    }
+    None
+}
+
 /// Whether an input request goes to the login-window job, not rtx-control's CGEventPost
 /// (#11 I4). Only the daemon decides it (C4).
 pub fn input_via_job(op: &str) -> bool {
