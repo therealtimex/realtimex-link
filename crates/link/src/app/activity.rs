@@ -59,6 +59,20 @@ pub struct Activity {
     pub local: Vec<(String, String)>,
 }
 
+/// A fresh first page: the list starts again from it and its `next`. For all computers and
+/// agents, the agents on this computer in the filter are rebuilt from it, so those whose entries
+/// were cleared or aged out go (review C5); for one computer they are only added to.
+fn fresh_page(activity: &mut Activity, page: &Value) {
+    let entries = entries_of(page);
+    if activity.client.is_none() {
+        activity.local.clear();
+    }
+    remember_local(activity, &entries);
+    activity.entries = entries;
+    activity.next = next_of(page);
+    activity.dropped = page.get("dropped").and_then(Value::as_u64).unwrap_or(0);
+}
+
 /// Remember the local callers among `entries` (the newest name wins).
 fn remember_local(activity: &mut Activity, entries: &[Value]) {
     for entry in entries {
@@ -83,6 +97,8 @@ pub struct ActivityView {
     open: HashSet<i64>,
     /// Clear… gets the focus back (its confirm was cancelled).
     pub focus_clear: bool,
+    /// The frame the tab was last drawn in: a gap means it is shown again.
+    seen: Option<u64>,
 }
 
 fn id_of(entry: &Value) -> i64 {
@@ -178,11 +194,7 @@ pub fn load(shared: &Shared, ctx: &egui::Context, client: Option<String>) {
             }
             match answer {
                 Ok(page) => {
-                    activity.entries = entries_of(&page);
-                    let entries = activity.entries.clone();
-                    remember_local(activity, &entries);
-                    activity.next = next_of(&page);
-                    activity.dropped = page.get("dropped").and_then(Value::as_u64).unwrap_or(0);
+                    fresh_page(activity, &page);
                     activity.load = Load::Ready;
                 }
                 Err(_) => activity.load = Load::Failed,
@@ -224,28 +236,44 @@ fn poll(shared: &Shared, ctx: &egui::Context) {
     });
 }
 
-/// New entries go on top. A log cleared elsewhere starts over (its ids start again too).
+/// The newest page again: new entries go on top. The list starts over from the page instead
+/// (keeping the filter; open runs stay open where their ids remain) when
+/// - the log was cleared elsewhere (its ids start again too, or it is empty), or
+/// - more than a page arrived since: the page doesn't reach the loaded newest and has more
+///   behind it, so putting it on top would hide the entries in between (review C2).
 fn merge(activity: &mut Activity, page: &Value) {
     let fresh = entries_of(page);
+    let Some(newest) = activity.entries.first().map(id_of) else {
+        fresh_page(activity, page);
+        return;
+    };
+    let starts_over = match (fresh.first().map(id_of), fresh.last().map(id_of)) {
+        (None, _) | (_, None) => true,
+        (Some(page_newest), _) if page_newest < newest => true,
+        (_, Some(page_oldest)) => page_oldest > newest && next_of(page).is_some(),
+    };
+    if starts_over {
+        fresh_page(activity, page);
+        // A Show older still on its way was for the list that went (older() drops its page).
+        activity.older = Load::Idle;
+        return;
+    }
     remember_local(activity, &fresh);
     activity.dropped = page.get("dropped").and_then(Value::as_u64).unwrap_or(activity.dropped);
-    let newest = activity.entries.first().map(id_of);
-    let page_newest = fresh.first().map(id_of);
-    match (newest, page_newest) {
-        (Some(newest), Some(page_newest)) if page_newest < newest => {
-            activity.entries = fresh;
-            activity.next = next_of(page);
-        }
-        (Some(newest), _) => {
-            let mut added: Vec<Value> = fresh.into_iter().filter(|e| id_of(e) > newest).collect();
-            added.append(&mut activity.entries);
-            activity.entries = added;
-        }
-        (None, _) => {
-            activity.entries = fresh;
-            activity.next = next_of(page);
-        }
-    }
+    let mut added: Vec<Value> = fresh.into_iter().filter(|e| id_of(e) > newest).collect();
+    added.append(&mut activity.entries);
+    activity.entries = added;
+}
+
+/// Read the newest page again now: every 5 s while the tab shows, and at once when it is shown
+/// again after another tab (or the window was away), quietly, without the spinner (review C2).
+fn refresh_due(load: Load, polled: Option<Instant>, shown_again: bool) -> bool {
+    load == Load::Ready && (shown_again || polled.is_none_or(|at| at.elapsed() >= LIVE))
+}
+
+/// The tab wasn't drawn in the frame before this one (`seen`: the frame it last was).
+fn shown_again(seen: Option<u64>, frame: u64) -> bool {
+    seen.is_some_and(|seen| frame > seen + 1)
 }
 
 /// Show older: the next page after `next`, appended (runs fold again across the boundary).
@@ -266,7 +294,8 @@ fn older(shared: &Shared, ctx: &egui::Context) {
         {
             let mut state = lock(&shared);
             let activity = &mut state.activity;
-            if activity.generation != generation {
+            // A new load, or a refresh that started the list over meanwhile: not for this list.
+            if activity.generation != generation || activity.next != Some(before) {
                 return;
             }
             match answer {
@@ -1016,9 +1045,11 @@ impl LinkApp {
         let removed = client.as_ref().is_some_and(|id| {
             !id.starts_with("local:") && !clients.iter().any(|c| text(c, "id") == *id)
         });
+        let frame = ctx.cumulative_frame_nr();
+        let again = shown_again(self.activity.seen.replace(frame), frame);
         if load_state == Load::Idle || (removed && load_state != Load::Loading) {
             load(&self.shared, ctx, None);
-        } else if load_state == Load::Ready && polled.is_none_or(|at| at.elapsed() >= LIVE) {
+        } else if refresh_due(load_state, polled, again) {
             poll(&self.shared, ctx);
         }
         ctx.request_repaint_after(LIVE);
@@ -1408,6 +1439,93 @@ mod tests {
         merge(&mut activity, &json!({ "entries": [{ "id": 1 }], "next": null }));
         assert_eq!(activity.entries.iter().map(id_of).collect::<Vec<_>>(), [1]);
         assert_eq!(activity.next, None);
+    }
+
+    fn ids(activity: &Activity) -> Vec<i64> {
+        activity.entries.iter().map(id_of).collect()
+    }
+
+    /// A page of `ids` (newest first), with `next` after its oldest when there is more.
+    fn page(ids: std::ops::RangeInclusive<i64>, more: bool) -> Value {
+        let entries: Vec<Value> = ids.clone().rev().map(|id| json!({ "id": id })).collect();
+        json!({ "entries": entries, "next": more.then_some(*ids.start()), "dropped": 0 })
+    }
+
+    #[test]
+    fn more_than_a_page_since_the_last_read_starts_the_list_over() {
+        // Loaded: 1..=100, the whole log. 150 entries arrive (101..=250): the newest page is
+        // 151..=250 with more behind it. Putting it on top would hide 101..=150 (review C2).
+        let mut activity = Activity {
+            client: Some("c-lan".into()),
+            ..Activity::default()
+        };
+        fresh_page(&mut activity, &page(1..=100, false));
+        activity.older = Load::Loading;
+        merge(&mut activity, &page(151..=250, true));
+        assert_eq!(ids(&activity), (151..=250).rev().collect::<Vec<_>>());
+        assert_eq!(activity.next, Some(151));
+        // The filter stays; Show older goes on from the new page.
+        assert_eq!(activity.client.as_deref(), Some("c-lan"));
+        assert_eq!(activity.older, Load::Idle);
+        // A page that reaches the loaded newest still goes on top, the rest kept.
+        merge(&mut activity, &page(161..=260, true));
+        assert_eq!(ids(&activity).len(), 110);
+        assert_eq!((ids(&activity)[0], activity.next), (260, Some(151)));
+        // New entries that don't overlap but are all there are (no `next`): on top as before.
+        let mut small = Activity::default();
+        fresh_page(&mut small, &page(1..=3, false));
+        merge(&mut small, &page(5..=6, false));
+        assert_eq!(ids(&small), [6, 5, 3, 2, 1]);
+        // Emptied elsewhere: empty.
+        merge(&mut small, &json!({ "entries": [], "next": null }));
+        assert!(small.entries.is_empty());
+    }
+
+    #[test]
+    fn the_tab_shown_again_reads_the_newest_page_at_once() {
+        assert!(shown_again(Some(10), 12));
+        assert!(!shown_again(Some(10), 11));
+        assert!(!shown_again(Some(10), 10));
+        assert!(!shown_again(None, 1));
+        let just = Some(Instant::now());
+        assert!(refresh_due(Load::Ready, just, true));
+        assert!(!refresh_due(Load::Ready, just, false));
+        assert!(refresh_due(Load::Ready, None, false));
+        // Not while loading or failed: those have their own spinner and Try again.
+        assert!(!refresh_due(Load::Loading, None, true));
+        assert!(!refresh_due(Load::Failed, None, true));
+        // And what it reads is merged by the same rule: more than a page since starts over,
+        // keeping the filter (the open runs live in ActivityView and are not touched).
+        let mut activity = Activity {
+            client: Some("local:w1:t2".into()),
+            ..Activity::default()
+        };
+        fresh_page(&mut activity, &page(1..=100, true));
+        merge(&mut activity, &page(201..=300, true));
+        assert_eq!((ids(&activity)[99], activity.next), (201, Some(201)));
+        assert_eq!(activity.client.as_deref(), Some("local:w1:t2"));
+    }
+
+    #[test]
+    fn a_fresh_load_of_everything_rebuilds_the_agents_in_the_filter() {
+        let local = |id: i64, client: &str, name: &str| {
+            json!({ "id": id, "clientId": client, "clientName": name, "via": "local" })
+        };
+        let mut activity = Activity::default();
+        fresh_page(&mut activity, &json!({ "entries": [local(2, "local:w1:t1", "Q3 report"), local(1, "local:w1:t2", "Inbox triage")] }));
+        assert_eq!(activity.local.len(), 2);
+        // After Clear: only the note is left, and the agents go from the filter (review C5).
+        fresh_page(&mut activity, &json!({ "entries": [{ "id": 1, "kind": "audit-cleared", "via": "public" }] }));
+        assert!(activity.local.is_empty());
+        // Filtered to one computer, a load only adds.
+        fresh_page(&mut activity, &json!({ "entries": [local(3, "local:w1:t1", "Q3 report")] }));
+        activity.client = Some("c-office".into());
+        fresh_page(&mut activity, &json!({ "entries": [{ "id": 4, "clientId": "c-office", "via": "public" }] }));
+        assert_eq!(activity.local, vec![("local:w1:t1".to_string(), "Q3 report".to_string())]);
+        // A starting-over refresh of everything rebuilds too.
+        activity.client = None;
+        merge(&mut activity, &json!({ "entries": [local(1, "local:w2:t9", "New run")], "next": null }));
+        assert_eq!(activity.local, vec![("local:w2:t9".to_string(), "New run".to_string())]);
     }
 
     #[test]
