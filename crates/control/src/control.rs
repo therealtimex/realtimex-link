@@ -310,6 +310,8 @@ impl Controller {
                 capture(max_width, display)
             }
         });
+        #[cfg(target_os = "linux")]
+        let shot = shot.map_err(wayland_capture_error);
         let shot = self.note_capture(shot)?;
         // A live view's smaller frames say their own size with each click (`space`).
         if !live {
@@ -671,6 +673,35 @@ fn refuse_when_locked() -> Result<()> {
         )),
         None => Err(platform::refused("screen-locked", LOCK_UNKNOWN)),
     }
+}
+
+/// GNOME Wayland: Mutter's D-Bus error when its screen-cast session is gone (GNOME ends it when
+/// the screen locks, or when sharing is stopped) never reaches agents as such (QA of #3055):
+/// `screen-locked` while it is locked, else `unavailable` (the next request starts a new one).
+#[cfg(target_os = "linux")]
+fn wayland_capture_error(error: anyhow::Error) -> anyhow::Error {
+    if !platform::screenshot_needs_input()
+        || error_code(&error).is_some()
+        || !mutter_session_gone(&format!("{error:#}"))
+    {
+        return error;
+    }
+    if platform::lock_state() == Some(true) {
+        return platform::refused("screen-locked", "The screen is locked. Unlock it to see it here.");
+    }
+    platform::refused(
+        "unavailable",
+        "GNOME ended the screen-sharing session (the screen was locked, or sharing was stopped). \
+         Link starts a new one: try again.",
+    )
+}
+
+/// Whether a capture failed because Mutter's remote-desktop or screen-cast session is gone.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mutter_session_gone(text: &str) -> bool {
+    text.contains("/org/gnome/Mutter/RemoteDesktop/Session")
+        || text.contains("/org/gnome/Mutter/ScreenCast/Session")
+        || (text.contains("org.freedesktop.DBus.Error") && text.contains("Mutter"))
 }
 
 /// Why `screen-locked` when the lock state can't be read.
@@ -1132,6 +1163,15 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gone_mutter_session_is_recognised() {
+        assert!(mutter_session_gone(
+            "org.freedesktop.DBus.Error.UnknownMethod: Object does not exist at path \u{201c}/org/gnome/Mutter/RemoteDesktop/Session/u3\u{201d}"
+        ));
+        assert!(mutter_session_gone("no such object /org/gnome/Mutter/ScreenCast/Session/u7"));
+        assert!(!mutter_session_gone("the display's picture is short"));
+    }
 
     #[test]
     fn unbase64_reverses_base64() {
