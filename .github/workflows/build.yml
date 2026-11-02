@@ -132,8 +132,8 @@ jobs:
           # frame pipeline and virtual-monitor fallback (#9), and the display table and point
           # mapping (#12); its other tests need a desktop.
           # And the accessibility runner (#3055 §2.2: timeouts, the circuit breaker, the output
-          # cap, the argv allow-list, out-of-order replies).
-          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests jobinput:: displays:: peer::tests::a_lost_display ax::
+          # cap, the argv allow-list, out-of-order replies), and how Linux reads the lock state.
+          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests jobinput:: displays:: peer::tests::a_lost_display ax:: linux::lock::tests
           # The CI scripts' own checks (the agent-desktop pin and fetch, the release's sums).
           python3 -m unittest discover -s ci -p 'test_*.py'
       # Lints, once (Linux): warnings show in the log; errors fail the build.
