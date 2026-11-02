@@ -2687,6 +2687,8 @@ done
             peers: Mutex::new(HashMap::new()),
             display_poll: Mutex::new(None),
             http_sessions: Mutex::new(HashMap::new()),
+            frames: wait::Frames::default(),
+            waits: wait::Waits::default(),
             transfers: Transfers::new(dir.join("temp"), dir.join("downloads")),
             clipboard: ClipboardShare::default(),
             clipboard_polling: AtomicBool::new(false),
