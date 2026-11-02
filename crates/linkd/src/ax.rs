@@ -56,8 +56,14 @@ const WHOLE_TEXT: usize = 64 * 1024;
 const MAX_STEPS: usize = 10;
 const MAX_QUEUED: usize = 4;
 const QUEUE_WAIT: Duration = Duration::from_secs(5);
-const BATCH_TIMEOUT: Duration = Duration::from_secs(20);
-const DEPTH_DEFAULT: u64 = 30;
+/// A batch's deadline ([`batch_timeout`]): 6 s a step, at least 20 s, at most 60 s. The app's
+/// client waits as long (realtimex-ai-app#3055, QA: a find-then-click takes ~5 s on Windows).
+const BATCH_PER_STEP: Duration = Duration::from_secs(6);
+const BATCH_MIN: Duration = Duration::from_secs(20);
+const BATCH_MAX: Duration = Duration::from_secs(60);
+/// The tree's depth when the client names none: agent-desktop's most. At 30, web pages in Edge
+/// lost their form fields (QA of #3055); a deeper walk stays within the snapshot's 10 s.
+const DEPTH_DEFAULT: u64 = 50;
 /// The client may ask for 1–60 (§2.4.2); agent-desktop 1.0.2 takes at most 50.
 const DEPTH_CLI_MAX: u64 = 50;
 const FIND_LIMIT_DEFAULT: u64 = 20;
@@ -74,8 +80,8 @@ const ANSWER_GRACE: Duration = Duration::from_secs(2);
 /// (crates/control/src/ax.rs `VERSION_CHECK`), so it never eats into the call's deadline.
 const VERSION_CHECK: Duration = Duration::from_secs(5);
 
-/// How long a call may still take: a batch's 20 s are a deadline, and each step's CLI call is
-/// capped by what is left of them (§2.3). Single calls have none.
+/// How long a call may still take: a batch's time ([`batch_timeout`]) is a deadline, and each
+/// step's CLI call is capped by what is left of it (§2.3). Single calls have none.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Budget {
     deadline: Option<Instant>,
@@ -100,9 +106,9 @@ impl Budget {
     }
 }
 
-/// The batch's 20 s are over before this call could start: nothing was sent.
+/// The batch's time is over before this call could start: nothing was sent.
 fn out_of_time() -> ApiError {
-    ApiError::coded(504, "timeout", "The batch ran out of its 20 s").with_delivery(Delivery::None)
+    ApiError::coded(504, "timeout", "The batch ran out of time").with_delivery(Delivery::None)
 }
 
 /// A failure of the runner itself (not one agent-desktop answered with), as a read or an action
@@ -965,7 +971,7 @@ fn depth_of(body: &Value) -> ApiResult<u64> {
     }
 }
 
-/// `POST ax/snapshot {window, maxDepth=30, interactive=true, root?}`.
+/// `POST ax/snapshot {window, maxDepth=50, interactive=true, root?}`.
 pub async fn snapshot<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value) -> ApiResult<(Value, Target)> {
     let window = text_field(body, "window").ok_or_else(|| ApiError::bad_request("window is required"))?;
     let depth = depth_of(body)?;
@@ -1026,7 +1032,8 @@ pub async fn snapshot<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &
     Ok((result, target))
 }
 
-/// `POST ax/find {window, role?, name?, text?, limit=20 (≤50)}` → `{matches}` (no children).
+/// `POST ax/find {window, role?, name?, text?, exact?, limit=20 (≤50)}` → `{matches}` (no
+/// children). `exact: true`: the name or text whole, not a part of it.
 pub async fn find<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value) -> ApiResult<(Value, Target)> {
     let window = text_field(body, "window").ok_or_else(|| ApiError::bad_request("window is required"))?;
     let limit = match body.get("limit") {
@@ -1061,6 +1068,9 @@ async fn find_in<D: Desktop>(
     if !any {
         return Err(ApiError::bad_request("find needs role, name or text"));
     }
+    if query.get("exact") == Some(&Value::Bool(true)) {
+        argv.push("--exact".into());
+    }
     argv.push(format!("--limit={limit}"));
     let answer = data(&read_cli(desktop, argv, READ_TIMEOUT, budget).await?).map_err(|e| map_error(&e, false, None))?;
     let raw: Vec<Value> = match answer.get("matches").and_then(Value::as_array) {
@@ -1087,10 +1097,53 @@ async fn find_in<D: Desktop>(
         .iter()
         // Context matches have no ref: nothing to act on.
         .filter(|m| m.get("ref_id").and_then(Value::as_str).is_some())
-        .map(|m| walk.node(m, false))
+        .map(|m| {
+            let mut node = walk.node(m, false);
+            // agent-desktop 1.0.2's find gives no actions: what the role takes, for an
+            // interactive element (its ref still allows any action, as unknown).
+            let advertised = m.get("available_actions").or_else(|| m.get("actions")).is_some();
+            if !advertised && m.get("interactive") == Some(&Value::Bool(true)) {
+                node["actions"] = json!(likely_actions(node["role"].as_str().unwrap_or("")));
+            }
+            node
+        })
         .collect();
     ax.remember(std::mem::take(&mut walk.refs));
     Ok(matches)
+}
+
+/// The actions an interactive element of `role` takes, as snapshots list them for it, for
+/// find's matches (agent-desktop's find doesn't say).
+fn likely_actions(role: &str) -> Vec<&'static str> {
+    let role: String = role
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match role.as_str() {
+        "button" | "link" | "menuitem" | "listitem" | "treeitem" | "cell" | "image" => vec!["click"],
+        "checkbox" | "switch" | "togglebutton" | "radiobutton" => vec!["click", "toggle"],
+        "textfield" | "searchfield" | "textarea" | "securetextfield" | "passwordtext" => {
+            vec!["click", "set-value", "type"]
+        }
+        "combobox" => vec!["click", "set-value", "type", "select", "expand", "collapse"],
+        "menubutton" | "popupbutton" => vec!["click", "expand", "collapse"],
+        "tab" => vec!["click", "select"],
+        "slider" | "spinbutton" | "incrementor" => vec!["set-value"],
+        _ => Vec::new(),
+    }
+}
+
+/// Of several matches, the one named exactly as the query's `name` (ignoring case and spaces
+/// around it), when only one is: `find --name Clear` acts on "Clear", not "Clear entry" or
+/// "Clear all memory" (QA of realtimex-ai-app#3055).
+fn exact_match<'a>(matches: &'a [Value], query: &Value) -> Option<&'a Value> {
+    let wanted = text_field(query, "name")?.trim().to_lowercase();
+    let mut exact = matches.iter().filter(|m| {
+        m["name"].as_str().is_some_and(|name| name.trim().to_lowercase() == wanted)
+    });
+    let one = exact.next()?;
+    exact.next().is_none().then_some(one)
 }
 
 /// `POST ax/get {ref, property: value|name|states|bounds}` → `{ref, property, value, secret?}`.
@@ -1200,12 +1253,15 @@ async fn needs_pixels<D: Desktop>(
             let display = bounds.get("display").cloned();
             error.with_details(json!({ "bounds": bounds, "display": display }))
         }
-        None => error,
+        None => error.with_suggestion(NO_BOUNDS),
     }
 }
 
+/// needs-pixels for an element whose place on the screen isn't known (GNOME Wayland gives none).
+const NO_BOUNDS: &str = "Take a screenshot, find the element in it and click it there by pixels.";
+
 /// The type fallback chain and every other action (§2.4.3, §2.4.5). `budget`: what is left of a
-/// batch's 20 s.
+/// batch's time.
 pub async fn act_on<D: Desktop>(
     desktop: &D,
     entry: &RefEntry,
@@ -1379,9 +1435,12 @@ async fn type_chain<D: Desktop>(
     // 4. The agent does it with pixels.
     let mut error = ApiError::coded(422, "needs-pixels", "This element takes no typing through accessibility")
         .with_delivery(Delivery::None);
-    if let Some(bounds) = bounds {
-        let display = bounds.get("display").cloned();
-        error = error.with_details(json!({ "bounds": bounds, "display": display }));
+    match bounds {
+        Some(bounds) => {
+            let display = bounds.get("display").cloned();
+            error = error.with_details(json!({ "bounds": bounds, "display": display }));
+        }
+        None => error = error.with_suggestion(NO_BOUNDS),
     }
     Err(error)
 }
@@ -1456,9 +1515,18 @@ pub enum Note {
 const STEP_GRACE: Duration = ANSWER_GRACE;
 
 /// `POST ax/batch {window, steps:[…≤10], stopOnError=true}` → `{results:[{ok, data|error}]}`,
-/// within 20 s in all. The rows to write come back with it.
+/// within [`batch_timeout`] in all. The rows to write come back with it.
 pub async fn batch<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value) -> ApiResult<(Value, Vec<Note>)> {
-    batch_until(desktop, ax, caller, body, Instant::now() + BATCH_TIMEOUT).await
+    let steps = body.get("steps").and_then(Value::as_array).map_or(0, Vec::len);
+    // Its CLI calls end by the deadline less the answer grace, so the whole answer is in by then
+    // (the relay in front of a remote batch waits 60 s for it).
+    let deadline = Instant::now() + batch_timeout(steps) - STEP_GRACE;
+    batch_until(desktop, ax, caller, body, deadline).await
+}
+
+/// How long a batch of `steps` steps may take: 6 s a step, from 20 s to 60 s (10 steps).
+pub fn batch_timeout(steps: usize) -> Duration {
+    (BATCH_PER_STEP * steps.min(MAX_STEPS) as u32).clamp(BATCH_MIN, BATCH_MAX)
 }
 
 /// The batch with its deadline: each step's CLI calls are capped by what is left of it, and a
@@ -1599,15 +1667,19 @@ async fn run_step<D: Desktop>(
         Step::Find { query, then } => {
             notes.push(Note::Read { window: target.window.clone(), app: target.app.clone() });
             let matches = find_in(desktop, ax, caller, target, query, CANDIDATES as u64 + 1, budget).await?;
-            match ((*then).filter(|t| !t.is_null()), matches.as_slice()) {
-                (None, _) => Ok(json!({ "matches": matches })),
-                (Some(_), []) => Err(ApiError::coded(409, "stale-ref", "Nothing matched to act on")),
-                (Some(then), [one]) => {
+            let chosen = match matches.as_slice() {
+                [one] => Some(one),
+                many => exact_match(many, query),
+            };
+            match ((*then).filter(|t| !t.is_null()), matches.as_slice(), chosen) {
+                (None, _, _) => Ok(json!({ "matches": matches })),
+                (Some(_), [], _) => Err(ApiError::coded(409, "stale-ref", "Nothing matched to act on")),
+                (Some(then), _, Some(one)) => {
                     let reference = one["ref"].as_str().unwrap_or("").to_string();
                     let entry = ax.lookup(&caller.owner, &reference)?;
                     act_step(desktop, entry, &reference, then, caller, budget, notes).await
                 }
-                (Some(_), many) => Err(ApiError::coded(409, "ambiguous-target", "More than one element matched")
+                (Some(_), many, None) => Err(ApiError::coded(409, "ambiguous-target", "More than one element matched")
                     .with_details(json!({ "candidates": many.iter().take(CANDIDATES).cloned().collect::<Vec<_>>() }))),
             }
         }
@@ -1955,7 +2027,7 @@ mod tests {
         let call = &fake.calls()[0];
         assert_eq!(call[0], "snapshot");
         assert!(call.contains(&"--window-id=w-42".to_string()));
-        assert!(call.contains(&"--max-depth=30".to_string()));
+        assert!(call.contains(&"--max-depth=50".to_string()));
         assert!(call.contains(&"--interactive-only".to_string()));
     }
 
@@ -2071,6 +2143,8 @@ mod tests {
         let fake = Fake::new(vec![failed("POLICY_DENIED", "not_delivered")]);
         let error = block(act_on(&fake, &entry(&["type"], false, false), "@s1:e2", "type", Some("x"), true, Budget::default())).unwrap_err();
         assert_eq!(error.code.as_deref(), Some("needs-pixels"));
+        // With no bounds to click, the suggestion doesn't name any (GNOME Wayland).
+        assert_eq!(error.suggestion.as_deref(), Some(NO_BOUNDS));
         // A password is never read back for the set-value path: straight to paste.
         let fake = Fake::new(vec![failed("POLICY_DENIED", "not_delivered")]);
         let acted = block(act_on(&fake, &entry(&["set-value"], true, true), "@s1:e3", "type", Some("pw"), true, Budget::default())).unwrap();
@@ -2437,6 +2511,59 @@ mod tests {
         let ax = Ax::new(None);
         let target = block(target(&Fake::new(vec![]), &ax, "w:2a0c46", Budget::default())).unwrap();
         assert_eq!(target.cli_window, "w-2755654");
+    }
+
+    #[test]
+    fn find_then_acts_on_the_one_named_exactly() {
+        let ax = Ax::new(None);
+        let c1 = caller("c1");
+        let clears = ok(json!({ "matches": [
+            { "interactive": true, "ref_id": "@f1:e1", "role": "button", "name": "Clear all memory", "states": [] },
+            { "interactive": true, "ref_id": "@f1:e2", "role": "button", "name": "Clear entry", "states": [] },
+            { "interactive": true, "ref_id": "@f1:e3", "role": "button", "name": " clear ", "states": [] },
+        ]}));
+        let body = json!({ "window": "m:42", "steps": [{ "find": { "name": "Clear" }, "then": { "action": "click" } }] });
+        let fake = Fake::new(vec![clears.clone(), ok(json!({ "disposition": { "delivery": "delivered_verified" } }))]);
+        let (answer, _) = block(batch(&fake, &ax, &c1, &body)).unwrap();
+        assert_eq!(answer["results"][0]["ok"], true, "{answer}");
+        assert_eq!(answer["results"][0]["data"]["ref"], "@f1:e3");
+        assert_eq!(fake.calls()[1], vec!["click", "--", "@f1:e3"]);
+        // No exact one (or two of them): still ambiguous.
+        let body = json!({ "window": "m:42", "steps": [{ "find": { "name": "Cle" }, "then": { "action": "click" } }] });
+        let fake = Fake::new(vec![clears]);
+        let (answer, _) = block(batch(&fake, &ax, &c1, &body)).unwrap();
+        assert_eq!(answer["results"][0]["error"]["code"], "ambiguous-target");
+        // `exact: true` goes to agent-desktop as --exact.
+        let fake = Fake::new(vec![ok(json!({ "matches": [] }))]);
+        block(find(&fake, &ax, &c1, &json!({ "window": "m:42", "name": "Clear", "exact": true }))).unwrap();
+        assert!(fake.calls()[0].contains(&"--exact".to_string()), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn find_matches_say_what_their_role_takes() {
+        let ax = Ax::new(None);
+        let fake = Fake::new(vec![ok(json!({ "matches": [
+            { "interactive": true, "ref_id": "@f2:e1", "role": "button", "name": "7", "states": [] },
+            { "interactive": true, "ref_id": "@f2:e2", "role": "textfield", "name": "To", "states": [] },
+            { "interactive": false, "ref_id": "@f2:e3", "role": "statictext", "name": "7", "states": [] },
+        ]}))]);
+        let (found, _) = block(find(&fake, &ax, &caller("c1"), &json!({ "window": "m:42", "name": "7" }))).unwrap();
+        assert_eq!(found["matches"][0]["actions"], json!(["click"]));
+        assert_eq!(found["matches"][1]["actions"], json!(["click", "set-value", "type"]));
+        assert_eq!(found["matches"][2]["actions"], json!([]));
+        // Its ref still allows any action: what agent-desktop allows wasn't said.
+        assert!(ax.lookup("c1", "@f2:e2").unwrap().actions.is_none());
+    }
+
+    #[test]
+    fn a_batch_has_6_s_a_step_from_20_to_60_s() {
+        assert_eq!(batch_timeout(0), Duration::from_secs(20));
+        assert_eq!(batch_timeout(1), Duration::from_secs(20));
+        assert_eq!(batch_timeout(3), Duration::from_secs(20));
+        assert_eq!(batch_timeout(4), Duration::from_secs(24));
+        assert_eq!(batch_timeout(7), Duration::from_secs(42));
+        assert_eq!(batch_timeout(10), Duration::from_secs(60));
+        assert_eq!(batch_timeout(50), Duration::from_secs(60));
     }
 
     #[test]

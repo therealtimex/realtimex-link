@@ -50,7 +50,7 @@ mod desktop;
 mod keymap;
 /// The window list and focus (realtimex-ai-app#3055).
 mod wins;
-pub use self::wins::{focus_window, list_windows, screen_locked};
+pub use self::wins::{focus_window, list_windows, lock_state, screen_locked};
 
 pub use self::desktop::follow_input_desktop;
 
@@ -420,10 +420,19 @@ fn keyboard(code: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     }
 }
 
-/// Send the events in one batch, so nothing else is interleaved with them.
+/// Send the events in one batch, so nothing else is interleaved with them. A press (a button, the
+/// wheel, a key going down) is first checked to reach its window (wins::input_reaches): Windows
+/// would drop it without saying so when the window runs as administrator.
 fn send(events: &[INPUT]) -> Result<()> {
     if events.is_empty() {
         return Ok(());
+    }
+    let (pointer, keys) = presses(events);
+    if pointer {
+        wins::input_reaches(true)?;
+    }
+    if keys {
+        wins::input_reaches(false)?;
     }
     let inserted = unsafe { SendInput(events, size_of::<INPUT>() as i32) };
     if (inserted as usize) < events.len() {
@@ -438,6 +447,28 @@ fn send(events: &[INPUT]) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+/// Whether `events` press a mouse button or the wheel, and whether they press a key: what UIPI
+/// may drop. Moving the pointer and letting go are never refused.
+fn presses(events: &[INPUT]) -> (bool, bool) {
+    const BUTTONS_DOWN: u32 = MOUSEEVENTF_LEFTDOWN.0
+        | MOUSEEVENTF_RIGHTDOWN.0
+        | MOUSEEVENTF_MIDDLEDOWN.0
+        | MOUSEEVENTF_WHEEL.0
+        | MOUSEEVENTF_HWHEEL.0;
+    let (mut pointer, mut keys) = (false, false);
+    for event in events {
+        // SAFETY: the union member that `r#type` says is set.
+        unsafe {
+            if event.r#type == INPUT_MOUSE {
+                pointer |= event.Anonymous.mi.dwFlags.0 & BUTTONS_DOWN != 0;
+            } else if event.r#type == INPUT_KEYBOARD {
+                keys |= event.Anonymous.ki.dwFlags.0 & KEYEVENTF_KEYUP.0 == 0;
+            }
+        }
+    }
+    (pointer, keys)
 }
 
 /// The Windows clipboard, owned by a message-only window: SetClipboardData fails for a

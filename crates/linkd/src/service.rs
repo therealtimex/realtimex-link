@@ -81,6 +81,30 @@ pub fn update_dir() -> std::io::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// agent-desktop's state for the daemon this service runs as SYSTEM (realtimex-ai-app#3055 G3):
+/// `%ProgramData%\RealTimeX Link\agent-desktop\SYSTEM`, only SYSTEM's and administrators', none
+/// of it inherited. agent-desktop refuses a state folder whose DACL grants anyone but SYSTEM,
+/// administrators and its own account: under the owner's profile, the folder inherited the owner's
+/// own grant. Made safe again at every start (an older folder's DACL is replaced), and kept by
+/// the start-up check as the service's own scratch ([`SCRATCH`]). None when it can't be made safe:
+/// agent-desktop then keeps its state in SYSTEM's own profile.
+#[cfg(windows)]
+pub fn ax_state_dir() -> Option<std::path::PathBuf> {
+    let base = trusted_dir()?.join(AX_STATE);
+    let dir = base.join("SYSTEM");
+    for path in [&base, &dir] {
+        if let Err(error) = win::protect_dir(path) {
+            log_line(&format!("agent-desktop's state folder isn't safe to use: {error}"));
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+/// The folder of agent-desktop's state in Link's ProgramData folder.
+#[cfg(windows)]
+const AX_STATE: &str = "agent-desktop";
+
 /// Whether writing into `dir` as SYSTEM would follow a junction or symbolic link (SD C3).
 pub fn is_link(dir: &std::path::Path) -> bool {
     #[cfg(windows)]
@@ -140,9 +164,10 @@ pub fn prepare_machine_dir(dir: &std::path::Path) -> bool {
     }
 }
 
-/// The folders whose contents the service makes and only it uses: transfers and update downloads.
+/// The folders whose contents the service makes and only it uses: transfers, update downloads
+/// and agent-desktop's state (kept with their own protected DACLs).
 #[cfg(windows)]
-const SCRATCH: [&str; 2] = ["updates", "transfers"];
+const SCRATCH: [&str; 3] = ["updates", "transfers", AX_STATE];
 
 /// How long a transfer or download is kept after it last changed, once the service that made it
 /// stopped: a pasted file stays openable for a day.
@@ -876,6 +901,49 @@ mod tests {
         let log = std::fs::read_to_string(dir.join("service.log")).unwrap();
         assert!(log.contains("after a repair"));
         *super::TRUSTED_DIR.write().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// agent-desktop's state folder (G3 of realtimex-ai-app#3055): only SYSTEM and administrators,
+    /// nothing inherited, also when an older one inherited a user's grant; and the start-up
+    /// check keeps it so.
+    #[test]
+    fn agent_desktops_state_folder_grants_only_system_and_administrators() {
+        let root = scratch("ax-state");
+        let dir = root.join("RealTimeX Link");
+        assert_eq!(win::secure_tree(&dir, &super::SCRATCH).unwrap(), win::Trust::Kept);
+        let state = dir.join(super::AX_STATE);
+        // An older folder, inheriting its parent's ACL plus a user's grant.
+        std::fs::create_dir_all(state.join("SYSTEM")).unwrap();
+        let granted = crate::util::command(r"C:\Windows\System32\icacls.exe")
+            .arg(state.join("SYSTEM"))
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)(F)"])
+            .status()
+            .unwrap();
+        assert!(granted.success());
+        std::fs::write(state.join("SYSTEM").join("refs.json"), b"{}").unwrap();
+        for path in [&state, &state.join("SYSTEM")] {
+            win::protect_dir(path).unwrap();
+        }
+        // icacls prints the path first, which may hold "Users" itself: only its grants count.
+        let grants = |path: &std::path::Path| icacls(path).replace(&path.display().to_string(), "");
+        for path in [state.clone(), state.join("SYSTEM"), state.join("SYSTEM").join("refs.json")] {
+            let acl = grants(&path);
+            assert!(!acl.contains("BUILTIN\\Users") && !acl.contains("S-1-5-32-545"), "{acl}");
+            assert!(acl.contains("SYSTEM") && acl.contains("Administrators"), "{acl}");
+        }
+        for path in [&state, &state.join("SYSTEM")] {
+            assert!(win::is_trusted(path), "{}", path.display());
+        }
+        // A fresh one is made the same way.
+        let fresh = state.join("fresh");
+        win::protect_dir(&fresh).unwrap();
+        let acl = grants(&fresh);
+        assert!(!acl.contains("BUILTIN\\Users") && acl.contains("SYSTEM"), "{acl}");
+        // The service's start-up check leaves it as it is.
+        let before = icacls(&state.join("SYSTEM"));
+        assert_eq!(win::secure_tree(&dir, &super::SCRATCH).unwrap(), win::Trust::Kept);
+        assert_eq!(icacls(&state.join("SYSTEM")), before);
         let _ = std::fs::remove_dir_all(&root);
     }
 

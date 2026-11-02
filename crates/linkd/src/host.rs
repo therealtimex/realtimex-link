@@ -1417,7 +1417,13 @@ impl Host {
 }
 
 /// agent-desktop's state (its refs between calls): `<data dir>/agent-desktop/<user>`, private.
+/// Under Link's Windows service (SYSTEM) it is in Link's ProgramData folder instead, protected
+/// (service::ax_state_dir, realtimex-ai-app#3055 G3).
 fn ax_state_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    if crate::service::active() {
+        return crate::service::ax_state_dir();
+    }
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .ok()

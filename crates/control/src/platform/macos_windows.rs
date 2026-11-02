@@ -125,7 +125,8 @@ pub fn list_windows() -> Result<Vec<Listed>> {
             "Listing windows needs macOS 14 or later",
         ));
     }
-    let windows = super::capture_bounded(rtx_screens::macos::list_windows)?;
+    // Not the picker's 200×150 floor: macOS Calculator (Basic) is 198 wide (QA of #3055).
+    let windows = super::capture_bounded(rtx_screens::macos::list_agent_windows)?;
     let focused = focused_window();
     Ok(windows
         .into_iter()

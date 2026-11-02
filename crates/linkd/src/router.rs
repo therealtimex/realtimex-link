@@ -905,6 +905,7 @@ async fn screenshot(
             wait::Frame {
                 cells,
                 space: (width, height),
+                taken: width,
             },
         )
     });
@@ -1182,9 +1183,8 @@ async fn focus_window(
 ) -> Response {
     let signed = signed_for!(shared, headers, peer, "control", "focus");
     let id = body.get("id").and_then(Value::as_str).unwrap_or("");
-    if crate::winid::WindowId::parse(id).is_none() {
-        return ApiError::bad_request("id must be a window id from GET /remote-control/windows")
-            .into_response();
+    if let Some(refused) = focus_refusal(id) {
+        return refused.into_response();
     }
     let focused = shared.backend.call("focus_window", json!({ "window": id })).await;
     let app = focused
@@ -1209,6 +1209,24 @@ async fn focus_window(
             .into_response(),
         Err(error) => http_error(error).into_response(),
     }
+}
+
+/// Why `id` can't be focused before asking: GNOME Wayland's `a:` ids (agent-desktop's windows)
+/// can't be brought forward by Link (`unsupported`, QA of realtimex-ai-app#3055); anything else
+/// that isn't a window id is a bad request.
+fn focus_refusal(id: &str) -> Option<ApiError> {
+    if id.strip_prefix("a:").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+        return Some(
+            ApiError::coded(501, "unsupported", "GNOME Wayland doesn't let Link bring a window to the front")
+                .with_suggestion(
+                    "Act on the window's elements by ref (ax snapshot, then act): they don't need it in front. \
+                     Or take a screenshot and click the window by pixels to bring it forward.",
+                ),
+        );
+    }
+    crate::winid::WindowId::parse(id)
+        .is_none()
+        .then(|| ApiError::bad_request("id must be a window id from GET /remote-control/windows"))
 }
 
 /// Where a wait's pictures come from: small live screenshots of one display.
@@ -1278,8 +1296,14 @@ async fn run_wait(shared: &Arc<Shared>, client: &str, body: &Value) -> ApiResult
     let request = wait::Request::parse(body)?;
     require_display(shared, request.display.as_deref()).await?;
     let _slot = shared.waits.enter(client)?;
+    // The picture `since` names, polled at its own width (wait::poll_width).
+    let named = request
+        .since
+        .as_deref()
+        .and_then(|token| shared.frames.find(client, token));
+    let taken = wait::poll_width(named.as_ref().map(|(_, frame)| frame));
     let mut params = json!({
-        "maxWidth": wait::POLL_WIDTH,
+        "maxWidth": taken,
         "quality": wait::POLL_QUALITY,
         // Not a screenshot of the client's: its pointer space stays its own latest one's.
         "live": true,
@@ -1295,10 +1319,8 @@ async fn run_wait(shared: &Arc<Shared>, client: &str, body: &Value) -> ApiResult
     };
     let first = polls.look().await?;
     let shown = polls.display.clone().unwrap_or_default();
-    let since = request
-        .since
-        .as_deref()
-        .and_then(|token| shared.frames.get(client, &shown, token));
+    // Only a picture of the display polled now.
+    let since = named.and_then(|(display, frame)| (display == shown).then_some(frame));
     // The space `region` and `area` are in: the client's latest screenshot of the display.
     let space = match &since {
         Some(frame) => Some(frame.space),
@@ -1336,6 +1358,7 @@ async fn run_wait(shared: &Arc<Shared>, client: &str, body: &Value) -> ApiResult
         wait::Frame {
             cells: outcome.cells,
             space,
+            taken,
         },
     );
     let mut answer = json!({
@@ -2946,6 +2969,16 @@ mod tests {
             let one = crate::actions::plan_actions(Some(&json!([up])), true).unwrap();
             assert_eq!(one[0].len(), 1);
         }
+    }
+
+    #[test]
+    fn focusing_a_gnome_wayland_window_is_unsupported() {
+        let refused = focus_refusal("a:3").unwrap();
+        assert_eq!((refused.status, refused.code.as_deref()), (501, Some("unsupported")));
+        assert!(refused.suggestion.is_some());
+        assert_eq!(focus_refusal("nonsense").unwrap().status, 400);
+        assert_eq!(focus_refusal("a:").unwrap().status, 400);
+        assert!(focus_refusal("m:42").is_none());
     }
 
     #[test]

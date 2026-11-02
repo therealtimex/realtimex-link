@@ -61,7 +61,7 @@ Run cargo build --release --locked --target $Target -p rtx-control
 # The Windows key mapping and clipboard unit tests (scancodes, #2909; paste restore) and the
 # display mapping (#12), when CI asks for them.
 if ($env:LINK_TEST_KEYS -eq '1') {
-  Run cargo test --release --locked --target $Target -p rtx-control '--' platform::windows::keymap platform::windows::clipboard codes:: displays::
+  Run cargo test --release --locked --target $Target -p rtx-control '--' platform::windows::keymap platform::windows::clipboard platform::windows::wins codes:: displays::
   # Link's service (realtimex-link#10): its ProgramData folder made safe, the pipe and body rules.
   Run cargo test --release --locked --target $Target -p rtx-linkd '--' service:: unattended::
 }

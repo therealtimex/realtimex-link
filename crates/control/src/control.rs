@@ -294,6 +294,15 @@ impl Controller {
         live: bool,
         display: Option<&str>,
     ) -> Result<platform::Shot> {
+        // GNOME Wayland: a locked screen has no screen-cast session (Mutter ends it), and its
+        // D-Bus error must not reach agents: 423 `screen-locked` instead (QA of #3055).
+        #[cfg(target_os = "linux")]
+        if platform::screenshot_needs_input() && platform::lock_state() == Some(true) {
+            return Err(platform::refused(
+                "screen-locked",
+                "The screen is locked. Unlock it to see it here.",
+            ));
+        }
         let shot = injected_unavailable(display).and_then(|()| {
             if platform::screenshot_needs_input() {
                 self.input()?.screenshot(max_width, live, display)
@@ -338,6 +347,9 @@ impl Controller {
         let op = request["op"].as_str().unwrap_or("");
         if !self.window_server && !matches!(op, "permissions" | "status") {
             platform::init_window_server();
+            // Remote Control never reads a screenshot's text: no Vision pass per picture.
+            #[cfg(target_os = "macos")]
+            rtx_screens::macos::set_text_recognition(false);
             self.window_server = true;
         }
         // macOS login window (realtimex-link#11 I4, C4): the daemon alone marks a request for
@@ -657,14 +669,18 @@ fn refuse_when_locked() -> Result<()> {
             "screen-locked",
             "The screen is locked. Unlock it to see its windows.",
         )),
-        None => Err(platform::refused(
-            "screen-locked",
-            "Link can't tell whether the screen is locked here (neither the desktop's screensaver \
-             nor logind answered on D-Bus), so it shows no windows or app contents. Check that \
-             the session bus and systemd-logind are reachable.",
-        )),
+        None => Err(platform::refused("screen-locked", LOCK_UNKNOWN)),
     }
 }
+
+/// Why `screen-locked` when the lock state can't be read.
+#[cfg(windows)]
+const LOCK_UNKNOWN: &str = "Link can't tell whether this Windows session is locked (its session \
+     manager didn't answer), so it shows no windows or app contents.";
+#[cfg(not(windows))]
+const LOCK_UNKNOWN: &str = "Link can't tell whether the screen is locked here (neither the \
+     desktop's screensaver nor logind answered on D-Bus), so it shows no windows or app contents. \
+     Check that the session bus and systemd-logind are reachable.";
 
 /// A window as rtx-linkd and agents get it (realtimex-ai-app#3055).
 fn window_json(window: &platform::Listed, displays: &[displays::DisplayInfo]) -> Value {

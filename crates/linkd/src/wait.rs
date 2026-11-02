@@ -33,6 +33,8 @@ pub const MIN_CHANGED_CELLS: usize = 2;
 pub const POLL: Duration = Duration::from_millis(250);
 /// The screenshot a poll takes: small and rough, only its thumbnail is used.
 pub const POLL_WIDTH: u64 = 320;
+/// The widest a poll is taken (a `since` picture's width, [`poll_width`]).
+pub const MAX_POLL_WIDTH: u64 = 4096;
 pub const POLL_QUALITY: u64 = 30;
 /// Frame tokens kept per client and display, and for how long.
 pub const KEPT_FRAMES: usize = 8;
@@ -229,11 +231,13 @@ pub fn decode_cells(value: &Value) -> Option<Vec<u8>> {
         .filter(|cells| cells.len() == COLUMNS * ROWS)
 }
 
-/// A kept screenshot: its thumbnail and the size of the picture the client got.
+/// A kept screenshot: its thumbnail, the size of the picture the client got, and how wide the
+/// picture its thumbnail came from was (a wait's own frame comes from a poll).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub cells: Vec<u8>,
     pub space: (u64, u64),
+    pub taken: u64,
 }
 
 #[derive(Default)]
@@ -295,11 +299,25 @@ impl Frames {
     }
 
     /// The frame `token` names, while it is kept.
+    #[cfg(test)]
     pub fn get(&self, client: &str, display: &str, token: &str) -> Option<Frame> {
         self.list(client, display)
             .into_iter()
             .find(|(kept, at, _)| kept == token && at.elapsed() < FRAME_TTL)
             .map(|(_, _, frame)| frame)
+    }
+
+    /// The frame `token` names and its display, whichever display of `client`'s it is.
+    pub fn find(&self, client: &str, token: &str) -> Option<(String, Frame)> {
+        self.kept()
+            .by
+            .iter()
+            .filter(|((owner, _), _)| owner == client)
+            .find_map(|((_, display), list)| {
+                list.iter()
+                    .find(|(kept, at, _)| kept == token && at.elapsed() < FRAME_TTL)
+                    .map(|(_, _, frame)| (display.clone(), frame.clone()))
+            })
     }
 
     /// The newest kept frame.
@@ -364,6 +382,14 @@ impl Drop for Slot<'_> {
             }
         }
     }
+}
+
+/// How wide a wait's polls are taken: as wide as the `since` picture, so its thumbnail and the
+/// polls' come from the same capture at the same size and compare equal when nothing changed
+/// (macOS scaled a 1280-wide screenshot and a 320-wide poll differently, and every wait after a
+/// screenshot answered `changed`: QA of realtimex-ai-app#3055); else small.
+pub fn poll_width(since: Option<&Frame>) -> u64 {
+    since.map_or(POLL_WIDTH, |frame| frame.taken.clamp(POLL_WIDTH, MAX_POLL_WIDTH))
 }
 
 /// Where a wait's pictures come from: rtx-control's screenshots, or a test's.
@@ -718,6 +744,7 @@ mod tests {
             Frame {
                 cells: screen(1),
                 space: (1280, 720),
+                taken: 1280,
             },
         );
         assert_eq!(frames.get("a", "1", &first).unwrap().cells, screen(1));
@@ -732,6 +759,7 @@ mod tests {
                 Frame {
                     cells: screen(level),
                     space: (1280, 720),
+                    taken: 1280,
                 },
             );
         }
@@ -790,5 +818,32 @@ mod tests {
             let error = Request::parse(&bad).unwrap_err();
             assert_eq!(error.code_or_status(), "bad-request", "{bad}");
         }
+    }
+
+    #[test]
+    fn polls_after_a_screenshot_are_as_wide_as_it() {
+        let shot = Frame { cells: screen(9), space: (1280, 1024), taken: 1280 };
+        assert_eq!(poll_width(Some(&shot)), 1280);
+        assert_eq!(poll_width(None), POLL_WIDTH);
+        // A wait's own frame: as wide as its polls were, whatever the client's space.
+        let polled = Frame { cells: screen(9), space: (1280, 1024), taken: POLL_WIDTH };
+        assert_eq!(poll_width(Some(&polled)), POLL_WIDTH);
+        let tiny = Frame { cells: screen(9), space: (100, 80), taken: 100 };
+        assert_eq!(poll_width(Some(&tiny)), POLL_WIDTH);
+        let huge = Frame { cells: screen(9), space: (8000, 4000), taken: 8000 };
+        assert_eq!(poll_width(Some(&huge)), MAX_POLL_WIDTH);
+        // The same picture at the same size: no change.
+        assert_eq!(changed(&shot.cells, &screen(9), Cells::ALL), None);
+    }
+
+    #[test]
+    fn a_token_is_found_on_whichever_display_it_is() {
+        let frames = Frames::default();
+        let a = frames.keep("c1", "1", Frame { cells: screen(1), space: (1280, 1024), taken: 1280 });
+        let b = frames.keep("c1", "2", Frame { cells: screen(2), space: (1920, 1080), taken: 1920 });
+        assert_eq!(frames.find("c1", &b).map(|(d, f)| (d, f.space)), Some(("2".into(), (1920, 1080))));
+        assert_eq!(frames.find("c1", &a).map(|(d, _)| d), Some("1".into()));
+        assert!(frames.find("c2", &a).is_none(), "another client's token is unknown");
+        assert!(frames.find("c1", "nope").is_none());
     }
 }

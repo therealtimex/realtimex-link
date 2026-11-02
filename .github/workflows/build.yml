@@ -148,6 +148,8 @@ jobs:
         run: |
           cargo test --locked -p rtx-control -- platform::macos codes::
           cargo test --locked -p rtx-link
+          # The change-detection thumbnail and the agents' window floor (#3055).
+          cargo test --locked -p rtx-screens -- macos::tests
       # macOS unattended access (realtimex-link#11), on the Intel runner every build runs: the
       # launchd plists through plutil and the macOS-only checks. The job's datagrams are tested
       # on Linux, the login-window key events with the macOS key mapping (Apple silicon):

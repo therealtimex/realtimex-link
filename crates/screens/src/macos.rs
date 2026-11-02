@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::image::{THUMB_HEIGHT, THUMB_WIDTH};
+use crate::image::{thumbnail_bgra, Bgra};
 use crate::text::TextLine;
 use crate::window::WindowInfo;
 use anyhow::{anyhow, bail, Context, Result};
@@ -23,7 +23,8 @@ use objc2_core_foundation::{
     CFDictionary, CFMutableData, CFRetained, CFString, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo, CGMainDisplayID,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
+    CGImageByteOrderInfo, CGMainDisplayID,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString};
 use objc2_image_io::{kCGImageDestinationLossyCompressionQuality, CGImageDestination};
@@ -232,13 +233,35 @@ pub fn window_dump(pids: &[i32]) -> Vec<String> {
         .collect()
 }
 
+/// The smallest window the picker offers: anything smaller is a helper or a badge, not a window
+/// worth recording.
+const PICKER_MIN: (f64, f64) = (200.0, 150.0);
+/// The smallest window an agent may target (realtimex-ai-app#3055): only near-zero helpers are
+/// left out; macOS Calculator in Basic mode is 198×350.
+const AGENT_MIN: (f64, f64) = (40.0, 20.0);
+
 /// App windows big enough to matter: normal ones (layer 0), and floating ones (above normal,
-/// below the menu bar, e.g. Meet's picture-in-picture at layer 3), marked `floating`.
+/// below the menu bar, e.g. Meet's picture-in-picture at layer 3), marked `floating`. The
+/// picker's list: at least 200×150.
 pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    list_windows_at_least(PICKER_MIN)
+}
+
+/// The same windows for an agent's window list (Remote Control's `windows` and accessibility):
+/// small ones too, down to 40×20.
+pub fn list_agent_windows() -> Result<Vec<WindowInfo>> {
+    list_windows_at_least(AGENT_MIN)
+}
+
+fn big_enough(width: f64, height: f64, (min_width, min_height): (f64, f64)) -> bool {
+    width >= min_width && height >= min_height
+}
+
+fn list_windows_at_least(min: (f64, f64)) -> Result<Vec<WindowInfo>> {
     let mut out = vec![];
     for w in shareable_windows()? {
         let (layer, frame) = unsafe { (w.windowLayer(), w.frame()) };
-        if !(0..=20).contains(&layer) || frame.size.width < 200.0 || frame.size.height < 150.0 {
+        if !(0..=20).contains(&layer) || !big_enough(frame.size.width, frame.size.height, min) {
             continue;
         }
         let app = unsafe { w.owningApplication() };
@@ -292,29 +315,55 @@ fn encode_jpeg(image: &CGImage) -> Result<Vec<u8>> {
     Ok(data.to_vec())
 }
 
-/// 64x36 grayscale, for change detection.
+/// Packed BGRA, as rtx-screens' shared image code reads it: 32-bit little-endian, alpha skipped.
+const BGRA: u32 = CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0;
+
+/// The thumbnail for change detection (THUMB_WIDTH × THUMB_HEIGHT grayscale): the picture's own
+/// pixels, area-averaged by [`thumbnail_bgra`] as on every other platform. Drawn straight into a
+/// 64×36 context, Core Graphics sampled the picture instead of averaging it, so the same screen
+/// gave different cells at different sizes, and a wait that compared a screenshot's cells with
+/// its smaller polls' always saw a change (QA of realtimex-ai-app#3055).
 fn thumbnail(image: &CGImage) -> Result<Vec<u8>> {
-    let mut pixels = vec![0u8; THUMB_WIDTH * THUMB_HEIGHT];
-    let space = CGColorSpace::new_device_gray().context("gray color space")?;
+    let (width, height) = (CGImage::width(Some(image)), CGImage::height(Some(image)));
+    if width == 0 || height == 0 {
+        bail!("the picture has no size");
+    }
+    let stride = width * 4;
+    let mut pixels = vec![0u8; stride * height];
+    let space = CGColorSpace::new_device_rgb().context("RGB color space")?;
     let ctx = unsafe {
         CGBitmapContextCreate(
             pixels.as_mut_ptr().cast(),
-            THUMB_WIDTH,
-            THUMB_HEIGHT,
+            width,
+            height,
             8,
-            THUMB_WIDTH,
+            stride,
             Some(&space),
-            CGImageAlphaInfo::None.0,
+            BGRA,
         )
     }
     .context("bitmap context")?;
     let rect = CGRect::new(
         CGPoint::new(0.0, 0.0),
-        CGSize::new(THUMB_WIDTH as f64, THUMB_HEIGHT as f64),
+        CGSize::new(width as f64, height as f64),
     );
     CGContext::draw_image(Some(&ctx), rect, Some(image));
     drop(ctx);
-    Ok(pixels)
+    Ok(thumbnail_bgra(&Bgra {
+        width,
+        height,
+        stride,
+        data: &pixels,
+    }))
+}
+
+/// Whether screenshots are read for text (Vision). The recorder needs it; Remote Control never
+/// reads it, and it takes most of a screenshot's time, which a wait's polls can't spare.
+static RECOGNIZE_TEXT: AtomicBool = AtomicBool::new(true);
+
+/// Turn text recognition of screenshots off (or on) for this process.
+pub fn set_text_recognition(on: bool) {
+    RECOGNIZE_TEXT.store(on, Ordering::Relaxed);
 }
 
 /// Lines of text in the image, recognized on-device (Vision); empty if recognition fails.
@@ -376,7 +425,11 @@ fn shot_of(image: &CGImage, title: String) -> Result<Shot> {
         width: CGImage::width(Some(image)) as u32,
         height: CGImage::height(Some(image)) as u32,
         title,
-        text: recognize_text(image),
+        text: if RECOGNIZE_TEXT.load(Ordering::Relaxed) {
+            recognize_text(image)
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -735,4 +788,48 @@ fn screen_names() -> std::collections::HashMap<u32, String> {
         }
     }
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_core_graphics::CGBitmapContextCreateImage;
+
+    /// A picture's thumbnail is its pixels' (image::thumbnail_bgra), whichever way it came: the
+    /// same picture always gives the same cells, so a wait sees no change where there is none.
+    #[test]
+    fn a_pictures_thumbnail_is_its_pixels_area_averaged() {
+        let (width, height) = (1280usize, 1024usize);
+        let stride = width * 4;
+        // Text-like detail: thin dark lines and dots on white, which sampling would alias.
+        let mut pixels = vec![255u8; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                if y % 7 == 0 || (x * 13 + y * 7) % 23 == 0 {
+                    let at = y * stride + x * 4;
+                    pixels[at..at + 3].copy_from_slice(&[(x % 256) as u8, 40, (y % 256) as u8]);
+                }
+            }
+        }
+        let expected = thumbnail_bgra(&Bgra { width, height, stride, data: &pixels });
+        let space = CGColorSpace::new_device_rgb().unwrap();
+        let ctx = unsafe {
+            CGBitmapContextCreate(pixels.as_mut_ptr().cast(), width, height, 8, stride, Some(&space), BGRA)
+        }
+        .unwrap();
+        let image = CGBitmapContextCreateImage(Some(&ctx)).unwrap();
+        drop(ctx);
+        let thumb = thumbnail(&image).unwrap();
+        assert_eq!(thumb.len(), crate::image::THUMB_WIDTH * crate::image::THUMB_HEIGHT);
+        assert_eq!(thumb, expected);
+    }
+
+    #[test]
+    fn agents_see_small_windows_the_picker_leaves_out() {
+        // macOS Calculator, Basic: 198×350.
+        assert!(!big_enough(198.0, 350.0, PICKER_MIN));
+        assert!(big_enough(198.0, 350.0, AGENT_MIN));
+        assert!(!big_enough(30.0, 350.0, AGENT_MIN));
+        assert!(!big_enough(198.0, 10.0, AGENT_MIN));
+    }
 }

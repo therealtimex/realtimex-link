@@ -169,8 +169,8 @@ pub fn macos_job_channel(fd: i32) {
 mod windows;
 #[cfg(windows)]
 pub use self::windows::{
-    control_permissions, focus_window, follow_input_desktop, list_windows, permission_owner,
-    request_control_permission, screen_locked, screenshot_needs_input, Input,
+    control_permissions, focus_window, follow_input_desktop, list_windows, lock_state,
+    permission_owner, request_control_permission, screen_locked, screenshot_needs_input, Input,
 };
 
 /// Windows moves the control thread to the desktop receiving input (sign-in, lock and UAC
@@ -188,9 +188,9 @@ pub use linux::{
     request_control_permission, screen_locked, screenshot_needs_input, set_virtual_displays, Input,
 };
 
-/// Locked or not; elsewhere the platform always knows. Linux answers `None` when no lock screen
-/// answers on D-Bus (linux/lock.rs).
-#[cfg(not(target_os = "linux"))]
+/// Locked or not; macOS always knows. Linux answers `None` when no lock screen answers on D-Bus
+/// (linux/lock.rs), Windows when its session manager doesn't (windows/wins.rs).
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn lock_state() -> Option<bool> {
     Some(screen_locked())
 }
