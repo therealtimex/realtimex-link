@@ -3,6 +3,8 @@
 # rtx-linkd and rtx-control sit next to it, where rtx-link and rtx-linkd look for them. A menu bar
 # app (LSUIElement): no Dock icon, and it keeps running when its window is closed.
 # Usage: scripts/bundle-macos.sh BIN_DIR OUTPUT_DIR (BIN_DIR holds rtx-link, rtx-linkd, rtx-control)
+# AGENT_DESKTOP_FILES: the pinned agent-desktop and agent-desktop-macos-helper (space-separated
+# paths, realtimex-ai-app#3055), put next to rtx-control, where it looks for them.
 set -euo pipefail
 BIN_DIR="$1"
 OUTPUT_DIR="$2"
@@ -18,6 +20,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 for bin in rtx-link rtx-linkd rtx-control; do
   cp "$BIN_DIR/$bin" "$APP/Contents/MacOS/$bin"
   chmod +x "$APP/Contents/MacOS/$bin"
+done
+for file in ${AGENT_DESKTOP_FILES:-}; do
+  cp "$file" "$APP/Contents/MacOS/$(basename "$file")"
+  chmod +x "$APP/Contents/MacOS/$(basename "$file")"
 done
 cp "$ROOT/assets/icon.icns" "$APP/Contents/Resources/icon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST

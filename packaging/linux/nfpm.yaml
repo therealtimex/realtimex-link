@@ -30,6 +30,15 @@ contents:
     dst: /usr/lib/realtimex-link/payload/rtx-control
     file_info:
       mode: 0755
+  # agent-desktop, the accessibility CLI rtx-control runs (pinned, third_party/agent-desktop.json).
+  - src: ${PAYLOAD}/agent-desktop
+    dst: /usr/lib/realtimex-link/payload/agent-desktop
+    file_info:
+      mode: 0755
+  - src: ${PAYLOAD}/agent-desktop-linux-clipboard-owner
+    dst: /usr/lib/realtimex-link/payload/agent-desktop-linux-clipboard-owner
+    file_info:
+      mode: 0755
   - src: ${PAYLOAD}/icon.png
     dst: /usr/lib/realtimex-link/payload/icon.png
     file_info:

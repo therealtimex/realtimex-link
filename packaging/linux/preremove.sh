@@ -6,7 +6,7 @@ case "$1" in
   remove | purge | 0) ;;
   *) exit 0 ;;
 esac
-for name in rtx-link rtx-linkd rtx-control; do
+for name in rtx-link rtx-linkd rtx-control agent-desktop; do
   pkill -f "^/opt/RealTimeX Link/$name" 2>/dev/null || true
 done
 rm -rf "/opt/RealTimeX Link"

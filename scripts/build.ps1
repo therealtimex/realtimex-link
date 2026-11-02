@@ -75,6 +75,16 @@ foreach ($name in 'rtx-linkd.exe', 'rtx-link.exe', 'rtx-control.exe') {
   $crt = @($dlls | Where-Object { $_ -match '^(vcruntime|msvcp|ucrtbase|api-ms-win-crt-)' })
   if ($crt.Count -gt 0) { Fail "$name depends on the C runtime DLLs: $($crt -join ', ')" }
 }
+# The pinned agent-desktop.exe (ci/fetch_agent_desktop.py, realtimex-ai-app#3055), next to
+# rtx-control.exe; without LINK_AGENT_DESKTOP_DIR the build has no accessibility layer.
+if ($env:LINK_AGENT_DESKTOP_DIR) {
+  $agentDesktop = Join-Path $env:LINK_AGENT_DESKTOP_DIR 'agent-desktop.exe'
+  if (-not (Test-Path -LiteralPath $agentDesktop)) { Fail "LINK_AGENT_DESKTOP_DIR has no agent-desktop.exe" }
+  Copy-Item -LiteralPath $agentDesktop -Destination (Join-Path $OutDir 'agent-desktop.exe') -Force
+  Write-Host "agent-desktop: $agentDesktop"
+} else {
+  Write-Host 'No LINK_AGENT_DESKTOP_DIR: this build has no accessibility layer'
+}
 Run (Join-Path $OutDir 'rtx-linkd.exe') --version
 Run (Join-Path $OutDir 'rtx-control.exe') --version
 Write-Host "SUCCESS: $(Join-Path $OutDir 'rtx-linkd.exe') $(Join-Path $OutDir 'rtx-link.exe') $(Join-Path $OutDir 'rtx-control.exe')"

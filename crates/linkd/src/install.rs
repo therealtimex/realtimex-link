@@ -16,6 +16,10 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 const EXECUTABLES: [&str; 3] = ["rtx-linkd", "rtx-link", "rtx-control"];
+/// The accessibility CLI rtx-control runs, and its Linux helper (realtimex-ai-app#3055): copied
+/// when the build has them (a build without them has no accessibility layer).
+#[cfg(not(target_os = "macos"))]
+const OPTIONAL_EXECUTABLES: [&str; 2] = ["agent-desktop", "agent-desktop-linux-clipboard-owner"];
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The installed version, beside the executables (Windows, Linux; the .app has its Info.plist),
 /// for when the installed rtx-linkd can't say.
@@ -504,6 +508,12 @@ fn copy(source: &Path, staging: &Path) -> Result<()> {
 fn copy(source: &Path, staging: &Path) -> Result<()> {
     std::fs::create_dir_all(staging)?;
     let mut names: Vec<String> = EXECUTABLES.iter().map(|name| executable(name)).collect();
+    names.extend(
+        OPTIONAL_EXECUTABLES
+            .iter()
+            .map(|name| executable(name))
+            .filter(|name| source.join(name).is_file()),
+    );
     names.push("icon.png".to_string());
     // Linux: the icon at each size for the icon theme (icons/16.png…), installed by menu_entry.
     let icons = source.join("icons");
