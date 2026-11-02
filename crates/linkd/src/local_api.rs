@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -50,6 +49,9 @@ pub const FEATURES: &[&str] = &[
     // realtimex-link#12: a live view can choose which display it shows (the viewer reads it from
     // the live view's own `info`); GET/POST /v1/displays/virtual.
     "displays",
+    // realtimex-ai-app#3055 §1.4: GET/DELETE /v1/host/audit (the Activity tab), and
+    // `auditDropped` in the overview.
+    "audit",
 ];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
 /// caller's nonce (see `hello_proof`).
@@ -140,6 +142,16 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/host/clients/remove", post(remove_client))
         .route("/v1/host/permissions/request", post(request_permission))
         .route("/v1/host/stop-session", post(stop_session))
+        .route("/v1/host/audit", get(audit).delete(clear_audit))
+        // Agents on this computer (ax.rs, Addendum 2): X-RTX-Caller on every call. They work
+        // with hosting off; rtx-control starts on demand.
+        .route("/v1/ax/apps", get(ax_apps))
+        .route("/v1/ax/windows", get(ax_windows))
+        .route("/v1/ax/snapshot", post(ax_snapshot))
+        .route("/v1/ax/find", post(ax_find))
+        .route("/v1/ax/get", post(ax_get))
+        .route("/v1/ax/act", post(ax_act))
+        .route("/v1/ax/batch", post(ax_batch))
         .fallback(|| async { ApiError::new(404, "Not found") })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -160,11 +172,7 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
         }
     });
     if name != "127.0.0.1" && name != "localhost" {
-        return (
-            StatusCode::MISDIRECTED_REQUEST,
-            Json(json!({ "error": "Not a local request" })),
-        )
-            .into_response();
+        return ApiError::coded(421, "not-local", "Not a local request").into_response();
     }
     // Asked before the client trusts this port with its token: it carries none.
     if request.uri().path() == HELLO_PATH {
@@ -177,11 +185,7 @@ async fn guard(State(state): State<Shared>, request: Request, next: Next) -> Res
         .map(|value| strip_bearer(value).to_string())
         .unwrap_or_default();
     if !same_bytes(given.as_bytes(), state.token.as_bytes()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Unauthorized" })),
-        )
-            .into_response();
+        return ApiError::coded(401, "unauthorized", "Unauthorized").into_response();
     }
     next.run(request).await
 }
@@ -250,6 +254,10 @@ async fn version(State(state): State<Shared>) -> Json<Value> {
 /// for it. RealTimeX shows its setting only when this is listed, and never requires it.
 fn features() -> Vec<&'static str> {
     let mut features = FEATURES.to_vec();
+    // /v1/ax/* (realtimex-ai-app#3055 Addendum 2): only where the remote `ax` is served.
+    if crate::ax::enabled() {
+        features.push("local-ax");
+    }
     if crate::unattended::supported() {
         features.push("unattended");
     }
@@ -1052,6 +1060,70 @@ async fn request_permission(State(state): State<Shared>, Body64(body): Body64) -
     }
     state.host.request_permission(name).await?;
     Ok(Json(json!({})))
+}
+
+/// The activity log, newest first: `?before=<id>&limit=<1..200>&client=<id>&kind=<kind>` →
+/// `{entries, next, retentionDays, dropped}` (audit.rs). Local only: no remote route reads it.
+async fn audit(
+    State(state): State<Shared>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Answer {
+    let query = crate::audit::Query::parse(&params)?;
+    let audit = state.host.audit.clone();
+    let page = tokio::task::spawn_blocking(move || audit.page(&query))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(page))
+}
+
+/// Clear it: `{cleared: n}`, and one `audit-cleared` row says so.
+async fn clear_audit(State(state): State<Shared>) -> Answer {
+    let audit = state.host.audit.clone();
+    let cleared = tokio::task::spawn_blocking(move || audit.clear())
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "cleared": cleared })))
+}
+
+/// One `/v1/ax/*` call for the agent `X-RTX-Caller` names (400 without it). The same handlers,
+/// bodies, results and codes as `/remote-control/ax/*`; its Activity rows are `via:"local"`.
+async fn ax_local(state: Shared, headers: axum::http::HeaderMap, body: Value, op: crate::ax::Op) -> Answer {
+    let header = headers.get("x-rtx-caller").and_then(|v| v.to_str().ok());
+    let caller = crate::ax::Caller::local(header)?;
+    let host = &state.host;
+    Ok(Json(
+        crate::ax::serve(&host.backend, &host.ax, &host.audit, &caller, op, &body).await?,
+    ))
+}
+
+async fn ax_apps(State(state): State<Shared>, headers: axum::http::HeaderMap) -> Answer {
+    ax_local(state, headers, json!({}), crate::ax::Op::Apps).await
+}
+
+async fn ax_windows(State(state): State<Shared>, headers: axum::http::HeaderMap) -> Answer {
+    ax_local(state, headers, json!({}), crate::ax::Op::Windows).await
+}
+
+async fn ax_snapshot(State(state): State<Shared>, headers: axum::http::HeaderMap, Body64(body): Body64) -> Answer {
+    ax_local(state, headers, body, crate::ax::Op::Snapshot).await
+}
+
+async fn ax_find(State(state): State<Shared>, headers: axum::http::HeaderMap, Body64(body): Body64) -> Answer {
+    ax_local(state, headers, body, crate::ax::Op::Find).await
+}
+
+async fn ax_get(State(state): State<Shared>, headers: axum::http::HeaderMap, Body64(body): Body64) -> Answer {
+    ax_local(state, headers, body, crate::ax::Op::Get).await
+}
+
+async fn ax_act(State(state): State<Shared>, headers: axum::http::HeaderMap, Body64(body): Body64) -> Answer {
+    ax_local(state, headers, body, crate::ax::Op::Act).await
+}
+
+async fn ax_batch(State(state): State<Shared>, headers: axum::http::HeaderMap, Body64(body): Body64) -> Answer {
+    ax_local(state, headers, body, crate::ax::Op::Batch).await
 }
 
 async fn stop_session(State(state): State<Shared>) -> Answer {

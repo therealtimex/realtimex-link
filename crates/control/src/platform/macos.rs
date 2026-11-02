@@ -24,6 +24,15 @@ pub mod job;
 /// The lock screen's picture (realtimex-link#11, Addendum 8).
 #[path = "macos_locked.rs"]
 mod locked;
+/// The window list and focus (realtimex-ai-app#3055).
+#[path = "macos_windows.rs"]
+mod wins;
+pub use wins::{focus_window, list_windows};
+
+/// Whether this session's screen is locked: window titles must not be read from behind it.
+pub fn screen_locked() -> bool {
+    locked::screen_locked()
+}
 
 /// `display` (None: the main display), at most `max_width` wide: ScreenCaptureKit, or
 /// CGDisplayCreateImage while the session is locked (ScreenCaptureKit's picture is blank then;

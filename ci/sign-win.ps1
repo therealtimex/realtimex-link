@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 $name = 'realtimex-link-windows-x86_64.tar.gz'
 $setup = "RealTimeX-Link-Setup-$Version.exe"
 $publisher = 'Dang Le'
-$executables = @('rtx-linkd.exe', 'rtx-link.exe', 'rtx-control.exe')
+$executables = @('rtx-linkd.exe', 'rtx-link.exe', 'rtx-control.exe', 'agent-desktop.exe')
 # The TrustedSigning module, exactly this version (PowerShell Gallery): a new upload under that name
 # never runs with the signing credentials until it is reviewed and pinned here.
 $trustedSigningVersion = '0.5.8'

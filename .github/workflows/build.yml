@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "test: macOS Intel and Linux x64 only; all: every platform"
+        description: "test: macOS Intel, Linux x64 and Windows x64; all: every platform"
         type: choice
         options: [test, all]
         default: test
@@ -22,8 +22,8 @@ permissions:
   contents: read
 
 jobs:
-  # Which platforms: every one for a release tag (or "all" by hand); while testing, only the
-  # machines it is tried on (macOS Intel, Linux x64).
+  # Which platforms: every one for a release tag (or "all" by hand); while testing, macOS Intel,
+  # Linux x64 and Windows x64, so every push compiles Windows (the arm builds come with "all").
   plan:
     runs-on: ubuntu-24.04
     outputs:
@@ -52,8 +52,9 @@ jobs:
           ALL: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.targets == 'all' }}
         run: |
           test='[
-            {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix"},
-            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix"}
+            {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix","triple":"x86_64-apple-darwin"},
+            {"name":"windows-x86_64","runner":"windows-2022","arch":"x86_64","script":"windows","triple":"x86_64-pc-windows-msvc"},
+            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix","triple":"x86_64-unknown-linux-gnu"}
           ]'
           # No Windows on ARM: RealTimeX does not ship there, and libvpx (rtx-control's live view)
           # does not build for it.
@@ -61,11 +62,11 @@ jobs:
           # the glibc 2.34 floor (Ubuntu 22.04, Debian 12, RHEL 9) comes from rtx-glibc-compat and
           # build.sh's check of every binary's glibc references.
           all='[
-            {"name":"macos-arm64","runner":"macos-15","arch":"arm64","script":"unix"},
-            {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix"},
-            {"name":"windows-x86_64","runner":"windows-2022","arch":"x86_64","script":"windows"},
-            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix"},
-            {"name":"linux-arm64","runner":"ubuntu-24.04-arm","arch":"arm64","script":"unix"}
+            {"name":"macos-arm64","runner":"macos-15","arch":"arm64","script":"unix","triple":"aarch64-apple-darwin"},
+            {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix","triple":"x86_64-apple-darwin"},
+            {"name":"windows-x86_64","runner":"windows-2022","arch":"x86_64","script":"windows","triple":"x86_64-pc-windows-msvc"},
+            {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix","triple":"x86_64-unknown-linux-gnu"},
+            {"name":"linux-arm64","runner":"ubuntu-24.04-arm","arch":"arm64","script":"unix","triple":"aarch64-unknown-linux-gnu"}
           ]'
           if [ "$ALL" = "true" ]; then list="$all"; else list="$test"; fi
           echo "matrix=$(echo "$list" | tr -d '\n ')" >> "$GITHUB_OUTPUT"
@@ -92,12 +93,32 @@ jobs:
         with:
           key: ${{ matrix.name }}
           cache-on-failure: true
+      # agent-desktop, the accessibility CLI rtx-control runs (realtimex-ai-app#3055 §2.1): the
+      # release asset pinned in third_party/agent-desktop.json, checked against the hash there
+      # (any mismatch fails the build); only its pinned files are taken out. Cached by the pin
+      # (never on a release tag, like the Rust cache); the hash is checked either way.
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          path: .agent-desktop-cache
+          key: agent-desktop-${{ matrix.triple }}-${{ hashFiles('third_party/agent-desktop.json') }}
+      - name: agent-desktop (macOS, Linux)
+        if: matrix.script == 'unix'
+        run: python3 ci/fetch_agent_desktop.py --target ${{ matrix.triple }} --out "$GITHUB_WORKSPACE/.agent-desktop" --cache .agent-desktop-cache
+      - name: agent-desktop (Windows)
+        if: matrix.script == 'windows'
+        shell: pwsh
+        run: |
+          python ci/fetch_agent_desktop.py --target ${{ matrix.triple }} --out "$env:GITHUB_WORKSPACE\.agent-desktop" --cache .agent-desktop-cache
+          if ($LASTEXITCODE -ne 0) { throw "agent-desktop fetch failed" }
       # rtx-control's VP8 encoder (libvpx) builds from source on Intel macOS, with nasm.
       - name: nasm (Intel macOS)
         if: matrix.name == 'macos-x86_64'
         run: brew install nasm
       - name: Build (macOS, Linux)
         if: matrix.script == 'unix'
+        env:
+          LINK_AGENT_DESKTOP_DIR: ${{ github.workspace }}/.agent-desktop
         run: scripts/build.sh ${{ matrix.arch }} dist/${{ matrix.name }}
       # Unit tests, once (Linux): the daemon (autostart, install, the local API), the window (its
       # theme) and the screen capture crate (its one-request-at-a-time gate, image helpers).
@@ -110,7 +131,11 @@ jobs:
           # rtx-control's physical key table and held-key rules (#2909), the GNOME Wayland
           # frame pipeline and virtual-monitor fallback (#9), and the display table and point
           # mapping (#12); its other tests need a desktop.
-          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests jobinput:: displays:: peer::tests::a_lost_display
+          # And the accessibility runner (#3055 §2.2: timeouts, the circuit breaker, the output
+          # cap, the argv allow-list, out-of-order replies), and how Linux reads the lock state.
+          cargo test --locked -p rtx-control -- codes:: control::tests platform::tests wayland_input::tests jobinput:: displays:: peer::tests::a_lost_display ax:: linux::lock::tests
+          # The CI scripts' own checks (the agent-desktop pin and fetch, the release's sums).
+          python3 -m unittest discover -s ci -p 'test_*.py'
       # Lints, once (Linux): warnings show in the log; errors fail the build.
       - name: Clippy (Linux)
         if: matrix.name == 'linux-x86_64'
@@ -123,6 +148,8 @@ jobs:
         run: |
           cargo test --locked -p rtx-control -- platform::macos codes::
           cargo test --locked -p rtx-link
+          # The change-detection thumbnail and the agents' window floor (#3055).
+          cargo test --locked -p rtx-screens -- macos::tests
       # macOS unattended access (realtimex-link#11), on the Intel runner every build runs: the
       # launchd plists through plutil and the macOS-only checks. The job's datagrams are tested
       # on Linux, the login-window key events with the macOS key mapping (Apple silicon):
@@ -132,12 +159,16 @@ jobs:
         timeout-minutes: 15
         run: |
           cargo test --locked -p rtx-linkd -- launchd:: unattended:: autostart::
+          # The change-detection thumbnail and the agents' window floor (#3055): rtx-screens has no
+          # libvpx, so it is quick here, on the runner every test build has.
+          cargo test --locked -p rtx-screens -- macos::tests
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh
         # Also the Windows key mapping's tests (scancodes for physical keys, #2909).
         env:
           LINK_TEST_KEYS: '1'
+          LINK_AGENT_DESKTOP_DIR: ${{ github.workspace }}\.agent-desktop
         run: scripts\build.ps1 ${{ matrix.arch }} dist\${{ matrix.name }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -174,7 +205,7 @@ jobs:
         run: |
           # Artifacts lose the executable bit: the programs get it back (also inside the .app).
           for dir in realtimex-link-*; do
-            (cd "$dir" && find . -type f -name 'rtx-*' -exec chmod +x {} + && tar -czf "../$dir.tar.gz" *)
+            (cd "$dir" && find . -type f \( -name 'rtx-*' -o -name 'agent-desktop' -o -name 'agent-desktop-*' \) -exec chmod +x {} + && tar -czf "../$dir.tar.gz" *)
           done
       # Linux packages: no signing needed, so they are built here (nfpm, pinned).
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

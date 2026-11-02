@@ -149,14 +149,16 @@ impl Session {
 /// Whether a bridge passes `op` to its helper in that session (M5): `Ok`, or the refusal code.
 /// The login window passes capture (and the display list, realtimex-link#12), input, text
 /// clipboard and the live view only; another
-/// user's session also images and reading copies; files and permission prompts only the
+/// user's session also images, reading copies and its windows (list and focus,
+/// realtimex-ai-app#3055: never the login window's); files and permission prompts only the
 /// owner's own (pasted files sit in the owner's 0700 temporary folder).
 pub fn bridge_allows(session: Session, op: &str) -> Result<(), &'static str> {
     const LOGIN_WINDOW: [&str; 13] = [
         "start", "stop", "status", "screenshot", "displays", "move", "button", "keysym", "key",
         "scroll", "paste_text", "clipboard_seq", "permissions",
     ];
-    const OTHER_USER: [&str; 2] = ["paste_image", "clipboard_read"];
+    // `ax` (#3055 §2.2): user sessions only; the login window has no user apps.
+    const OTHER_USER: [&str; 5] = ["paste_image", "clipboard_read", "windows", "focus_window", "ax"];
     const OWNER_ONLY: [&str; 2] = ["paste_files", "request_permission"];
     let allowed = LOGIN_WINDOW.contains(&op)
         || op.starts_with("peer_")
@@ -406,6 +408,15 @@ mod tests {
         }
         assert!(bridge_allows(Session::LoginWindow, "paste_image").is_err());
         assert!(bridge_allows(Session::LoginWindow, "clipboard_read").is_err());
+        // Windows (realtimex-ai-app#3055): a user's session only, never the login window.
+        for op in ["windows", "focus_window", "ax"] {
+            assert_eq!(
+                bridge_allows(Session::LoginWindow, op),
+                Err("not-in-this-session")
+            );
+            assert_eq!(bridge_allows(Session::Owner, op), Ok(()));
+            assert_eq!(bridge_allows(Session::Other, op), Ok(()));
+        }
         assert_eq!(bridge_allows(Session::Other, "paste_image"), Ok(()));
         assert_eq!(bridge_allows(Session::Other, "clipboard_read"), Ok(()));
         assert_eq!(

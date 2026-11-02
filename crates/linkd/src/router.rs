@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::actions::{is_physical_key, run_actions};
+use crate::audit::{self, Outcome, Who};
 use crate::backend::Backend;
 use crate::clients::Authenticated;
 use crate::clipboard_share::{self, ClipboardShare, Pulled, POLL_MS};
@@ -38,6 +39,7 @@ use crate::local_api::Body64;
 use crate::requests::Poll;
 use crate::transfers::{Ended, Transfers};
 use crate::util::{iso_now, now_ms, unbase64};
+use crate::wait;
 
 const AUTH_FAILURE_WINDOW_MS: i64 = 60 * 1000;
 pub const MAX_AUTH_FAILURES: usize = 10;
@@ -53,7 +55,7 @@ const TAILNET_FAILURES_TOTAL: usize = 30;
 pub const SERVICE: &str = "realtimex-remote-control";
 /// 2 (ADR-2611 §4.5): peer live view, connection requests, client keys, identity tokens.
 pub const PROTOCOL_VERSION: u32 = 2;
-const FEATURES: [&str; 6] = [
+const FEATURES: [&str; 9] = [
     "peer-view",
     "connect-requests",
     "client-key",
@@ -61,6 +63,13 @@ const FEATURES: [&str; 6] = [
     "transfers",
     // realtimex-link#12: GET /displays, and `display` on /screenshot, /actions and /frames.
     "displays",
+    // realtimex-ai-app#3055: every error body has `code`, `retry` and, where they apply,
+    // `retryAfterMs`, `delivery` and `suggestion` (error.rs).
+    "errors-v2",
+    // GET /windows and POST /windows/focus (window ids from Link).
+    "windows",
+    // POST /wait, and the `x-screen-frame` header on /screenshot.
+    "wait",
 ];
 /// What a live view's `info` lists: the features the viewer adapts to.
 const PEER_FEATURES: [&str; 4] = ["transfers", "paste-files", "physical-keys", "displays"];
@@ -143,6 +152,10 @@ struct Peer {
     /// What the viewer was last told it shows, and the list it was told: a fresh list is
     /// pushed only when that changes.
     told: Mutex<(Option<String>, Vec<Value>)>,
+    /// For its activity row when it ends (audit.rs): who, since when, and its input summed.
+    who: Who,
+    started: i64,
+    input: Mutex<serde_json::Map<String, Value>>,
 }
 
 pub struct Shared {
@@ -161,6 +174,10 @@ pub struct Shared {
     /// Reads the display list every displays::POLL while a WebRTC view is open.
     display_poll: Mutex<Option<JoinHandle<()>>>,
     http_sessions: Mutex<HashMap<String, i64>>,
+    /// Each client's latest screenshots' thumbnails, by frame token, and its open waits
+    /// (wait.rs, realtimex-ai-app#3055).
+    frames: wait::Frames,
+    waits: wait::Waits,
     transfers: Transfers,
     clipboard: ClipboardShare,
     clipboard_polling: AtomicBool,
@@ -227,6 +244,8 @@ fn new_shared(
         peers: Mutex::new(HashMap::new()),
         display_poll: Mutex::new(None),
         http_sessions: Mutex::new(HashMap::new()),
+        frames: wait::Frames::default(),
+        waits: wait::Waits::default(),
         transfers: Transfers::new(temp_dir, downloads),
         clipboard: ClipboardShare::default(),
         clipboard_polling: AtomicBool::new(false),
@@ -251,11 +270,21 @@ fn routes(shared: &Arc<Shared>) -> Router {
         .route("/remote-control/status", get(status))
         .route("/remote-control/screenshot", post(screenshot))
         .route("/remote-control/displays", get(list_displays))
+        .route("/remote-control/windows", get(list_windows))
+        .route("/remote-control/windows/focus", post(focus_window))
+        .route("/remote-control/wait", post(wait_for_change))
         .route("/remote-control/actions", post(actions))
         .route("/remote-control/frames", get(frames))
         .route("/remote-control/peer/offer", post(peer_offer))
         .route("/remote-control/transfer", post(transfer))
         .route("/remote-control/stop", post(stop))
+        // The accessibility layer (ax.rs, realtimex-ai-app#3055 Phase 2): feature "ax".
+        .route("/remote-control/ax/apps", get(ax_apps))
+        .route("/remote-control/ax/snapshot", post(ax_snapshot))
+        .route("/remote-control/ax/find", post(ax_find))
+        .route("/remote-control/ax/get", post(ax_get))
+        .route("/remote-control/ax/act", post(ax_act))
+        .route("/remote-control/ax/batch", post(ax_batch))
         .fallback(|| async { ApiError::new(404, "Not found") })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(shared.clone())
@@ -355,6 +384,46 @@ fn no_store(mut response: Response) -> Response {
     response
 }
 
+// --- the activity log (audit.rs) ---------------------------------------------------------
+
+/// How this listener's clients come: over the tailnet or Public Exposure.
+fn via_of(shared: &Shared) -> &'static str {
+    if shared.public {
+        "public"
+    } else {
+        "tailnet"
+    }
+}
+
+/// An activity row about `client`'s request of `kind`: ok, or its error.
+fn audit_row<T>(
+    shared: &Shared,
+    client: &Authenticated,
+    kind: &'static str,
+    result: &ApiResult<T>,
+    detail: Value,
+) {
+    if let Some(host) = shared.host.upgrade() {
+        host.audit
+            .outcome(Who::client(client, via_of(shared)), kind, result, detail);
+    }
+}
+
+/// A view's row when it ends: `display`, how long, and its input (a person's isn't kept per
+/// batch, design §1.4 rule 5).
+fn audit_view(shared: &Shared, who: Who, started: i64, display: Option<String>, input: serde_json::Map<String, Value>) {
+    if let Some(host) = shared.host.upgrade() {
+        let mut detail = json!({ "durationMs": (now_ms() - started).max(0) });
+        if let Some(display) = display {
+            detail["display"] = json!(display);
+        }
+        if !input.is_empty() {
+            detail["input"] = Value::Object(input);
+        }
+        host.audit.note(who, "view", Outcome::Ok, None, detail);
+    }
+}
+
 // --- failed sign-ins ---------------------------------------------------------------------
 
 fn blocked(shared: &Shared, key: &str) -> bool {
@@ -441,15 +510,22 @@ fn clear(shared: &Shared, key: &str) {
 }
 
 fn too_many() -> Response {
-    json_status(429, json!({ "error": "Too many failed attempts" }))
+    ApiError::coded(429, "rate-limited", "Too many failed attempts")
+        .retry_after((AUTH_FAILURE_WINDOW_MS / 1000) as u64)
+        .into_response()
 }
 
 // --- sign-in -----------------------------------------------------------------------------
 
 /// Unauthenticated so a controller can find the App ID among its Tailscale peers.
 async fn hello(State(shared): State<Ctx>) -> ApiResult<Json<Value>> {
+    let mut features = FEATURES.to_vec();
+    // Only where this platform serves it and the CLI is bundled (ax.rs).
+    if crate::ax::enabled() {
+        features.push("ax");
+    }
     let mut answer =
-        json!({ "service": SERVICE, "version": PROTOCOL_VERSION, "features": FEATURES });
+        json!({ "service": SERVICE, "version": PROTOCOL_VERSION, "features": features });
     if let (Some(target), Some(identity)) = (
         answer.as_object_mut(),
         host_of(&shared)?.identity().as_object(),
@@ -487,6 +563,7 @@ async fn connect(
     let via = if shared.public { "public" } else { "tailnet" };
     match host.admit(&body, &address, via, password_blocked).await {
         Ok(admitted) => {
+            audit_connect(&host, &body, &admitted, via);
             if admitted.wrong_password {
                 fail(&shared, &key);
                 if shared.public {
@@ -511,8 +588,17 @@ async fn connect(
                     "[remote-control] {name} signed in from {address} ({by})"
                 ));
             }
-            let mut response = no_store(json_status(admitted.status, admitted.body));
-            if let Some(seconds) = admitted.retry_after {
+            let mut body = admitted.body;
+            if admitted.status >= 400 {
+                crate::error::complete_body(admitted.status, &mut body, admitted.retry_after);
+            }
+            let retry_after = admitted.retry_after.or_else(|| {
+                body.get("retryAfterMs")
+                    .and_then(Value::as_u64)
+                    .map(|ms| ms.div_ceil(1000).max(1))
+            });
+            let mut response = no_store(json_status(admitted.status, body));
+            if let Some(seconds) = retry_after {
                 response
                     .headers_mut()
                     .insert("Retry-After", seconds.to_string().parse().expect("header"));
@@ -521,6 +607,65 @@ async fn connect(
         }
         Err(error) => error.into_response(),
     }
+}
+
+/// A `connect` row for each sign-in's outcome (a new pending request is written where it is made,
+/// host.rs). A refused computer was never admitted: only what it calls itself is kept.
+fn audit_connect(host: &Host, body: &Value, admitted: &crate::host::Admitted, via: &str) {
+    if admitted.status == 202 {
+        return;
+    }
+    let asked = body.get("client");
+    let actor = if asked.and_then(|c| c.get("actor")).and_then(Value::as_str) == Some("agent") {
+        "agent"
+    } else {
+        "person"
+    };
+    if admitted.status == 200 {
+        let client = admitted.body.get("client");
+        let control = client.and_then(|c| c.pointer("/permissions/control")) == Some(&Value::Bool(true));
+        host.audit.note(
+            Who {
+                actor: actor.into(),
+                via: via.into(),
+                ..Who::owner(client)
+            },
+            "connect",
+            Outcome::Ok,
+            None,
+            json!({
+                "admittedBy": admitted.body.get("admittedBy"),
+                "permission": if control { "control" } else { "view" },
+            }),
+        );
+        return;
+    }
+    let named = |key: &str| {
+        asked
+            .and_then(|c| c.get(key))
+            .and_then(Value::as_str)
+            .map(|text| crate::requests::clean_name(Some(&json!(text))))
+            .filter(|text| !text.is_empty())
+    };
+    let code = admitted
+        .body
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::error::status_code(admitted.status).to_string());
+    host.audit.note(
+        Who {
+            client_id: None,
+            client_name: named("name"),
+            machine: named("machine"),
+            actor: actor.into(),
+            via: via.into(),
+        },
+        "connect",
+        Outcome::of_status(admitted.status),
+        Some(&code),
+        json!({}),
+    );
 }
 
 /// A pending request's poll (ADR-2611 §1.4). The request id is the requester's capability; an
@@ -548,12 +693,11 @@ async fn poll_request(
     no_store(match answer {
         None => {
             fail(&shared, &key);
-            json_status(
-                404,
-                json!({ "error": "No such request", "code": "unknown-request" }),
-            )
+            ApiError::coded(404, "unknown-request", "No such request").into_response()
         }
-        Some(Poll::Claimed) => json_status(410, json!({ "status": "claimed", "code": "claimed" })),
+        Some(Poll::Claimed) => ApiError::coded(410, "claimed", "This request was already used")
+            .with_details(json!({ "status": "claimed" }))
+            .into_response(),
         Some(Poll::Allowed(admit)) => {
             let mut body = json!({ "status": "allowed" });
             if let (Some(target), Some(fields)) = (body.as_object_mut(), admit.as_object()) {
@@ -583,10 +727,7 @@ async fn cancel_request(
         Some(status) => json_status(200, json!({ "status": status })),
         None => {
             fail(&shared, &key);
-            json_status(
-                404,
-                json!({ "error": "No such request", "code": "unknown-request" }),
-            )
+            ApiError::coded(404, "unknown-request", "No such request").into_response()
         }
     }
 }
@@ -628,16 +769,20 @@ fn signed(
         None => {
             // An expired token is normal: the controller signs in again.
             if !token.is_empty() && host.token_expired(&token) {
-                return Err(Box::new(json_status(
-                    401,
-                    json!({ "error": "This sign-in has expired", "code": "token-expired" }),
-                )));
+                return Err(Box::new(
+                    ApiError::coded(401, "token-expired", "This sign-in has expired")
+                        .into_response(),
+                ));
             }
             fail(shared, &key);
-            Err(Box::new(json_status(
-                401,
-                json!({ "error": "Sign in again: this client is not allowed", "code": "invalid-token" }),
-            )))
+            Err(Box::new(
+                ApiError::coded(
+                    401,
+                    "invalid-token",
+                    "Sign in again: this client is not allowed",
+                )
+                .into_response(),
+            ))
         }
     }
 }
@@ -646,10 +791,14 @@ fn require(signed: &Signed, permission: &str) -> Result<(), Box<Response>> {
     if signed.client.may(permission) {
         Ok(())
     } else {
-        Err(Box::new(json_status(
-            403,
-            json!({ "error": format!("This client is not allowed to {permission}") }),
-        )))
+        Err(Box::new(
+            ApiError::coded(
+                403,
+                "view-only",
+                format!("This client is not allowed to {permission}"),
+            )
+            .into_response(),
+        ))
     }
 }
 
@@ -659,6 +808,24 @@ macro_rules! signed_with {
         {
             Ok(signed) => signed,
             Err(response) => return *response,
+        }
+    };
+}
+
+/// As signed_with!, and a refusal for lack of `permission` is an activity row of `kind`.
+macro_rules! signed_for {
+    ($shared:expr, $headers:expr, $peer:expr, $permission:expr, $kind:expr) => {
+        match signed(&$shared, &$headers, &$peer) {
+            Err(response) => return *response,
+            Ok(signed) => match require(&signed, $permission) {
+                Ok(()) => signed,
+                Err(response) => {
+                    let refused: ApiResult<()> =
+                        Err(ApiError::coded(403, "view-only", "not allowed"));
+                    audit_row(&$shared, &signed.client, $kind, &refused, json!({}));
+                    return *response;
+                }
+            },
         }
     };
 }
@@ -697,20 +864,25 @@ async fn screenshot(
     let signed = signed_with!(shared, headers, peer, "view");
     let quality = number_or(body.get("quality"), 75.0).clamp(30.0, 95.0);
     let display = displays::named(body.get("display"));
-    let mut params = json!({ "quality": quality });
+    // `cells`: the thumbnail itself, kept for a later wait (x-screen-frame).
+    let mut params = json!({ "quality": quality, "cells": true });
     if let Some(display) = &display {
         params["display"] = json!(display);
     }
-    let shot = match shared.backend.call("screenshot", params).await {
+    let shot = shared
+        .backend
+        .call("screenshot", params)
+        .await
+        .map_err(http_error);
+    let shown = shot
+        .as_ref()
+        .ok()
+        .and_then(|shot| shot["display"].as_str().map(str::to_string))
+        .or(display.clone());
+    audit_row(&shared, &signed.client, "screenshot", &shot, json!({ "display": shown }));
+    let shot = match shot {
         Ok(shot) => shot,
-        Err(error) => {
-            let (code, message) = screen_problem(&error.message);
-            return if code == "screen-locked" {
-                json_status(423, json!({ "error": message, "code": code }))
-            } else {
-                error.into_response()
-            };
-        }
+        Err(error) => return error.into_response(),
     };
     let (width, height) = (
         shot["width"].as_u64().unwrap_or(0),
@@ -724,6 +896,19 @@ async fn screenshot(
         "[remote-control] screenshot {width}x{height} for {}",
         signed.client.name()
     ));
+    // Its frame token (realtimex-ai-app#3055): a later wait compares with this picture.
+    let frame = wait::decode_cells(&shot["cells"]).map(|cells| {
+        let shown = shot["display"].as_str().or(display.as_deref()).unwrap_or("");
+        shared.frames.keep(
+            signed.client.id(),
+            shown,
+            wait::Frame {
+                cells,
+                space: (width, height),
+                taken: width,
+            },
+        )
+    });
     let data = shot["data"].as_str().and_then(unbase64).unwrap_or_default();
     let mime = shot["mime"].as_str().unwrap_or("image/jpeg").to_string();
     let mut response = (StatusCode::OK, data).into_response();
@@ -737,6 +922,9 @@ async fn screenshot(
     // Which display the picture is (realtimex-link#12): the one named, else the primary.
     if let Some(shown) = shot["display"].as_str() {
         fields.push(("x-screen-display", shown.to_string()));
+    }
+    if let Some(frame) = frame {
+        fields.push(("x-screen-frame", frame));
     }
     for (name, value) in fields {
         if let Ok(value) = value.parse() {
@@ -895,17 +1083,306 @@ async fn actions(
     headers: HeaderMap,
     Body64(body): Body64,
 ) -> Response {
-    let signed = signed_with!(shared, headers, peer, "control");
+    let signed = signed_for!(shared, headers, peer, "control", "actions");
     let display = displays::named(body.get("display"));
+    let actions = body.get("actions");
+    let detail = audit::actions_detail(actions, display.as_deref());
     if let Err(error) = require_display(&shared, display.as_deref()).await {
+        audit_row(&shared, &signed.client, "actions", &Err::<(), _>(error.clone()), detail);
         return error.into_response();
     }
-    let actions = body.get("actions");
     let display = display.as_deref();
-    match perform_actions(&shared, &signed.client, actions, false, false, display, display).await {
+    let result = perform_actions(&shared, &signed.client, actions, false, false, display, display)
+        .await
+        .map_err(http_error);
+    audit_row(&shared, &signed.client, "actions", &result, detail);
+    match result {
         Ok(result) => Json(result).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+/// An error as the HTTP routes answer it: a capture refused because the screen is locked is
+/// 423 `screen-locked` (the DataChannel says so its own way).
+fn http_error(error: ApiError) -> ApiError {
+    if error.code.is_none() {
+        let (code, message) = screen_problem(&error.message);
+        if code == "screen-locked" {
+            return ApiError {
+                status: 423,
+                code: Some(code.to_string()),
+                message,
+                ..error
+            };
+        }
+    }
+    error
+}
+
+// --- windows and waiting (realtimex-ai-app#3055) ------------------------------------------
+
+/// `{ windows: [{ id, pid, app, appName, title, display, frame, focused, minimized }] }`,
+/// front to back where the system says; `?display=<id>`: only that display's (404 when it
+/// isn't attached).
+async fn list_windows(
+    State(shared): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let signed = signed_with!(shared, headers, peer, "view");
+    let display = query.get("display").filter(|d| !d.is_empty()).cloned();
+    let listed = async {
+        require_display(&shared, display.as_deref()).await?;
+        match shared.backend.call("windows", json!({})).await {
+            // appKey on every window (Addendum 2).
+            Ok(mut answer) => {
+                crate::appkey::add_keys(&mut answer);
+                Ok(answer)
+            }
+            // GNOME Wayland: agent-desktop lists them, under `a:` ids (§1.2).
+            Err(error) if error.code.as_deref() == Some("unsupported") && crate::ax::enabled() => {
+                let host = host_of(&shared)?;
+                let live = crate::ax::Live { backend: &shared.backend, ax: &host.ax };
+                Ok(json!({ "windows": crate::ax::wayland_windows(&live, &host.ax).await? }))
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let listed = listed.await;
+    audit_row(&shared, &signed.client, "windows", &listed, json!({ "display": display }));
+    match listed {
+        Ok(answer) => {
+            let windows = windows_on(&answer, display.as_deref());
+            no_store(Json(json!({ "windows": windows })).into_response())
+        }
+        Err(error) => http_error(error).into_response(),
+    }
+}
+
+/// rtx-control's windows, only `display`'s when one is named.
+fn windows_on(answer: &Value, display: Option<&str>) -> Vec<Value> {
+    answer
+        .get("windows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|window| display.is_none_or(|id| window.get("display").and_then(Value::as_str) == Some(id)))
+        .cloned()
+        .collect()
+}
+
+/// `{id}` → `{ focused: true, window }`: the window in front, checked. Refusals:
+/// `window-not-found` (404), `focus-refused` (409; delivery unknown), `input-blocked`,
+/// `permission-missing`, `unsupported` (GNOME Wayland), `screen-locked`.
+async fn focus_window(
+    State(shared): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Body64(body): Body64,
+) -> Response {
+    let signed = signed_for!(shared, headers, peer, "control", "focus");
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    if let Some(refused) = focus_refusal(id) {
+        return refused.into_response();
+    }
+    let focused = shared.backend.call("focus_window", json!({ "window": id })).await;
+    let app = focused
+        .as_ref()
+        .ok()
+        .and_then(|answer| answer.pointer("/window/app"))
+        .cloned();
+    audit_row(&shared, &signed.client, "focus", &focused, json!({ "app": app }));
+    match focused {
+        Ok(answer) => {
+            (shared.log)(&format!(
+                "[remote-control] focused a window for {}",
+                signed.client.name()
+            ));
+            Json(json!({ "focused": true, "window": answer.get("window").cloned().unwrap_or(Value::Null) }))
+                .into_response()
+        }
+        // The helper never answered: the window may have come forward anyway.
+        Err(error) if error.code_or_status() == "timeout" => error
+            .with_retry(crate::error::Retry::No)
+            .with_delivery(crate::error::Delivery::Unknown)
+            .into_response(),
+        Err(error) => http_error(error).into_response(),
+    }
+}
+
+/// Why `id` can't be focused before asking: GNOME Wayland's `a:` ids (agent-desktop's windows)
+/// can't be brought forward by Link (`unsupported`, QA of realtimex-ai-app#3055); anything else
+/// that isn't a window id is a bad request.
+fn focus_refusal(id: &str) -> Option<ApiError> {
+    if id.strip_prefix("a:").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+        return Some(
+            ApiError::coded(501, "unsupported", "GNOME Wayland doesn't let Link bring a window to the front")
+                .with_suggestion(
+                    "Act on the window's elements by ref (ax snapshot, then act): they don't need it in front. \
+                     Or take a screenshot and click the window by pixels to bring it forward.",
+                ),
+        );
+    }
+    crate::winid::WindowId::parse(id)
+        .is_none()
+        .then(|| ApiError::bad_request("id must be a window id from GET /remote-control/windows"))
+}
+
+/// Where a wait's pictures come from: small live screenshots of one display.
+struct Polls<'a> {
+    shared: &'a Shared,
+    params: Value,
+    /// The display the pictures are of, as rtx-control names it.
+    display: Option<String>,
+}
+
+impl Polls<'_> {
+    async fn look(&mut self) -> ApiResult<Vec<u8>> {
+        let shot = self
+            .shared
+            .backend
+            .call("screenshot", self.params.clone())
+            .await
+            .map_err(http_error)?;
+        if shot["locked"] == Value::Bool(true) {
+            return Err(ApiError::coded(
+                423,
+                "screen-locked",
+                "The screen is locked. Unlock it to see it here.",
+            ));
+        }
+        if let Some(shown) = shot["display"].as_str() {
+            self.display = Some(shown.to_string());
+        }
+        wait::decode_cells(&shot["cells"]).ok_or_else(|| {
+            ApiError::coded(
+                501,
+                "unsupported",
+                "This computer's Remote Control helper can't compare pictures",
+            )
+        })
+    }
+}
+
+impl wait::Source for Polls<'_> {
+    fn next(&mut self) -> impl std::future::Future<Output = ApiResult<Vec<u8>>> + Send {
+        self.look()
+    }
+}
+
+/// POST /wait (view): `{display?, since?, timeoutMs?, settleMs?, region?}` →
+/// `{changed, elapsedMs, frame, display, area?}`; wait.rs says how.
+async fn wait_for_change(
+    State(shared): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Body64(body): Body64,
+) -> Response {
+    let signed = signed_with!(shared, headers, peer, "view");
+    let waited = run_wait(&shared, signed.client.id(), &body).await;
+    let detail = match &waited {
+        Ok(answer) => json!({ "display": answer.get("display"), "changed": answer.get("changed") }),
+        Err(_) => json!({ "display": displays::named(body.get("display")) }),
+    };
+    audit_row(&shared, &signed.client, "wait", &waited, detail);
+    match waited {
+        Ok(answer) => no_store(Json(answer).into_response()),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn run_wait(shared: &Arc<Shared>, client: &str, body: &Value) -> ApiResult<Value> {
+    let request = wait::Request::parse(body)?;
+    require_display(shared, request.display.as_deref()).await?;
+    let _slot = shared.waits.enter(client)?;
+    // The picture `since` names, polled at its own width (wait::poll_width).
+    let named = request
+        .since
+        .as_deref()
+        .and_then(|token| shared.frames.find(client, token));
+    let taken = wait::poll_width(named.as_ref().map(|(_, frame)| frame));
+    let mut params = json!({
+        "maxWidth": taken,
+        "quality": wait::POLL_QUALITY,
+        // Not a screenshot of the client's: its pointer space stays its own latest one's.
+        "live": true,
+        "cells": true,
+    });
+    if let Some(display) = &request.display {
+        params["display"] = json!(display);
+    }
+    let mut polls = Polls {
+        shared,
+        params,
+        display: request.display.clone(),
+    };
+    let first = polls.look().await?;
+    let shown = polls.display.clone().unwrap_or_default();
+    // Only a picture of the display polled now.
+    let since = named.and_then(|(display, frame)| (display == shown).then_some(frame));
+    // The space `region` and `area` are in: the client's latest screenshot of the display.
+    let space = match &since {
+        Some(frame) => Some(frame.space),
+        None => shared.frames.latest(client, &shown).map(|frame| frame.space),
+    }
+    .or_else(|| {
+        lock(&shared.shot_sizes)
+            .get(&(client.to_string(), request.display.clone()))
+            .copied()
+    });
+    let space = match space {
+        Some(space) => space,
+        None => native_size(shared, &shown).await.unwrap_or((
+            wait::POLL_WIDTH,
+            wait::POLL_WIDTH * wait::ROWS as u64 / wait::COLUMNS as u64,
+        )),
+    };
+    let region = request
+        .region
+        .map_or(wait::Cells::ALL, |region| wait::region_cells(region, space));
+    let outcome = wait::watch(
+        &mut polls,
+        since.map(|frame| frame.cells),
+        first,
+        region,
+        request.timeout,
+        request.settle,
+        wait::POLL,
+    )
+    .await?;
+    let shown = polls.display.clone().unwrap_or(shown);
+    let frame = shared.frames.keep(
+        client,
+        &shown,
+        wait::Frame {
+            cells: outcome.cells,
+            space,
+            taken,
+        },
+    );
+    let mut answer = json!({
+        "changed": outcome.changed,
+        "elapsedMs": outcome.elapsed.as_millis() as u64,
+        "frame": frame,
+        "display": shown,
+    });
+    if let Some(area) = outcome.area {
+        answer["area"] = wait::area_of(area, space);
+    }
+    Ok(answer)
+}
+
+/// A display's native size, from the display list.
+async fn native_size(shared: &Shared, id: &str) -> Option<(u64, u64)> {
+    let list = fresh_displays(shared).await.ok()?;
+    let display = list
+        .iter()
+        .find(|display| display.get("id").and_then(Value::as_str) == Some(id))?;
+    Some((
+        display.get("width")?.as_u64()?,
+        display.get("height")?.as_u64()?,
+    ))
 }
 
 // --- the MJPEG live view -----------------------------------------------------------------
@@ -923,10 +1400,13 @@ async fn frames(
 ) -> Response {
     if shared.public {
         // A stream would carry the whole screen through the relay; the WebRTC view goes direct.
-        return json_status(
+        return ApiError::coded(
             403,
-            json!({ "error": "The live view is not available over Public Exposure", "code": "live-view-not-public" }),
-        );
+            "live-view-not-public",
+            "The live view is not available over Public Exposure",
+        )
+        .with_suggestion("Use screenshots; the live view connects directly instead.")
+        .into_response();
     }
     let signed = signed_with!(shared, headers, peer, "view");
     let number = |name: &str| {
@@ -959,6 +1439,8 @@ async fn frames(
         "[remote-control] live view started for {}",
         signed.client.name()
     ));
+    let viewer = Who::client(&signed.client, via_of(&shared));
+    let started = now_ms();
     let task_shared = shared.clone();
     tokio::spawn(async move {
         let shared = task_shared;
@@ -1068,6 +1550,7 @@ async fn frames(
             "[remote-control] live view ended for {}",
             signed.client.name()
         ));
+        audit_view(&shared, viewer, started, display, serde_json::Map::new());
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
     let mut response = Response::new(body);
@@ -1188,6 +1671,13 @@ fn close_peer(shared: &Arc<Shared>, session: u64) {
             poll.abort();
         }
     }
+    audit_view(
+        shared,
+        peer.who.clone(),
+        peer.started,
+        lock(&peer.display).clone(),
+        std::mem::take(&mut *lock(&peer.input)),
+    );
     // Nothing more runs for this view. A button it still holds would stay down: let go of it
     // once the actions already running are done.
     peer.closed.store(true, Ordering::SeqCst);
@@ -1583,7 +2073,10 @@ async fn act(
     )
     .await;
     match &performed {
-        Ok(_) => settle_held(&mut lock(&peer.held_keys), actions),
+        Ok(_) => {
+            settle_held(&mut lock(&peer.held_keys), actions);
+            audit::view_input(actions, &mut lock(&peer.input));
+        }
         // A failed batch (input-blocked, screen-locked, an error part way, a refused action)
         // releases every key the view holds: it can't know which of its actions ran, so it
         // forgets its own (#2909).
@@ -1817,7 +2310,7 @@ async fn peer_offer(
     let signed = signed_with!(shared, headers, peer, "view");
     let sdp = body.get("sdp").and_then(Value::as_str).unwrap_or("");
     if !sdp.starts_with("v=0") || sdp.len() > MAX_SDP_LENGTH {
-        return json_status(400, json!({ "error": "A WebRTC offer (sdp) is required" }));
+        return ApiError::bad_request("A WebRTC offer (sdp) is required").into_response();
     }
     let max_width = number_or(body.get("maxWidth"), 1280.0).clamp(MIN_FRAME_WIDTH, MAX_FRAME_WIDTH);
     let mut params = json!({ "sdp": sdp, "maxWidth": max_width });
@@ -1855,6 +2348,9 @@ async fn peer_offer(
         display: Mutex::new(display),
         follows: AtomicBool::new(follows),
         told: Mutex::new((None, Vec::new())),
+        who: Who::client(&signed.client, via_of(&shared)),
+        started: now_ms(),
+        input: Mutex::new(serde_json::Map::new()),
     });
     lock(&shared.peers).insert(session, entry);
     ensure_display_poll(&shared);
@@ -1897,8 +2393,56 @@ fn note(shared: &Shared, client: &Authenticated, transfer: Value) {
     }
 }
 
+/// The root folder's name a transfer used ("Downloads"), never its full path.
+fn folder_name(folder: &std::path::Path) -> Option<String> {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// What a clipboard's content is, for its activity row.
+fn clipboard_kind(content: &Value) -> Option<&'static str> {
+    match content.get("kind").and_then(Value::as_str)? {
+        "text" => Some("text"),
+        "image" => Some("image"),
+        "files" => Some("files"),
+        _ => None,
+    }
+}
+
 fn note_pulled(shared: &Shared, pulled: Option<Pulled>) {
     let Some(pulled) = pulled else { return };
+    if let Some(host) = shared.host.upgrade() {
+        let client = &pulled.client;
+        let text = |name: &str| {
+            client
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let who = Who {
+            client_id: text("id"),
+            client_name: text("name"),
+            machine: text("machine"),
+            actor: text("actor").unwrap_or_else(|| "person".into()),
+            via: via_of(shared).into(),
+        };
+        host.audit.note(
+            who,
+            "transfer",
+            Outcome::Ok,
+            None,
+            json!({
+                "op": "get",
+                "direction": "from-this-computer",
+                "files": pulled.names,
+                "count": pulled.count,
+                "bytes": pulled.size,
+                "folder": pulled.folder,
+            }),
+        );
+    }
     let name = pulled
         .client
         .get("name")
@@ -1933,14 +2477,21 @@ async fn run_transfer(
     client: &Authenticated,
     message: &Value,
 ) -> ApiResult<Value> {
+    let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     if !client.may("control") {
-        return Err(ApiError::coded(
+        let refused = Err(ApiError::coded(
             403,
             "view-only",
             "This client is not allowed to control",
         ));
+        let what = if clipboard_share::handles(kind) {
+            "clipboard"
+        } else {
+            "transfer"
+        };
+        audit_row(shared, client, what, &refused, json!({}));
+        return refused;
     }
-    let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
         "xfer_begin" => files_work(|| shared.transfers.begin(session, message)),
         "xfer_chunk" => files_work(|| shared.transfers.chunk(session, message)),
@@ -1957,10 +2508,31 @@ async fn run_transfer(
                     client.name()
                 ));
                 note(shared, client, json!({ "kind": "image", "size": size }));
+                audit_row(
+                    shared,
+                    client,
+                    "transfer",
+                    &Ok::<(), ApiError>(()),
+                    json!({ "op": "paste-image", "direction": "to-this-computer", "count": 1, "bytes": size }),
+                );
                 Ok(json!({ "pasted": true }))
             }
             Ended::Stored => Ok(json!({ "stored": true })),
             Ended::Saved { name, folder, size } => {
+                audit_row(
+                    shared,
+                    client,
+                    "transfer",
+                    &Ok::<(), ApiError>(()),
+                    json!({
+                        "op": "send",
+                        "direction": "to-this-computer",
+                        "files": [name],
+                        "count": 1,
+                        "bytes": size,
+                        "folder": folder_name(&folder),
+                    }),
+                );
                 let folder = folder.to_string_lossy().into_owned();
                 (shared.log)(&format!(
                     "[remote-control] {} sent {name} ({size} bytes) to {folder}",
@@ -2024,6 +2596,19 @@ async fn run_transfer(
                 client,
                 json!({ "kind": "files", "count": names.len(), "name": names.first(), "size": group.size }),
             );
+            audit_row(
+                shared,
+                client,
+                "transfer",
+                &Ok::<(), ApiError>(()),
+                json!({
+                    "op": "paste-files",
+                    "direction": "to-this-computer",
+                    "files": names,
+                    "count": names.len(),
+                    "bytes": group.size,
+                }),
+            );
             Ok(json!({ "pasted": names.len() }))
         }
         "clipboard_watch" => {
@@ -2046,7 +2631,15 @@ async fn run_transfer(
             Ok(answer)
         }
         "clipboard_get" => {
-            let content = shared.backend.call("clipboard_read", json!({})).await?;
+            let content = shared.backend.call("clipboard_read", json!({})).await;
+            audit_row(
+                shared,
+                client,
+                "clipboard",
+                &content,
+                json!({ "direction": "read", "kind": content.as_ref().ok().and_then(clipboard_kind) }),
+            );
+            let content = content?;
             Ok(match shared.clipboard.announce(session, &content) {
                 Some(mut shown) => {
                     if let Some(fields) = shown.as_object_mut() {
@@ -2071,12 +2664,36 @@ async fn run_transfer(
             note_pulled(shared, pulled);
             Ok(json!({}))
         }
-        "fs_list" => files_work(|| file_browse::list(&shared.home, message)),
+        "fs_list" => {
+            let listed = files_work(|| file_browse::list(&shared.home, message));
+            let count = listed
+                .as_ref()
+                .ok()
+                .and_then(|answer| answer.get("entries"))
+                .and_then(Value::as_array)
+                .map(Vec::len);
+            audit_row(
+                shared,
+                client,
+                "transfer",
+                &listed,
+                json!({
+                    "op": "list",
+                    "direction": "from-this-computer",
+                    "count": count,
+                    "folder": message.get("folder"),
+                }),
+            );
+            listed
+        }
         "fs_pull" => {
             let (path, name, size) =
                 files_work(|| file_browse::pull_target(&shared.home, message))?;
             let batch = message.get("batch").and_then(Value::as_str);
-            let pull = shared.clipboard.offer_file(session, path, size, batch);
+            let folder = message.get("folder").and_then(Value::as_str);
+            let pull = shared
+                .clipboard
+                .offer_file(session, path, size, batch, folder);
             Ok(json!({ "pull": pull, "name": name, "size": size }))
         }
         _ => Err(ApiError::bad_request("Unknown message")),
@@ -2135,6 +2752,17 @@ async fn poll_clipboard(shared: &Arc<Shared>) -> ApiResult<()> {
             shared.clipboard.announce(&session, &content),
             session.parse::<u64>(),
         ) {
+            // A copy here went to that viewer: a read of this computer's clipboard.
+            let viewer = lock(&shared.peers).get(&number).map(|peer| peer.who.clone());
+            if let (Some(who), Some(host)) = (viewer, shared.host.upgrade()) {
+                host.audit.note(
+                    who,
+                    "clipboard",
+                    Outcome::Ok,
+                    None,
+                    json!({ "direction": "read", "kind": clipboard_kind(&content) }),
+                );
+            }
             send_to_peer(shared, number, message);
         }
     }
@@ -2151,7 +2779,7 @@ async fn transfer(
     let signed = signed_with!(shared, headers, peer, "control");
     let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     if !is_transfer(kind) || kind == "clipboard_watch" {
-        return json_status(400, json!({ "error": "Unknown transfer message" }));
+        return ApiError::bad_request("Unknown transfer message").into_response();
     }
     let session = format!("http:{}", signed.client.id());
     let first = {
@@ -2193,6 +2821,47 @@ async fn transfer(
         Ok(result) => no_store(Json(result).into_response()),
         Err(error) => error.into_response(),
     }
+}
+
+// --- the accessibility layer (ax.rs) ------------------------------------------------------
+
+/// One `ax/*` route: signed in with view at least (acts need control, ax.rs checks), then the
+/// layer for this client, writing its Activity rows.
+async fn ax_call(shared: Ctx, peer: SocketAddr, headers: HeaderMap, body: Value, op: crate::ax::Op) -> Response {
+    let signed = signed_with!(shared, headers, peer, "view");
+    let host = match host_of(&shared) {
+        Ok(host) => host,
+        Err(error) => return error.into_response(),
+    };
+    let caller = crate::ax::Caller::remote(&signed.client, via_of(&shared));
+    match crate::ax::serve(&shared.backend, &host.ax, &host.audit, &caller, op, &body).await {
+        Ok(answer) => no_store(Json(answer).into_response()),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn ax_apps(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
+    ax_call(shared, peer, headers, json!({}), crate::ax::Op::Apps).await
+}
+
+async fn ax_snapshot(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Snapshot).await
+}
+
+async fn ax_find(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Find).await
+}
+
+async fn ax_get(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Get).await
+}
+
+async fn ax_act(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Act).await
+}
+
+async fn ax_batch(State(shared): State<Ctx>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Body64(body): Body64) -> Response {
+    ax_call(shared, peer, headers, body, crate::ax::Op::Batch).await
 }
 
 /// Stop the desktop helper, which ends every live view and session on this computer: that takes
@@ -2303,6 +2972,51 @@ mod tests {
     }
 
     #[test]
+    fn focusing_a_gnome_wayland_window_is_unsupported() {
+        let refused = focus_refusal("a:3").unwrap();
+        assert_eq!((refused.status, refused.code.as_deref()), (501, Some("unsupported")));
+        assert!(refused.suggestion.is_some());
+        assert_eq!(focus_refusal("nonsense").unwrap().status, 400);
+        assert_eq!(focus_refusal("a:").unwrap().status, 400);
+        assert!(focus_refusal("m:42").is_none());
+    }
+
+    #[test]
+    fn a_locked_capture_is_423_screen_locked_over_http() {
+        let locked = http_error(ApiError::new(502, "Screen capture inhibited"));
+        assert_eq!(
+            (locked.status, locked.code.as_deref()),
+            (423, Some("screen-locked"))
+        );
+        assert_eq!(locked.body()["retryAfterMs"], 5000);
+        // Anything else, and anything already coded, stays as it was.
+        let other = http_error(ApiError::new(502, "helper exited"));
+        assert_eq!((other.status, other.code), (502, None));
+        let coded = http_error(ApiError::coded(409, "input-blocked", "locked out"));
+        assert_eq!(coded.code.as_deref(), Some("input-blocked"));
+    }
+
+    #[test]
+    fn windows_can_be_listed_for_one_display() {
+        let answer = json!({ "windows": [
+            { "id": "m:1", "display": "1" },
+            { "id": "m:2", "display": "2" },
+            { "id": "m:3", "display": null },
+        ] });
+        assert_eq!(windows_on(&answer, None).len(), 3);
+        let on_two = windows_on(&answer, Some("2"));
+        assert_eq!(on_two, vec![json!({ "id": "m:2", "display": "2" })]);
+        assert!(windows_on(&json!({}), None).is_empty());
+    }
+
+    #[test]
+    fn hello_lists_the_agent_features() {
+        for feature in ["errors-v2", "windows", "wait", "displays"] {
+            assert!(FEATURES.contains(&feature), "{feature}");
+        }
+    }
+
+    #[test]
     fn a_locked_screen_is_said_so() {
         assert_eq!(
             screen_problem("Screen capture inhibited").0,
@@ -2375,6 +3089,8 @@ done
             peers: Mutex::new(HashMap::new()),
             display_poll: Mutex::new(None),
             http_sessions: Mutex::new(HashMap::new()),
+            frames: wait::Frames::default(),
+            waits: wait::Waits::default(),
             transfers: Transfers::new(dir.join("temp"), dir.join("downloads")),
             clipboard: ClipboardShare::default(),
             clipboard_polling: AtomicBool::new(false),
@@ -2402,6 +3118,9 @@ done
             display: Mutex::new(Some("1".into())),
             follows: AtomicBool::new(true),
             told: Mutex::new((None, Vec::new())),
+            who: Who::default(),
+            started: 0,
+            input: Mutex::new(serde_json::Map::new()),
         })
     }
 

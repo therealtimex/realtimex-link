@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::audit::{Audit, Outcome, Who as AuditWho};
 use crate::backend::Backend;
 use crate::clients::{normalize_permissions, Authenticated, ClientStore, ConnectRequest, KeyState};
 use crate::error::ApiError;
@@ -101,6 +102,11 @@ impl Admitted {
 
 pub struct Host {
     pub store: Arc<Store>,
+    /// The activity log (audit.rs, realtimex-ai-app#3055 §1.4).
+    pub audit: Audit,
+    /// The accessibility layer's refs and queue (ax.rs, Phase 2), shared by remote clients and
+    /// agents on this computer.
+    pub ax: crate::ax::Ax,
     secrets: SecretBox,
     pub clients: ClientStore,
     pub requests: RequestStore,
@@ -130,9 +136,12 @@ impl Host {
         base_port: u16,
         log: Arc<dyn Fn(&str) + Send + Sync>,
     ) -> Arc<Self> {
+        let audit = Audit::start(store.clone());
         Arc::new_cyclic(|me: &Weak<Host>| {
             let created = log.clone();
             let settled = log.clone();
+            let asked = audit.clone();
+            let expired = audit.clone();
             Host {
                 clients: ClientStore::new(store.clone()),
                 requests: RequestStore::new(
@@ -146,14 +155,34 @@ impl Host {
                             "[remote-control] {} asks to connect ({kind})",
                             request.client_name
                         ));
+                        // A pending request (Addendum 1 D3); the owner's answer is an access row.
+                        asked.note(
+                            request_who(request),
+                            "connect",
+                            Outcome::Pending,
+                            None,
+                            json!({}),
+                        );
                     }),
                     Box::new(move |request| {
                         settled(&format!(
                             "[remote-control] request from {}: {}",
                             request.client_name, request.status
                         ));
+                        // Nobody answered within its minute.
+                        if request.status == "expired" {
+                            expired.note(
+                                request_who(request),
+                                "connect",
+                                Outcome::Refused,
+                                Some("request-expired"),
+                                json!({}),
+                            );
+                        }
                     }),
                 ),
+                audit,
+                ax: crate::ax::Ax::new(ax_state_dir()),
                 store,
                 secrets,
                 backend,
@@ -363,6 +392,13 @@ impl Host {
             None => password::generate(),
         };
         self.save_password(&next, true)?;
+        self.audit.note(
+            AuditWho::owner(None),
+            "access",
+            Outcome::Ok,
+            None,
+            json!({ "change": "new-password" }),
+        );
         self.clients.sign_out_all()?;
         self.end_streams(|_| true).await;
         let _ = self.backend.stop().await;
@@ -635,8 +671,12 @@ impl Host {
         let settled =
             || ApiError::coded(409, "request-settled", "This request was already settled");
         if decision == "deny" {
+            let request = self.requests.find(reference);
             if !self.requests.deny(reference) {
                 return Err(settled());
+            }
+            if let Some(request) = request {
+                self.note_access(&request_subject(&request, None), "denied", None);
             }
             return Ok(json!({ "status": "denied" }));
         }
@@ -672,13 +712,36 @@ impl Host {
         };
         if admitted.status != 200 {
             self.requests.deny_decided(&request.reference);
+            self.note_access(&request_subject(&request, None), "denied", None);
             return Ok(json!({ "status": "denied" }));
         }
+        let subject = request_subject(&request, admitted.body.get("client"));
+        let permission = if decision == "allow-control" {
+            "control"
+        } else {
+            "view"
+        };
+        let connected = admitted.body.clone();
         if !self
             .requests
             .allow(&request.reference, grant, admitted.body)
         {
             return Err(settled());
+        }
+        // The owner's answer, then the client's admission (Addendum 1 D3).
+        self.note_access(&subject, "allowed", Some(permission));
+        if let Some(client) = connected.get("client") {
+            self.audit.note(
+                AuditWho {
+                    actor: "person".into(),
+                    via: request.via.clone(),
+                    ..AuditWho::owner(Some(client))
+                },
+                "connect",
+                Outcome::Ok,
+                None,
+                json!({ "admittedBy": "request", "permission": permission }),
+            );
         }
         Ok(json!({ "status": "allowed" }))
     }
@@ -959,12 +1022,16 @@ impl Host {
         if crate::owner::check_presence(&self.store) {
             (self.log)("[sign-in] RealTimeX is gone: RealTimeX Link manages its own account again");
         }
-        // The webhook inbox keeps deliveries for a week (webhooks.rs).
+        // The webhook inbox keeps deliveries for a week (webhooks.rs); the activity log 30 days
+        // and 50,000 rows (audit.rs).
         let store = self.store.clone();
+        let audit = self.audit.clone();
         tokio::spawn(async move {
             loop {
                 let before = crate::util::now_ms() - crate::webhooks::RETENTION_MS;
                 let _ = store.inbox_prune(before);
+                let pruning = audit.clone();
+                let _ = tokio::task::spawn_blocking(move || pruning.prune()).await;
                 tokio::time::sleep(Duration::from_secs(60 * 60)).await;
             }
         });
@@ -1056,6 +1123,11 @@ impl Host {
         self.relay.stop();
         self.close_listener().await;
         self.backend.dispose();
+        // Accessibility reads still adding up to their minute become rows now, and the writer
+        // saves what it has (at most 5 s); a crash still loses them (the log is best-effort).
+        self.audit.flush_reads(true);
+        let audit = self.audit.clone();
+        let _ = tokio::task::spawn_blocking(move || audit.flush()).await;
     }
 
     /// End the open live views of clients `matches` accepts.
@@ -1090,12 +1162,43 @@ impl Host {
 
     // --- clients ------------------------------------------------------------
 
+    /// An `access` row: the owner changed `change` about `subject` (a client as listed), or about
+    /// no client (Addendum 1 D1, D4).
+    fn note_access(&self, subject: &Value, change: &str, permission: Option<&str>) {
+        let subject = Some(subject).filter(|s| s.is_object());
+        let mut detail = json!({ "change": change });
+        if let Some(permission) = permission {
+            detail["permission"] = json!(permission);
+        }
+        self.audit.note(
+            AuditWho::owner(subject),
+            "access",
+            Outcome::Ok,
+            None,
+            detail,
+        );
+    }
+
+    /// The saved client as the overview lists it.
+    fn listed_client(&self, id: &str) -> Option<Value> {
+        self.clients
+            .list()
+            .into_iter()
+            .find(|client| client.get("id").and_then(Value::as_str) == Some(id))
+    }
+
     pub async fn set_client_permissions(
         &self,
         id: &str,
         permissions: &Value,
     ) -> Result<Value, ApiError> {
         let client = self.clients.set_permissions(id, permissions)?;
+        let control = client.pointer("/permissions/control") == Some(&Value::Bool(true));
+        self.note_access(
+            &client,
+            "permission",
+            Some(if control { "control" } else { "view" }),
+        );
         if client.pointer("/permissions/view") != Some(&Value::Bool(true)) {
             self.end_streams(|client| client == id).await;
         } else {
@@ -1108,6 +1211,11 @@ impl Host {
     /// Revoking also ends the running session, which may belong to that client.
     pub async fn set_client_revoked(&self, id: &str, revoked: bool) -> Result<Value, ApiError> {
         let client = self.clients.set_revoked(id, revoked)?;
+        self.note_access(
+            &client,
+            if revoked { "blocked" } else { "allowed-again" },
+            None,
+        );
         if revoked {
             self.end_streams(|client| client == id).await;
             let _ = self.backend.stop().await;
@@ -1119,6 +1227,7 @@ impl Host {
     /// Disconnect: its session ends now; it may connect again.
     pub async fn disconnect_client(&self, id: &str) -> Result<Value, ApiError> {
         let client = self.clients.sign_out(id)?;
+        self.note_access(&client, "disconnected", None);
         self.end_streams(|client| client == id).await;
         let holder = self
             .state()
@@ -1135,7 +1244,11 @@ impl Host {
     }
 
     pub async fn remove_client(&self, id: &str) -> Result<(), ApiError> {
+        let subject = self.listed_client(id);
         self.clients.remove(id)?;
+        if let Some(subject) = subject {
+            self.note_access(&subject, "removed", None);
+        }
         self.end_streams(|client| client == id).await;
         let _ = self.backend.stop().await;
         self.state().session = None;
@@ -1226,6 +1339,8 @@ impl Host {
             "defaultPermissions": state.default_permissions,
             "newComputerPolicy": state.new_computer_policy,
             "passwordChangedAt": state.password_changed_at,
+            // Activity rows that couldn't be saved since Link started (audit.rs).
+            "auditDropped": self.audit.dropped(),
         })
     }
 
@@ -1299,6 +1414,42 @@ impl Host {
             "updatedAt": iso_now(),
         })
     }
+}
+
+/// agent-desktop's state (its refs between calls): `<data dir>/agent-desktop/<user>`, private.
+/// Under Link's Windows service (SYSTEM) it is in Link's ProgramData folder instead, protected
+/// (service::ax_state_dir, realtimex-ai-app#3055 G3).
+fn ax_state_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    if crate::service::active() {
+        return crate::service::ax_state_dir();
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_alphanumeric() || "-_.$".contains(c)))
+        .unwrap_or_else(|| "default".into());
+    crate::paths::data_dir().map(|dir| dir.join("agent-desktop").join(user))
+}
+
+/// Who a connection request is from, for its activity rows: the saved client with that client
+/// id when there is one, else only what the request calls itself.
+fn request_who(request: &crate::requests::Request) -> AuditWho {
+    AuditWho {
+        client_id: None,
+        client_name: Some(request.client_name.clone()).filter(|n| !n.is_empty()),
+        machine: Some(request.machine.clone()).filter(|m| !m.is_empty()),
+        actor: "person".into(),
+        via: request.via.clone(),
+    }
+}
+
+/// The subject of the owner's answer to a request: the client it admitted, else the request's
+/// own names.
+fn request_subject(request: &crate::requests::Request, admitted: Option<&Value>) -> Value {
+    admitted.cloned().unwrap_or_else(|| {
+        json!({ "id": null, "name": request.client_name, "machine": request.machine })
+    })
 }
 
 struct Who {

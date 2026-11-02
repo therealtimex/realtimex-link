@@ -111,6 +111,14 @@ for helper in rtx-linkd rtx-control; do
   sign --identifier "ai.realtimex.link.${helper}" "$APP/Contents/MacOS/$helper"
   check_team "$APP/Contents/MacOS/$helper"
 done
+# agent-desktop (realtimex-ai-app#3055), re-signed as Link's: hardened runtime, our Team ID, so
+# notarization covers it and TCC credits its accessibility use to Link.
+for helper in agent-desktop agent-desktop-macos-helper; do
+  if [ -f "$APP/Contents/MacOS/$helper" ]; then
+    sign --identifier "ai.realtimex.link.${helper}" "$APP/Contents/MacOS/$helper"
+    check_team "$APP/Contents/MacOS/$helper"
+  fi
+done
 sign "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 codesign -dv "$APP" 2>&1 | grep -E "^(Identifier|TeamIdentifier|Authority=Developer ID Application)"

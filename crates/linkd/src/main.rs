@@ -7,8 +7,11 @@
 use rtx_glibc_compat as _;
 
 mod actions;
+mod appkey;
 mod artifacts;
+mod audit;
 mod autostart;
+mod ax;
 mod backend;
 #[cfg(target_os = "macos")]
 mod bridges;
@@ -50,7 +53,12 @@ mod transfers;
 mod unattended;
 mod update;
 mod util;
+mod wait;
 mod webhooks;
+// rtx-control's window ids (realtimex-ai-app#3055), to refuse a malformed one before it goes out.
+#[path = "../../control/src/winid.rs"]
+#[allow(dead_code)]
+mod winid;
 
 use std::path::PathBuf;
 use std::sync::Arc;

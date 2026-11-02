@@ -8,6 +8,7 @@ use rtx_glibc_compat as _;
 
 // Each platform reads its own column of the key table.
 #[allow(dead_code)]
+mod ax;
 mod codes;
 mod control;
 mod displays;
@@ -22,6 +23,8 @@ mod crt_shim;
 mod keys;
 mod peer;
 mod platform;
+// Window ids (realtimex-ai-app#3055), shared with rtx-linkd.
+mod winid;
 
 use clap::Parser;
 

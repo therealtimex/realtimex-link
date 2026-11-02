@@ -323,6 +323,15 @@ impl RequestStore {
         list
     }
 
+    /// The request with this reference, as it is now.
+    pub fn find(&self, reference: &str) -> Option<Request> {
+        self.lock()
+            .requests
+            .values()
+            .find(|r| r.reference == reference)
+            .cloned()
+    }
+
     /// Allowing starts: the request is marked "deciding" under the lock, so a second allow (or a
     /// deny) can't settle it while this one admits the client. None when it isn't pending. Ends
     /// with `allow`, `deny_decided`, or `undecide` when admitting failed.

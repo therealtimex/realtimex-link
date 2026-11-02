@@ -21,6 +21,18 @@ pub fn request_control_permission(name: &str) -> Result<()> {
     bail!("{name} needs no permission on this platform")
 }
 
+pub fn list_windows() -> Result<Vec<crate::platform::Listed>> {
+    Err(crate::platform::refused("unsupported", "No window list on this platform"))
+}
+
+pub fn focus_window(_window: &crate::platform::Listed) -> Result<()> {
+    Err(crate::platform::refused("unsupported", "No window focus on this platform"))
+}
+
+pub fn screen_locked() -> bool {
+    false
+}
+
 pub struct Input;
 
 impl Input {

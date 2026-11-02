@@ -1,4 +1,4 @@
-//! The window: This computer and Clients, a request from a new computer, who is in control,
+//! The window: This computer, Clients and Activity, a request from a new computer, who is in control,
 //! and Open RealTimeX / Get RealTimeX. State comes from rtx-linkd every 1.5 s; each change is one
 //! request to it, made off the UI thread.
 
@@ -15,6 +15,7 @@ use crate::desktop;
 use crate::i18n::{t, tf};
 use crate::theme::{self, primary_button, semibold, tone_colors, Tone};
 
+pub mod activity;
 mod sharing;
 
 const POLL: Duration = Duration::from_millis(1500);
@@ -52,6 +53,8 @@ pub struct Snapshot {
     /// The theme ("light", "dark", "system") and the language (a tag or "system") the window
     /// and Settings show, and Settings' changes on their way to the daemon.
     pub choices: Choices,
+    /// The Activity tab's entries (GET /v1/host/audit, realtimex-ai-app#3055).
+    pub activity: activity::Activity,
 }
 
 pub type Shared = Arc<Mutex<Snapshot>>;
@@ -432,6 +435,8 @@ fn fit_height(ctx: &egui::Context, extra: f32) {
 enum Tab {
     ThisComputer,
     Clients,
+    /// Only with a daemon whose features list "audit".
+    Activity,
 }
 
 /// Where keyboard focus goes next frame: Back when Settings opens, the gear when it closes.
@@ -455,6 +460,8 @@ enum Confirm {
     SignOut,
     /// Start with this computer: its sign-in and lock screens become reachable.
     StartWithComputer,
+    /// The activity log, for every computer (DELETE /v1/host/audit).
+    ClearActivity,
 }
 
 pub struct LinkApp {
@@ -488,6 +495,8 @@ pub struct LinkApp {
     /// Give Start with this computer's switch the focus once it can take it: after its confirm
     /// closes or its change is answered (contract §5).
     focus_start_with_computer: bool,
+    /// The Activity tab's own state (activity.rs).
+    activity: activity::ActivityView,
 }
 
 impl LinkApp {
@@ -532,6 +541,7 @@ impl LinkApp {
             focused: false,
             title: crate::instance::current().name(),
             focus_start_with_computer: false,
+            activity: activity::ActivityView::default(),
         }
     }
 
@@ -820,10 +830,15 @@ impl eframe::App for LinkApp {
             self.settings = false;
             self.focus = Some(Focus::Gear);
         }
-        let (status, shared) = {
+        let (status, shared, audit) = {
             let state = lock(&self.shared);
-            (state.status.clone(), state.shared.clone())
+            // Activity is a tab only with a daemon that keeps the log (contract §2).
+            let audit = state.api.as_ref().is_some_and(|api| api.has("audit"));
+            (state.status.clone(), state.shared.clone(), audit)
         };
+        if !audit && self.tab == Tab::Activity {
+            self.tab = Tab::ThisComputer;
+        }
         let instance = crate::instance::current();
         self.name_window(ctx, &instance);
         let (overview, requests, password, account, update, error, notice, stored) = {
@@ -1019,6 +1034,14 @@ impl eframe::App for LinkApp {
                             Tab::Clients,
                             &tf("tabs.clients", &[("count", count.to_string().as_str())]),
                         );
+                        if audit {
+                            theme::selectable_value(
+                                ui,
+                                &mut self.tab,
+                                Tab::Activity,
+                                &t("tabs.activity"),
+                            );
+                        }
                     });
                     ui.separator();
                     match self.tab {
@@ -1045,6 +1068,7 @@ impl eframe::App for LinkApp {
                             }
                         }
                         Tab::Clients => self.clients_ui(ui, ctx, overview),
+                        Tab::Activity => self.activity_ui(ui, ctx, overview),
                     }
                 }
                 let focused = ctx.memory(|memory| memory.focused());
@@ -1944,6 +1968,7 @@ impl LinkApp {
             Confirm::Remove { name, .. } => ("remove", name.as_str()),
             Confirm::SignOut => ("signOut", ""),
             Confirm::StartWithComputer => ("startWithComputer", ""),
+            Confirm::ClearActivity => ("clearActivity", ""),
         };
         let part = |part: &str| tf(&format!("confirm.{which}.{part}"), &[("name", name)]);
         let message = match confirm {
@@ -2029,11 +2054,16 @@ impl LinkApp {
                     set_unattended(&self.shared, &self.refresh, ctx, true);
                     self.focus_start_with_computer = true;
                 }
+                Some(Confirm::ClearActivity) => activity::clear(&self.shared, ctx),
                 None => {}
             }
         } else if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if matches!(self.confirm, Some(Confirm::StartWithComputer)) {
                 self.focus_start_with_computer = true;
+            }
+            // Cancel or Esc: back to Clear… (contract §8).
+            if matches!(self.confirm, Some(Confirm::ClearActivity)) {
+                self.activity.focus_clear = true;
             }
             self.confirm = None;
         }

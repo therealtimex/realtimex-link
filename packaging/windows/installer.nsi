@@ -154,6 +154,10 @@ Section "Install"
   File "${PAYLOAD}\rtx-linkd.exe"
   File "${PAYLOAD}\rtx-link.exe"
   File "${PAYLOAD}\rtx-control.exe"
+  ; The accessibility CLI rtx-control runs (realtimex-ai-app#3055), when the build has it.
+  !if /FileExists "${PAYLOAD}\agent-desktop.exe"
+    File "${PAYLOAD}\agent-desktop.exe"
+  !endif
   ; Decide first (rtx-linkd install --check: 0 replaces, 11 is this version, 10 is newer), then
   ; stop the service only when its files will be replaced: stopping it ends live remote
   ; sessions, even at the sign-in screen.
@@ -229,6 +233,7 @@ Section "Uninstall"
   nsExec::Exec 'taskkill /F /IM rtx-link.exe'
   nsExec::Exec 'taskkill /F /IM rtx-linkd.exe'
   nsExec::Exec 'taskkill /F /IM rtx-control.exe'
+  nsExec::Exec 'taskkill /F /IM agent-desktop.exe'
   Sleep 1000
   ; Start at login, for the user removing it (others' entries point at a program that is gone).
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP}"

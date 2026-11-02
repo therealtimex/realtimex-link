@@ -35,6 +35,11 @@ const BOOKKEEPING_OPS: [&str; 3] = ["peer_close", "peer_send", "displays"];
 pub const CONTROL_PROTOCOL: u64 = 2;
 /// rtx-control's code for a request naming a display that isn't attached (realtimex-link#12).
 pub const DISPLAY_NOT_FOUND: &str = "display-not-found";
+/// rtx-control's codes for the window ops (realtimex-ai-app#3055): a window id that isn't open
+/// (now), an op this desktop doesn't have (windows on Wayland), a locked screen.
+pub const WINDOW_NOT_FOUND: &str = "window-not-found";
+pub const UNSUPPORTED: &str = "unsupported";
+pub const SCREEN_LOCKED: &str = "screen-locked";
 /// How many virtual displays a headless GNOME Wayland session may record (the `virtualDisplays`
 /// setting, realtimex-link#12), and how many by default: one, as since 0.2.6.
 pub const VIRTUAL_DISPLAYS: std::ops::RangeInclusive<u64> = 1..=4;
@@ -285,16 +290,35 @@ fn helper_env(command: &mut Command) {
 }
 
 /// A failed helper answer: 409 with its `code` when the desktop refused the input, 404 for a
-/// display that isn't attached (realtimex-link#12), else 502.
+/// display (realtimex-link#12) or window that isn't there, 501 for what this desktop can't do,
+/// 423 for a locked screen (realtimex-ai-app#3055), else 502.
 fn helper_error(message: &Value, fallback: &str) -> ApiError {
     let text = message
         .get("error")
         .and_then(Value::as_str)
         .unwrap_or(fallback);
     match message.get("code").and_then(Value::as_str) {
-        Some(code @ DISPLAY_NOT_FOUND) => ApiError::coded(404, code, text),
-        Some(code) => ApiError::coded(409, code, text),
+        Some(code) => {
+            let mut error = ApiError::coded(helper_status(code), code, text);
+            // The helper's own wait (the accessibility runner's breaker, ax.rs).
+            error.retry_after_ms = message.get("retryAfterMs").and_then(Value::as_u64);
+            error
+        }
         None => ApiError::new(502, text),
+    }
+}
+
+/// The HTTP status of an rtx-control failure code.
+fn helper_status(code: &str) -> u16 {
+    match code {
+        DISPLAY_NOT_FOUND | WINDOW_NOT_FOUND => 404,
+        UNSUPPORTED => 501,
+        SCREEN_LOCKED => 423,
+        // The accessibility runner's (ax.rs).
+        "bad-request" => 400,
+        "busy" | "unavailable" => 503,
+        "timeout" => 504,
+        _ => 409,
     }
 }
 
@@ -462,7 +486,11 @@ impl Backend {
         }
         let detected = self.detected();
         let Some(binary) = detected.binary else {
-            return Err(ApiError::new(501, detected.reason.unwrap_or_default()));
+            return Err(ApiError::coded(
+                501,
+                "unavailable",
+                detected.reason.unwrap_or_default(),
+            ));
         };
         let spawned = crate::helper::spawn(&binary, || {
             Self::spawn_helper(&binary).map_err(|error| std::io::Error::other(error.message))
@@ -579,6 +607,35 @@ impl Backend {
     }
 
     async fn send(self: &Arc<Self>, op: &str, params: &Value) -> Result<Value, ApiError> {
+        self.send_within(op, params, REQUEST_TIMEOUT).await
+    }
+
+    /// One op of the long-lived helper without starting a capture or input session (the
+    /// accessibility layer and the window list need none: no GNOME sharing prompt, no capture),
+    /// answered within `timeout` (realtimex-ai-app#3055 §2.2: the call's own + 2 s).
+    pub async fn call_unstarted(
+        self: &Arc<Self>,
+        op: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ApiError> {
+        if !self.available() {
+            return Err(ApiError::coded(
+                503,
+                "unavailable",
+                "Remote Control's helper isn't available here",
+            ));
+        }
+        self.touch();
+        self.send_within(op, &params, timeout).await
+    }
+
+    async fn send_within(
+        self: &Arc<Self>,
+        op: &str,
+        params: &Value,
+        timeout: Duration,
+    ) -> Result<Value, ApiError> {
         self.ensure_child().await?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut line = Map::new();
@@ -616,7 +673,7 @@ impl Backend {
                 .remove(&id);
             return Err(ApiError::new(502, "Remote Control helper exited"));
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, answer).await {
+        match tokio::time::timeout(timeout, answer).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ApiError::new(502, "Remote Control helper exited")),
             Err(_) => {
@@ -723,7 +780,11 @@ impl Backend {
     /// One request in a short-lived helper process, outside the long-lived session.
     async fn run_once(&self, op: &str, params: Value) -> Result<Value, ApiError> {
         let Some(binary) = self.detected().binary else {
-            return Err(ApiError::new(501, "Remote Control is not available here"));
+            return Err(ApiError::coded(
+                501,
+                "unavailable",
+                "Remote Control is not available here",
+            ));
         };
         let mut child = Self::spawn_helper(&binary)?;
         let mut stdin = child
@@ -868,6 +929,19 @@ fn session_closed(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_failures_answer_with_the_status_of_their_code() {
+        let failed = |code: &str| helper_error(&json!({ "ok": false, "error": "no", "code": code }), "x");
+        assert_eq!(failed("display-not-found").status, 404);
+        assert_eq!(failed("window-not-found").status, 404);
+        assert_eq!(failed("unsupported").status, 501);
+        assert_eq!(failed("screen-locked").status, 423);
+        assert_eq!(failed("input-blocked").status, 409);
+        assert_eq!(failed("focus-refused").status, 409);
+        let uncoded = helper_error(&json!({ "ok": false, "error": "it broke" }), "x");
+        assert_eq!((uncoded.status, uncoded.code_or_status()), (502, "unavailable".into()));
+    }
 
     /// A stand-in for rtx-control: answers every request, and exits with rtx-control's stall
     /// code on op "stall". Each start is counted in `spawns` next to it.

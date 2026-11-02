@@ -3,6 +3,9 @@
 # profile, into OUTPUT_DIR: on macOS as RealTimeX Link.app (scripts/bundle-macos.sh), on Linux as
 # the three executables. Usage: scripts/build.sh [arm64|x86_64] [output_dir]
 # Rust comes from rustup (the version in rust-toolchain.toml).
+# LINK_AGENT_DESKTOP_DIR: the pinned agent-desktop CLI for this target (ci/fetch_agent_desktop.py,
+# realtimex-ai-app#3055), put next to rtx-control. Without it the build has no accessibility layer
+# (rtx-control answers `unavailable`).
 set -euo pipefail
 ARCH_PARAM="${1:-$(uname -m)}"
 OUTPUT_DIR="${2:-dist}"
@@ -51,13 +54,41 @@ for bin in rtx-linkd rtx-link rtx-control; do
     fi
   fi
 done
+# The pinned agent-desktop files (not its .version note), when given.
+AGENT_DESKTOP=()
+if [ -n "${LINK_AGENT_DESKTOP_DIR:-}" ]; then
+  for file in "$LINK_AGENT_DESKTOP_DIR"/agent-desktop*; do
+    case "$file" in *.version) continue ;; esac
+    [ -f "$file" ] && AGENT_DESKTOP+=("$file")
+  done
+  if [ ${#AGENT_DESKTOP[@]} -eq 0 ]; then
+    echo "ERROR: LINK_AGENT_DESKTOP_DIR ($LINK_AGENT_DESKTOP_DIR) has no agent-desktop" >&2
+    exit 1
+  fi
+  echo "agent-desktop $(cat "$LINK_AGENT_DESKTOP_DIR/agent-desktop.version" 2>/dev/null): ${AGENT_DESKTOP[*]##*/}"
+else
+  echo "No LINK_AGENT_DESKTOP_DIR: this build has no accessibility layer"
+fi
 if [ "$(uname -s)" = Darwin ]; then
-  scripts/bundle-macos.sh "$BUILT" "$OUTPUT_DIR"
+  AGENT_DESKTOP_FILES="${AGENT_DESKTOP[*]+${AGENT_DESKTOP[*]}}" scripts/bundle-macos.sh "$BUILT" "$OUTPUT_DIR"
   OUT="$OUTPUT_DIR/RealTimeX Link.app/Contents/MacOS"
 else
   for bin in rtx-linkd rtx-link rtx-control; do
     cp "$BUILT/$bin" "$OUTPUT_DIR/$bin"
     chmod +x "$OUTPUT_DIR/$bin"
+  done
+  for file in ${AGENT_DESKTOP[@]+"${AGENT_DESKTOP[@]}"}; do
+    cp "$file" "$OUTPUT_DIR/"
+    chmod +x "$OUTPUT_DIR/$(basename "$file")"
+    # The prebuilt CLI must fit the same glibc floor (#3055 G1).
+    if command -v objdump >/dev/null 2>&1; then
+      NEED=$(objdump -T "$file" | { grep -o 'GLIBC_[0-9.]*' || true; } | sed 's/GLIBC_//' | sort -uV | tail -1)
+      echo "$(basename "$file") requires glibc $NEED"
+      if [ -n "$NEED" ] && [ "$(printf '%s\n%s\n' "$NEED" "$GLIBC_MAX" | sort -V | tail -1)" != "$GLIBC_MAX" ]; then
+        echo "ERROR: $(basename "$file") requires glibc $NEED, more than $GLIBC_MAX" >&2
+        exit 1
+      fi
+    fi
   done
   # The autostart entry's icon (rtx-linkd's autostart.rs) and the icon theme's sizes, which its
   # install.rs puts into hicolor for the menu entry and the dock.

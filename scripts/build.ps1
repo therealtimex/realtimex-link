@@ -61,7 +61,7 @@ Run cargo build --release --locked --target $Target -p rtx-control
 # The Windows key mapping and clipboard unit tests (scancodes, #2909; paste restore) and the
 # display mapping (#12), when CI asks for them.
 if ($env:LINK_TEST_KEYS -eq '1') {
-  Run cargo test --release --locked --target $Target -p rtx-control '--' platform::windows::keymap platform::windows::clipboard codes:: displays::
+  Run cargo test --release --locked --target $Target -p rtx-control '--' platform::windows::keymap platform::windows::clipboard platform::windows::wins codes:: displays::
   # Link's service (realtimex-link#10): its ProgramData folder made safe, the pipe and body rules.
   Run cargo test --release --locked --target $Target -p rtx-linkd '--' service:: unattended::
 }
@@ -74,6 +74,16 @@ foreach ($name in 'rtx-linkd.exe', 'rtx-link.exe', 'rtx-control.exe') {
   $dlls = & dumpbin.exe /nologo /dependents $exe | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
   $crt = @($dlls | Where-Object { $_ -match '^(vcruntime|msvcp|ucrtbase|api-ms-win-crt-)' })
   if ($crt.Count -gt 0) { Fail "$name depends on the C runtime DLLs: $($crt -join ', ')" }
+}
+# The pinned agent-desktop.exe (ci/fetch_agent_desktop.py, realtimex-ai-app#3055), next to
+# rtx-control.exe; without LINK_AGENT_DESKTOP_DIR the build has no accessibility layer.
+if ($env:LINK_AGENT_DESKTOP_DIR) {
+  $agentDesktop = Join-Path $env:LINK_AGENT_DESKTOP_DIR 'agent-desktop.exe'
+  if (-not (Test-Path -LiteralPath $agentDesktop)) { Fail "LINK_AGENT_DESKTOP_DIR has no agent-desktop.exe" }
+  Copy-Item -LiteralPath $agentDesktop -Destination (Join-Path $OutDir 'agent-desktop.exe') -Force
+  Write-Host "agent-desktop: $agentDesktop"
+} else {
+  Write-Host 'No LINK_AGENT_DESKTOP_DIR: this build has no accessibility layer'
 }
 Run (Join-Path $OutDir 'rtx-linkd.exe') --version
 Run (Join-Path $OutDir 'rtx-control.exe') --version

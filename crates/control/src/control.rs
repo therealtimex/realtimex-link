@@ -28,7 +28,19 @@
 //! {"id":13,"op":"peer_close","session":1}
 //! {"id":19,"op":"displays"}                  -> {"displays":[{"id","name","primary","x","y","width","height","scale"}…]}
 //! {"id":20,"op":"peer_display","session":1,"display":"<id>"} -> {"display":"<id>","width":..,"height":..}
+//! {"id":21,"op":"windows"}                   -> {"windows":[{"id","pid","app","appName","title","display","frame":{x,y,width,height},"focused","minimized"}…]}
+//! {"id":22,"op":"focus_window","window":"<window id>"} -> {"focused":true,"window":{…}}
+//! {"id":23,"op":"ax","argv":["snapshot","--window-id=w-1"],"timeoutMs":10000,"stateDir":"/…"}
+//!                                            -> {"result":<agent-desktop's envelope>}   (ax.rs; may
+//!                                               answer after later requests, by id)
 //! ```
+//!
+//! Windows (realtimex-ai-app#3055): ids are [`crate::winid`]'s (`m:`, `w:`, `x:`); `display` is
+//! the display holding most of the window and `frame` is in its native pixels from its top-left
+//! (null for a window on none). Failures: `window-not-found`, `focus-refused`, `input-blocked`,
+//! `permission-missing`, `unsupported` (GNOME Wayland) and `screen-locked` (no titles from behind
+//! the lock screen). `screenshot` with `"cells":true` adds the 64×36 thumbnail itself (`cells`,
+//! base64) and `locked`, for rtx-linkd's `wait`.
 //!
 //! Which display (realtimex-link#12): `screenshot`, `move` and `peer_offer` take `"display":"<id>"`
 //! (an id from `displays`); without one they mean the primary display, as before. A display that
@@ -63,6 +75,7 @@ use crate::codes::{physical_key, PhysicalKey};
 use crate::displays::{self, Display};
 use crate::peer::{self, Peer, ToMain};
 use crate::platform::{self, Button, Input};
+use crate::winid::WindowId;
 
 /// Screenshots are at most this wide unless the request asks otherwise.
 const DEFAULT_MAX_WIDTH: u32 = 1920;
@@ -113,6 +126,8 @@ struct Controller {
     peers: HashMap<u64, Peer>,
     next_peer: u64,
     to_main: Sender<Msg>,
+    /// The accessibility runner (ax.rs, realtimex-ai-app#3055 §2.2).
+    ax: crate::ax::Ax,
     /// AppKit's window-server connection, made on the first request that needs the screen or
     /// input. A permissions check never makes it: on macOS that connection puts the helper in
     /// the Dock for a moment (it lives inside an app bundle), and checks run often.
@@ -126,6 +141,8 @@ enum Msg {
     Eof,
     Peer(ToMain),
     Stalled(CaptureStalled),
+    /// An accessibility call finished on its worker thread: answered by its id.
+    AxDone(crate::ax::Done),
 }
 
 impl Controller {
@@ -277,6 +294,15 @@ impl Controller {
         live: bool,
         display: Option<&str>,
     ) -> Result<platform::Shot> {
+        // GNOME Wayland: a locked screen has no screen-cast session (Mutter ends it), and its
+        // D-Bus error must not reach agents: 423 `screen-locked` instead (QA of #3055).
+        #[cfg(target_os = "linux")]
+        if platform::screenshot_needs_input() && platform::lock_state() == Some(true) {
+            return Err(platform::refused(
+                "screen-locked",
+                "The screen is locked. Unlock it to see it here.",
+            ));
+        }
         let shot = injected_unavailable(display).and_then(|()| {
             if platform::screenshot_needs_input() {
                 self.input()?.screenshot(max_width, live, display)
@@ -284,6 +310,8 @@ impl Controller {
                 capture(max_width, display)
             }
         });
+        #[cfg(target_os = "linux")]
+        let shot = shot.map_err(wayland_capture_error);
         let shot = self.note_capture(shot)?;
         // A live view's smaller frames say their own size with each click (`space`).
         if !live {
@@ -321,6 +349,9 @@ impl Controller {
         let op = request["op"].as_str().unwrap_or("");
         if !self.window_server && !matches!(op, "permissions" | "status") {
             platform::init_window_server();
+            // Remote Control never reads a screenshot's text: no Vision pass per picture.
+            #[cfg(target_os = "macos")]
+            rtx_screens::macos::set_text_recognition(false);
             self.window_server = true;
         }
         // macOS login window (realtimex-link#11 I4, C4): the daemon alone marks a request for
@@ -384,6 +415,11 @@ impl Controller {
                     // Same value for the same picture: a live view skips unchanged frames.
                     "thumb": thumb_hash(&shot.thumb),
                 });
+                // rtx-linkd's wait compares the thumbnails themselves (realtimex-ai-app#3055).
+                if request["cells"].as_bool() == Some(true) {
+                    answer["cells"] = json!(base64(&shot.thumb));
+                    answer["locked"] = json!(platform::screen_locked());
+                }
                 // Which display it is: the one named, else the primary's id when known.
                 let shown = match display {
                     Some(id) => Some(id.to_string()),
@@ -580,9 +616,120 @@ impl Controller {
                     "height": target.info.height,
                 }))
             }
+            "windows" => {
+                refuse_when_locked()?;
+                let listed = platform::list_windows()?;
+                let displays = self.display_infos()?;
+                let windows: Vec<Value> = listed.iter().map(|w| window_json(w, &displays)).collect();
+                Ok(json!({ "windows": windows }))
+            }
+            "focus_window" => {
+                refuse_when_locked()?;
+                // `window`: the request's own `id` is its line number.
+                let wanted = request["window"]
+                    .as_str()
+                    .and_then(WindowId::parse)
+                    .ok_or_else(|| platform::refused("window-not-found", "No such window here"))?;
+                let listed = platform::list_windows()?;
+                let window = listed
+                    .iter()
+                    .find(|window| window.id == wanted)
+                    .ok_or_else(|| {
+                        platform::refused("window-not-found", "The window is not open (any more)")
+                    })?;
+                platform::focus_window(window)?;
+                // As it is now: in front, and maybe restored or moved.
+                let now = platform::list_windows()
+                    .ok()
+                    .and_then(|list| list.into_iter().find(|window| window.id == wanted));
+                let displays = self.display_infos()?;
+                let mut shown = window_json(now.as_ref().unwrap_or(window), &displays);
+                shown["focused"] = json!(true);
+                Ok(json!({ "focused": true, "window": shown }))
+            }
             other => bail!("Unknown op: {other}"),
         }
     }
+
+    /// The displays as listed now, for placing windows on them.
+    fn display_infos(&mut self) -> Result<Vec<displays::DisplayInfo>> {
+        Ok(self
+            .read_displays()?
+            .into_iter()
+            .map(|display| display.info)
+            .collect())
+    }
+}
+
+/// `screen-locked` while the screen is locked: window titles and app contents must not leak from
+/// behind it. When Link can't tell (Linux with no lock screen answering on D-Bus), the same:
+/// a guard that can't see the lock would not guard anything.
+fn refuse_when_locked() -> Result<()> {
+    match platform::lock_state() {
+        Some(false) => Ok(()),
+        Some(true) => Err(platform::refused(
+            "screen-locked",
+            "The screen is locked. Unlock it to see its windows.",
+        )),
+        None => Err(platform::refused("screen-locked", LOCK_UNKNOWN)),
+    }
+}
+
+/// GNOME Wayland: Mutter's D-Bus error when its screen-cast session is gone (GNOME ends it when
+/// the screen locks, or when sharing is stopped) never reaches agents as such (QA of #3055):
+/// `screen-locked` while it is locked, else `unavailable` (the next request starts a new one).
+#[cfg(target_os = "linux")]
+fn wayland_capture_error(error: anyhow::Error) -> anyhow::Error {
+    if !platform::screenshot_needs_input()
+        || error_code(&error).is_some()
+        || !mutter_session_gone(&format!("{error:#}"))
+    {
+        return error;
+    }
+    if platform::lock_state() == Some(true) {
+        return platform::refused("screen-locked", "The screen is locked. Unlock it to see it here.");
+    }
+    platform::refused(
+        "unavailable",
+        "GNOME ended the screen-sharing session (the screen was locked, or sharing was stopped). \
+         Link starts a new one: try again.",
+    )
+}
+
+/// Whether a capture failed because Mutter's remote-desktop or screen-cast session is gone.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mutter_session_gone(text: &str) -> bool {
+    text.contains("/org/gnome/Mutter/RemoteDesktop/Session")
+        || text.contains("/org/gnome/Mutter/ScreenCast/Session")
+        || (text.contains("org.freedesktop.DBus.Error") && text.contains("Mutter"))
+}
+
+/// Why `screen-locked` when the lock state can't be read.
+#[cfg(windows)]
+const LOCK_UNKNOWN: &str = "Link can't tell whether this Windows session is locked (its session \
+     manager didn't answer), so it shows no windows or app contents.";
+#[cfg(not(windows))]
+const LOCK_UNKNOWN: &str = "Link can't tell whether the screen is locked here (neither the \
+     desktop's screensaver nor logind answered on D-Bus), so it shows no windows or app contents. \
+     Check that the session bus and systemd-logind are reachable.";
+
+/// A window as rtx-linkd and agents get it (realtimex-ai-app#3055).
+fn window_json(window: &platform::Listed, displays: &[displays::DisplayInfo]) -> Value {
+    let info = &window.info;
+    let placed = displays::place_window(info.frame, displays, platform::WINDOW_FRAMES_IN_POINTS);
+    json!({
+        "id": window.id.to_string(),
+        "pid": info.pid,
+        "app": info.app,
+        "appName": info.app_name,
+        "title": info.title,
+        "display": placed.as_ref().map(|(display, _)| display.clone()),
+        "frame": placed.map(|(_, [x, y, width, height])| {
+            json!({ "x": x, "y": y, "width": width, "height": height })
+        }),
+        "focused": window.focused,
+        "minimized": !info.on_screen,
+    })
 }
 
 /// Ctrl+Alt+Delete (realtimex-link#10): Delete going down while a Ctrl and an Alt are held.
@@ -778,6 +925,7 @@ pub fn run() -> Result<()> {
         peers: HashMap::new(),
         next_peer: 0,
         to_main: to_main.clone(),
+        ax: crate::ax::Ax::default(),
         window_server: false,
     };
     let stdout = std::io::stdout();
@@ -833,7 +981,15 @@ pub fn run() -> Result<()> {
                 // stdin closes.
                 controller.peers.clear();
                 controller.end_session();
+                crate::ax::kill_running();
                 return Err(stalled.into());
+            }
+            Msg::AxDone(done) => {
+                controller.ax.finished(&done);
+                let mut reply = done.reply.body;
+                reply["id"] = done.id;
+                write_line(&mut out, &reply);
+                continue;
             }
             Msg::Peer(event) => {
                 controller.on_peer(event, &mut out);
@@ -855,12 +1011,36 @@ pub fn run() -> Result<()> {
         };
         let id = request["id"].clone();
         let op = request["op"].as_str().unwrap_or("");
+        // Accessibility calls run on a worker thread and answer later, by id (ax.rs).
+        if op == "ax" {
+            // A tree read shows what is behind the lock screen, which a screenshot can't (§2.2).
+            if let Err(error) = refuse_when_locked() {
+                write_line(&mut out, &response(id, Err(error)));
+                continue;
+            }
+            let to_main = controller.to_main.clone();
+            let answer = controller.ax.start(id.clone(), &request, move |done| {
+                let _ = to_main.send(Msg::AxDone(done));
+            });
+            if let Some(mut reply) = answer {
+                reply["id"] = id;
+                write_line(&mut out, &reply);
+            }
+            continue;
+        }
         let result = controller.handle(&request);
         let ends_session = result.as_ref().is_err_and(|error| !displays::lost(error));
         if ends_session
             && !matches!(
                 op,
-                "start" | "peer_offer" | "peer_send" | "peer_close" | "peer_display" | "displays"
+                "start"
+                    | "peer_offer"
+                    | "peer_send"
+                    | "peer_close"
+                    | "peer_display"
+                    | "displays"
+                    | "windows"
+                    | "focus_window"
             )
         {
             // The desktop may have ended the session (GNOME: the user stopped sharing); start
@@ -871,6 +1051,7 @@ pub fn run() -> Result<()> {
     }
     controller.peers.clear();
     controller.end_session();
+    crate::ax::kill_running();
     Ok(())
 }
 
@@ -982,6 +1163,15 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gone_mutter_session_is_recognised() {
+        assert!(mutter_session_gone(
+            "org.freedesktop.DBus.Error.UnknownMethod: Object does not exist at path \u{201c}/org/gnome/Mutter/RemoteDesktop/Session/u3\u{201d}"
+        ));
+        assert!(mutter_session_gone("no such object /org/gnome/Mutter/ScreenCast/Session/u7"));
+        assert!(!mutter_session_gone("the display's picture is short"));
+    }
 
     #[test]
     fn unbase64_reverses_base64() {

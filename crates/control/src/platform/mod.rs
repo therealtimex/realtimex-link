@@ -12,8 +12,6 @@ pub enum Button {
 /// A Remote Control input failure the server can name: `rtx-control` answers it with its `code`
 /// as well as the message.
 #[derive(Debug)]
-// Only Windows reports one so far.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub struct InputError {
     pub code: &'static str,
     pub message: String,
@@ -26,6 +24,27 @@ impl std::fmt::Display for InputError {
 }
 
 impl std::error::Error for InputError {}
+
+/// A refusal with its code (`window-not-found`, `focus-refused`, `unsupported`…), as rtx-control
+/// answers it.
+pub fn refused(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+    InputError {
+        code,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// A window as this platform lists it (realtimex-ai-app#3055): its id, what rtx-screens says
+/// about it, and whether it has the keyboard focus.
+pub struct Listed {
+    pub id: crate::winid::WindowId,
+    pub info: rtx_screens::WindowInfo,
+    pub focused: bool,
+}
+
+/// Whether window frames are in points (macOS) rather than the displays' pixels.
+pub const WINDOW_FRAMES_IN_POINTS: bool = cfg!(target_os = "macos");
 
 /// What this computer's clipboard holds, as Remote Control reads it for a viewer (#2682).
 pub enum ClipboardContent {
@@ -136,8 +155,8 @@ pub fn capture_state() -> u64 {
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    capture_bounded, capture_state, control_permissions, permission_owner, request_control_permission,
-    screenshot_needs_input, Input,
+    capture_bounded, capture_state, control_permissions, focus_window, list_windows,
+    permission_owner, request_control_permission, screen_locked, screenshot_needs_input, Input,
 };
 
 /// macOS, under Link's supervisor (realtimex-link#11): the login-window job's channel.
@@ -150,8 +169,8 @@ pub fn macos_job_channel(fd: i32) {
 mod windows;
 #[cfg(windows)]
 pub use self::windows::{
-    control_permissions, follow_input_desktop, permission_owner, request_control_permission,
-    screenshot_needs_input, Input,
+    control_permissions, focus_window, follow_input_desktop, list_windows, lock_state,
+    permission_owner, request_control_permission, screen_locked, screenshot_needs_input, Input,
 };
 
 /// Windows moves the control thread to the desktop receiving input (sign-in, lock and UAC
@@ -165,14 +184,21 @@ pub fn follow_input_desktop() -> Option<String> {
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    control_permissions, permission_owner, request_control_permission, screenshot_needs_input,
-    set_virtual_displays, Input,
+    control_permissions, focus_window, list_windows, lock_state, permission_owner,
+    request_control_permission, screen_locked, screenshot_needs_input, set_virtual_displays, Input,
 };
+
+/// Locked or not; macOS always knows. Linux answers `None` when no lock screen answers on D-Bus
+/// (linux/lock.rs), Windows when its session manager doesn't (windows/wins.rs).
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn lock_state() -> Option<bool> {
+    Some(screen_locked())
+}
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod unsupported;
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub use unsupported::{
-    control_permissions, permission_owner, request_control_permission, screenshot_needs_input,
-    Input,
+    control_permissions, focus_window, list_windows, permission_owner, request_control_permission,
+    screen_locked, screenshot_needs_input, Input,
 };

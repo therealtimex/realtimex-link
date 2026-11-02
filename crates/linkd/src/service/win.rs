@@ -837,6 +837,28 @@ pub fn create_protected_dir(path: &std::path::Path, reader: Option<&str>) -> std
     }
 }
 
+/// Only SYSTEM and administrators, inherited by what is made inside.
+pub const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+/// `path` as a folder with exactly [`PRIVATE_DIR_SDDL`] (protected, administrators as owner):
+/// made so, or an existing one's DACL replaced (what is in it then inherits only that). Never
+/// through a junction or link.
+pub fn protect_dir(path: &std::path::Path) -> std::io::Result<()> {
+    if is_reparse(path) {
+        return Err(std::io::Error::other(format!("{} is a link", path.display())));
+    }
+    match create_protected_dir(path, None) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !path.is_dir() {
+                return Err(std::io::Error::other(format!("{} isn't a folder", path.display())));
+            }
+            set_security(path, Some(PRIVATE_DIR_SDDL))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// The user signed in on a session, as a SID (None at the sign-in screen).
 pub fn session_user(session: u32) -> Option<String> {
     let mut token: HANDLE = std::ptr::null_mut();
