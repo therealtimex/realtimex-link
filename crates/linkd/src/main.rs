@@ -50,7 +50,12 @@ mod transfers;
 mod unattended;
 mod update;
 mod util;
+mod wait;
 mod webhooks;
+// rtx-control's window ids (realtimex-ai-app#3055), to refuse a malformed one before it goes out.
+#[path = "../../control/src/winid.rs"]
+#[allow(dead_code)]
+mod winid;
 
 use std::path::PathBuf;
 use std::sync::Arc;

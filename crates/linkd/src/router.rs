@@ -38,6 +38,7 @@ use crate::local_api::Body64;
 use crate::requests::Poll;
 use crate::transfers::{Ended, Transfers};
 use crate::util::{iso_now, now_ms, unbase64};
+use crate::wait;
 
 const AUTH_FAILURE_WINDOW_MS: i64 = 60 * 1000;
 pub const MAX_AUTH_FAILURES: usize = 10;
@@ -53,7 +54,7 @@ const TAILNET_FAILURES_TOTAL: usize = 30;
 pub const SERVICE: &str = "realtimex-remote-control";
 /// 2 (ADR-2611 §4.5): peer live view, connection requests, client keys, identity tokens.
 pub const PROTOCOL_VERSION: u32 = 2;
-const FEATURES: [&str; 6] = [
+const FEATURES: [&str; 9] = [
     "peer-view",
     "connect-requests",
     "client-key",
@@ -61,6 +62,13 @@ const FEATURES: [&str; 6] = [
     "transfers",
     // realtimex-link#12: GET /displays, and `display` on /screenshot, /actions and /frames.
     "displays",
+    // realtimex-ai-app#3055: every error body has `code`, `retry` and, where they apply,
+    // `retryAfterMs`, `delivery` and `suggestion` (error.rs).
+    "errors-v2",
+    // GET /windows and POST /windows/focus (window ids from Link).
+    "windows",
+    // POST /wait, and the `x-screen-frame` header on /screenshot.
+    "wait",
 ];
 /// What a live view's `info` lists: the features the viewer adapts to.
 const PEER_FEATURES: [&str; 4] = ["transfers", "paste-files", "physical-keys", "displays"];
@@ -161,6 +169,10 @@ pub struct Shared {
     /// Reads the display list every displays::POLL while a WebRTC view is open.
     display_poll: Mutex<Option<JoinHandle<()>>>,
     http_sessions: Mutex<HashMap<String, i64>>,
+    /// Each client's latest screenshots' thumbnails, by frame token, and its open waits
+    /// (wait.rs, realtimex-ai-app#3055).
+    frames: wait::Frames,
+    waits: wait::Waits,
     transfers: Transfers,
     clipboard: ClipboardShare,
     clipboard_polling: AtomicBool,
@@ -227,6 +239,8 @@ fn new_shared(
         peers: Mutex::new(HashMap::new()),
         display_poll: Mutex::new(None),
         http_sessions: Mutex::new(HashMap::new()),
+        frames: wait::Frames::default(),
+        waits: wait::Waits::default(),
         transfers: Transfers::new(temp_dir, downloads),
         clipboard: ClipboardShare::default(),
         clipboard_polling: AtomicBool::new(false),
@@ -251,6 +265,9 @@ fn routes(shared: &Arc<Shared>) -> Router {
         .route("/remote-control/status", get(status))
         .route("/remote-control/screenshot", post(screenshot))
         .route("/remote-control/displays", get(list_displays))
+        .route("/remote-control/windows", get(list_windows))
+        .route("/remote-control/windows/focus", post(focus_window))
+        .route("/remote-control/wait", post(wait_for_change))
         .route("/remote-control/actions", post(actions))
         .route("/remote-control/frames", get(frames))
         .route("/remote-control/peer/offer", post(peer_offer))
@@ -441,7 +458,9 @@ fn clear(shared: &Shared, key: &str) {
 }
 
 fn too_many() -> Response {
-    json_status(429, json!({ "error": "Too many failed attempts" }))
+    ApiError::coded(429, "rate-limited", "Too many failed attempts")
+        .retry_after((AUTH_FAILURE_WINDOW_MS / 1000) as u64)
+        .into_response()
 }
 
 // --- sign-in -----------------------------------------------------------------------------
@@ -511,8 +530,17 @@ async fn connect(
                     "[remote-control] {name} signed in from {address} ({by})"
                 ));
             }
-            let mut response = no_store(json_status(admitted.status, admitted.body));
-            if let Some(seconds) = admitted.retry_after {
+            let mut body = admitted.body;
+            if admitted.status >= 400 {
+                crate::error::complete_body(admitted.status, &mut body, admitted.retry_after);
+            }
+            let retry_after = admitted.retry_after.or_else(|| {
+                body.get("retryAfterMs")
+                    .and_then(Value::as_u64)
+                    .map(|ms| ms.div_ceil(1000).max(1))
+            });
+            let mut response = no_store(json_status(admitted.status, body));
+            if let Some(seconds) = retry_after {
                 response
                     .headers_mut()
                     .insert("Retry-After", seconds.to_string().parse().expect("header"));
@@ -548,12 +576,11 @@ async fn poll_request(
     no_store(match answer {
         None => {
             fail(&shared, &key);
-            json_status(
-                404,
-                json!({ "error": "No such request", "code": "unknown-request" }),
-            )
+            ApiError::coded(404, "unknown-request", "No such request").into_response()
         }
-        Some(Poll::Claimed) => json_status(410, json!({ "status": "claimed", "code": "claimed" })),
+        Some(Poll::Claimed) => ApiError::coded(410, "claimed", "This request was already used")
+            .with_details(json!({ "status": "claimed" }))
+            .into_response(),
         Some(Poll::Allowed(admit)) => {
             let mut body = json!({ "status": "allowed" });
             if let (Some(target), Some(fields)) = (body.as_object_mut(), admit.as_object()) {
@@ -583,10 +610,7 @@ async fn cancel_request(
         Some(status) => json_status(200, json!({ "status": status })),
         None => {
             fail(&shared, &key);
-            json_status(
-                404,
-                json!({ "error": "No such request", "code": "unknown-request" }),
-            )
+            ApiError::coded(404, "unknown-request", "No such request").into_response()
         }
     }
 }
@@ -628,16 +652,20 @@ fn signed(
         None => {
             // An expired token is normal: the controller signs in again.
             if !token.is_empty() && host.token_expired(&token) {
-                return Err(Box::new(json_status(
-                    401,
-                    json!({ "error": "This sign-in has expired", "code": "token-expired" }),
-                )));
+                return Err(Box::new(
+                    ApiError::coded(401, "token-expired", "This sign-in has expired")
+                        .into_response(),
+                ));
             }
             fail(shared, &key);
-            Err(Box::new(json_status(
-                401,
-                json!({ "error": "Sign in again: this client is not allowed", "code": "invalid-token" }),
-            )))
+            Err(Box::new(
+                ApiError::coded(
+                    401,
+                    "invalid-token",
+                    "Sign in again: this client is not allowed",
+                )
+                .into_response(),
+            ))
         }
     }
 }
@@ -646,10 +674,14 @@ fn require(signed: &Signed, permission: &str) -> Result<(), Box<Response>> {
     if signed.client.may(permission) {
         Ok(())
     } else {
-        Err(Box::new(json_status(
-            403,
-            json!({ "error": format!("This client is not allowed to {permission}") }),
-        )))
+        Err(Box::new(
+            ApiError::coded(
+                403,
+                "view-only",
+                format!("This client is not allowed to {permission}"),
+            )
+            .into_response(),
+        ))
     }
 }
 
@@ -697,20 +729,14 @@ async fn screenshot(
     let signed = signed_with!(shared, headers, peer, "view");
     let quality = number_or(body.get("quality"), 75.0).clamp(30.0, 95.0);
     let display = displays::named(body.get("display"));
-    let mut params = json!({ "quality": quality });
+    // `cells`: the thumbnail itself, kept for a later wait (x-screen-frame).
+    let mut params = json!({ "quality": quality, "cells": true });
     if let Some(display) = &display {
         params["display"] = json!(display);
     }
     let shot = match shared.backend.call("screenshot", params).await {
         Ok(shot) => shot,
-        Err(error) => {
-            let (code, message) = screen_problem(&error.message);
-            return if code == "screen-locked" {
-                json_status(423, json!({ "error": message, "code": code }))
-            } else {
-                error.into_response()
-            };
-        }
+        Err(error) => return http_error(error).into_response(),
     };
     let (width, height) = (
         shot["width"].as_u64().unwrap_or(0),
@@ -724,6 +750,18 @@ async fn screenshot(
         "[remote-control] screenshot {width}x{height} for {}",
         signed.client.name()
     ));
+    // Its frame token (realtimex-ai-app#3055): a later wait compares with this picture.
+    let frame = wait::decode_cells(&shot["cells"]).map(|cells| {
+        let shown = shot["display"].as_str().or(display.as_deref()).unwrap_or("");
+        shared.frames.keep(
+            signed.client.id(),
+            shown,
+            wait::Frame {
+                cells,
+                space: (width, height),
+            },
+        )
+    });
     let data = shot["data"].as_str().and_then(unbase64).unwrap_or_default();
     let mime = shot["mime"].as_str().unwrap_or("image/jpeg").to_string();
     let mut response = (StatusCode::OK, data).into_response();
@@ -737,6 +775,9 @@ async fn screenshot(
     // Which display the picture is (realtimex-link#12): the one named, else the primary.
     if let Some(shown) = shot["display"].as_str() {
         fields.push(("x-screen-display", shown.to_string()));
+    }
+    if let Some(frame) = frame {
+        fields.push(("x-screen-frame", frame));
     }
     for (name, value) in fields {
         if let Ok(value) = value.parse() {
@@ -904,8 +945,241 @@ async fn actions(
     let display = display.as_deref();
     match perform_actions(&shared, &signed.client, actions, false, false, display, display).await {
         Ok(result) => Json(result).into_response(),
+        Err(error) => http_error(error).into_response(),
+    }
+}
+
+/// An error as the HTTP routes answer it: a capture refused because the screen is locked is
+/// 423 `screen-locked` (the DataChannel says so its own way).
+fn http_error(error: ApiError) -> ApiError {
+    if error.code.is_none() {
+        let (code, message) = screen_problem(&error.message);
+        if code == "screen-locked" {
+            return ApiError {
+                status: 423,
+                code: Some(code.to_string()),
+                message,
+                ..error
+            };
+        }
+    }
+    error
+}
+
+// --- windows and waiting (realtimex-ai-app#3055) ------------------------------------------
+
+/// `{ windows: [{ id, pid, app, appName, title, display, frame, focused, minimized }] }`,
+/// front to back where the system says; `?display=<id>`: only that display's (404 when it
+/// isn't attached).
+async fn list_windows(
+    State(shared): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let _signed = signed_with!(shared, headers, peer, "view");
+    let display = query.get("display").filter(|d| !d.is_empty()).cloned();
+    let listed = async {
+        require_display(&shared, display.as_deref()).await?;
+        shared.backend.call("windows", json!({})).await
+    };
+    match listed.await {
+        Ok(answer) => {
+            let windows = windows_on(&answer, display.as_deref());
+            no_store(Json(json!({ "windows": windows })).into_response())
+        }
+        Err(error) => http_error(error).into_response(),
+    }
+}
+
+/// rtx-control's windows, only `display`'s when one is named.
+fn windows_on(answer: &Value, display: Option<&str>) -> Vec<Value> {
+    answer
+        .get("windows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|window| display.is_none_or(|id| window.get("display").and_then(Value::as_str) == Some(id)))
+        .cloned()
+        .collect()
+}
+
+/// `{id}` → `{ focused: true, window }`: the window in front, checked. Refusals:
+/// `window-not-found` (404), `focus-refused` (409; delivery unknown), `input-blocked`,
+/// `permission-missing`, `unsupported` (GNOME Wayland), `screen-locked`.
+async fn focus_window(
+    State(shared): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Body64(body): Body64,
+) -> Response {
+    let signed = signed_with!(shared, headers, peer, "control");
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    if crate::winid::WindowId::parse(id).is_none() {
+        return ApiError::bad_request("id must be a window id from GET /remote-control/windows")
+            .into_response();
+    }
+    match shared.backend.call("focus_window", json!({ "window": id })).await {
+        Ok(answer) => {
+            (shared.log)(&format!(
+                "[remote-control] focused a window for {}",
+                signed.client.name()
+            ));
+            Json(json!({ "focused": true, "window": answer.get("window").cloned().unwrap_or(Value::Null) }))
+                .into_response()
+        }
+        // The helper never answered: the window may have come forward anyway.
+        Err(error) if error.code_or_status() == "timeout" => error
+            .with_retry(crate::error::Retry::No)
+            .with_delivery(crate::error::Delivery::Unknown)
+            .into_response(),
+        Err(error) => http_error(error).into_response(),
+    }
+}
+
+/// Where a wait's pictures come from: small live screenshots of one display.
+struct Polls<'a> {
+    shared: &'a Shared,
+    params: Value,
+    /// The display the pictures are of, as rtx-control names it.
+    display: Option<String>,
+}
+
+impl Polls<'_> {
+    async fn look(&mut self) -> ApiResult<Vec<u8>> {
+        let shot = self
+            .shared
+            .backend
+            .call("screenshot", self.params.clone())
+            .await
+            .map_err(http_error)?;
+        if shot["locked"] == Value::Bool(true) {
+            return Err(ApiError::coded(
+                423,
+                "screen-locked",
+                "The screen is locked. Unlock it to see it here.",
+            ));
+        }
+        if let Some(shown) = shot["display"].as_str() {
+            self.display = Some(shown.to_string());
+        }
+        wait::decode_cells(&shot["cells"]).ok_or_else(|| {
+            ApiError::coded(
+                501,
+                "unsupported",
+                "This computer's Remote Control helper can't compare pictures",
+            )
+        })
+    }
+}
+
+impl wait::Source for Polls<'_> {
+    fn next(&mut self) -> impl std::future::Future<Output = ApiResult<Vec<u8>>> + Send {
+        self.look()
+    }
+}
+
+/// POST /wait (view): `{display?, since?, timeoutMs?, settleMs?, region?}` →
+/// `{changed, elapsedMs, frame, display, area?}`; wait.rs says how.
+async fn wait_for_change(
+    State(shared): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Body64(body): Body64,
+) -> Response {
+    let signed = signed_with!(shared, headers, peer, "view");
+    match run_wait(&shared, signed.client.id(), &body).await {
+        Ok(answer) => no_store(Json(answer).into_response()),
         Err(error) => error.into_response(),
     }
+}
+
+async fn run_wait(shared: &Arc<Shared>, client: &str, body: &Value) -> ApiResult<Value> {
+    let request = wait::Request::parse(body)?;
+    require_display(shared, request.display.as_deref()).await?;
+    let _slot = shared.waits.enter(client)?;
+    let mut params = json!({
+        "maxWidth": wait::POLL_WIDTH,
+        "quality": wait::POLL_QUALITY,
+        // Not a screenshot of the client's: its pointer space stays its own latest one's.
+        "live": true,
+        "cells": true,
+    });
+    if let Some(display) = &request.display {
+        params["display"] = json!(display);
+    }
+    let mut polls = Polls {
+        shared,
+        params,
+        display: request.display.clone(),
+    };
+    let first = polls.look().await?;
+    let shown = polls.display.clone().unwrap_or_default();
+    let since = request
+        .since
+        .as_deref()
+        .and_then(|token| shared.frames.get(client, &shown, token));
+    // The space `region` and `area` are in: the client's latest screenshot of the display.
+    let space = match &since {
+        Some(frame) => Some(frame.space),
+        None => shared.frames.latest(client, &shown).map(|frame| frame.space),
+    }
+    .or_else(|| {
+        lock(&shared.shot_sizes)
+            .get(&(client.to_string(), request.display.clone()))
+            .copied()
+    });
+    let space = match space {
+        Some(space) => space,
+        None => native_size(shared, &shown).await.unwrap_or((
+            wait::POLL_WIDTH,
+            wait::POLL_WIDTH * wait::ROWS as u64 / wait::COLUMNS as u64,
+        )),
+    };
+    let region = request
+        .region
+        .map_or(wait::Cells::ALL, |region| wait::region_cells(region, space));
+    let outcome = wait::watch(
+        &mut polls,
+        since.map(|frame| frame.cells),
+        first,
+        region,
+        request.timeout,
+        request.settle,
+        wait::POLL,
+    )
+    .await?;
+    let shown = polls.display.clone().unwrap_or(shown);
+    let frame = shared.frames.keep(
+        client,
+        &shown,
+        wait::Frame {
+            cells: outcome.cells,
+            space,
+        },
+    );
+    let mut answer = json!({
+        "changed": outcome.changed,
+        "elapsedMs": outcome.elapsed.as_millis() as u64,
+        "frame": frame,
+        "display": shown,
+    });
+    if let Some(area) = outcome.area {
+        answer["area"] = wait::area_of(area, space);
+    }
+    Ok(answer)
+}
+
+/// A display's native size, from the display list.
+async fn native_size(shared: &Shared, id: &str) -> Option<(u64, u64)> {
+    let list = fresh_displays(shared).await.ok()?;
+    let display = list
+        .iter()
+        .find(|display| display.get("id").and_then(Value::as_str) == Some(id))?;
+    Some((
+        display.get("width")?.as_u64()?,
+        display.get("height")?.as_u64()?,
+    ))
 }
 
 // --- the MJPEG live view -----------------------------------------------------------------
@@ -923,10 +1197,13 @@ async fn frames(
 ) -> Response {
     if shared.public {
         // A stream would carry the whole screen through the relay; the WebRTC view goes direct.
-        return json_status(
+        return ApiError::coded(
             403,
-            json!({ "error": "The live view is not available over Public Exposure", "code": "live-view-not-public" }),
-        );
+            "live-view-not-public",
+            "The live view is not available over Public Exposure",
+        )
+        .with_suggestion("Use screenshots; the live view connects directly instead.")
+        .into_response();
     }
     let signed = signed_with!(shared, headers, peer, "view");
     let number = |name: &str| {
@@ -1817,7 +2094,7 @@ async fn peer_offer(
     let signed = signed_with!(shared, headers, peer, "view");
     let sdp = body.get("sdp").and_then(Value::as_str).unwrap_or("");
     if !sdp.starts_with("v=0") || sdp.len() > MAX_SDP_LENGTH {
-        return json_status(400, json!({ "error": "A WebRTC offer (sdp) is required" }));
+        return ApiError::bad_request("A WebRTC offer (sdp) is required").into_response();
     }
     let max_width = number_or(body.get("maxWidth"), 1280.0).clamp(MIN_FRAME_WIDTH, MAX_FRAME_WIDTH);
     let mut params = json!({ "sdp": sdp, "maxWidth": max_width });
@@ -2151,7 +2428,7 @@ async fn transfer(
     let signed = signed_with!(shared, headers, peer, "control");
     let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     if !is_transfer(kind) || kind == "clipboard_watch" {
-        return json_status(400, json!({ "error": "Unknown transfer message" }));
+        return ApiError::bad_request("Unknown transfer message").into_response();
     }
     let session = format!("http:{}", signed.client.id());
     let first = {
@@ -2299,6 +2576,41 @@ mod tests {
         for up in ups {
             let one = crate::actions::plan_actions(Some(&json!([up])), true).unwrap();
             assert_eq!(one[0].len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_locked_capture_is_423_screen_locked_over_http() {
+        let locked = http_error(ApiError::new(502, "Screen capture inhibited"));
+        assert_eq!(
+            (locked.status, locked.code.as_deref()),
+            (423, Some("screen-locked"))
+        );
+        assert_eq!(locked.body()["retryAfterMs"], 5000);
+        // Anything else, and anything already coded, stays as it was.
+        let other = http_error(ApiError::new(502, "helper exited"));
+        assert_eq!((other.status, other.code), (502, None));
+        let coded = http_error(ApiError::coded(409, "input-blocked", "locked out"));
+        assert_eq!(coded.code.as_deref(), Some("input-blocked"));
+    }
+
+    #[test]
+    fn windows_can_be_listed_for_one_display() {
+        let answer = json!({ "windows": [
+            { "id": "m:1", "display": "1" },
+            { "id": "m:2", "display": "2" },
+            { "id": "m:3", "display": null },
+        ] });
+        assert_eq!(windows_on(&answer, None).len(), 3);
+        let on_two = windows_on(&answer, Some("2"));
+        assert_eq!(on_two, vec![json!({ "id": "m:2", "display": "2" })]);
+        assert!(windows_on(&json!({}), None).is_empty());
+    }
+
+    #[test]
+    fn hello_lists_the_agent_features() {
+        for feature in ["errors-v2", "windows", "wait", "displays"] {
+            assert!(FEATURES.contains(&feature), "{feature}");
         }
     }
 

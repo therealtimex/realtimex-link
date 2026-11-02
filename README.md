@@ -39,6 +39,21 @@ control other computers from.
   nothing measurable) and starts again when a physical monitor is plugged in or out; a headless
   one records `virtualDisplays` (1–4, default 1; `GET/POST /v1/displays/virtual {count}` on the
   local API) virtual monitors, `Meta-0`… in the order it made them.
+  **For agents** (realtimex-ai-app#3055, features `errors-v2`, `windows`, `wait`): every error
+  body is `{error, code, retry, retryAfterMs?, delivery?, suggestion?}` (`retry`: `safe`, `after`
+  with `retryAfterMs` and `Retry-After`, `refresh` or `no`; `delivery` for input: `none`,
+  `unknown` or `done`; codes and their rules in `crates/linkd/src/error.rs`), a superset of the
+  old `{error, code?}`; success bodies and the live view's DataChannel are unchanged.
+  `GET /remote-control/windows[?display=<id>]` lists normal app windows
+  (`{id, pid, app, appName, title, display, frame, focused, minimized}`, `frame` in that display's
+  native pixels; ids `m:` macOS, `w:` Windows, `x:` X11, opaque to clients) and
+  `POST /remote-control/windows/focus {id}` (control) brings one to the front and checks it
+  (`window-not-found`, `focus-refused`, `input-blocked`, `permission-missing`); GNOME Wayland
+  answers `unsupported`, a locked screen `screen-locked`, and the macOS login window has
+  neither. `/screenshot` adds an `x-screen-frame` token, and `POST /remote-control/wait
+  {display?, since?, timeoutMs?, settleMs?, region?}` answers once the screen changed since that
+  picture (`{changed, elapsedMs, frame, display, area?}`; `changed:false` at the timeout), from
+  rtx-control's change thumbnail every 250 ms, at most two waits per client.
   **Start with this computer on macOS** (0.4.1, realtimex-link#11): one administrator's prompt
   installs a root LaunchDaemon that runs its owner's daemon from boot, and a session agent at the
   login window and in each user's session, so allowed computers connect at the login window and
