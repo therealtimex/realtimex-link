@@ -13,7 +13,8 @@ release's unsigned files from that very run's artifacts, not from whatever the d
 
 Environment: GITHUB_LINK_TOKEN (Actions read/write on the mirror), CI_COMMIT_SHA, CI_COMMIT_TAG or
 CI_COMMIT_BRANCH, and optionally GITHUB_REPOSITORY (default therealtimex/realtimex-link) and
-BUILD_TARGETS (test|all; tags always build all).
+BUILD_TARGETS (test: macOS Intel, Linux x64 and Windows x64; all: every platform; tags always
+build all).
 """
 
 import json

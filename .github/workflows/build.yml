@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "test: macOS Intel and Linux x64 only; all: every platform"
+        description: "test: macOS Intel, Linux x64 and Windows x64; all: every platform"
         type: choice
         options: [test, all]
         default: test
@@ -22,8 +22,8 @@ permissions:
   contents: read
 
 jobs:
-  # Which platforms: every one for a release tag (or "all" by hand); while testing, only the
-  # machines it is tried on (macOS Intel, Linux x64).
+  # Which platforms: every one for a release tag (or "all" by hand); while testing, macOS Intel,
+  # Linux x64 and Windows x64, so every push compiles Windows (the arm builds come with "all").
   plan:
     runs-on: ubuntu-24.04
     outputs:
@@ -53,6 +53,7 @@ jobs:
         run: |
           test='[
             {"name":"macos-x86_64","runner":"macos-15-intel","arch":"x86_64","script":"unix","triple":"x86_64-apple-darwin"},
+            {"name":"windows-x86_64","runner":"windows-2022","arch":"x86_64","script":"windows","triple":"x86_64-pc-windows-msvc"},
             {"name":"linux-x86_64","runner":"ubuntu-24.04","arch":"x86_64","script":"unix","triple":"x86_64-unknown-linux-gnu"}
           ]'
           # No Windows on ARM: RealTimeX does not ship there, and libvpx (rtx-control's live view)
