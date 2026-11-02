@@ -49,6 +49,9 @@ pub const FEATURES: &[&str] = &[
     // realtimex-link#12: a live view can choose which display it shows (the viewer reads it from
     // the live view's own `info`); GET/POST /v1/displays/virtual.
     "displays",
+    // realtimex-ai-app#3055 §1.4: GET/DELETE /v1/host/audit (the Activity tab), and
+    // `auditDropped` in the overview.
+    "audit",
 ];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
 /// caller's nonce (see `hello_proof`).
@@ -139,6 +142,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/host/clients/remove", post(remove_client))
         .route("/v1/host/permissions/request", post(request_permission))
         .route("/v1/host/stop-session", post(stop_session))
+        .route("/v1/host/audit", get(audit).delete(clear_audit))
         .fallback(|| async { ApiError::new(404, "Not found") })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -1043,6 +1047,31 @@ async fn request_permission(State(state): State<Shared>, Body64(body): Body64) -
     }
     state.host.request_permission(name).await?;
     Ok(Json(json!({})))
+}
+
+/// The activity log, newest first: `?before=<id>&limit=<1..200>&client=<id>&kind=<kind>` →
+/// `{entries, next, retentionDays, dropped}` (audit.rs). Local only: no remote route reads it.
+async fn audit(
+    State(state): State<Shared>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Answer {
+    let query = crate::audit::Query::parse(&params)?;
+    let audit = state.host.audit.clone();
+    let page = tokio::task::spawn_blocking(move || audit.page(&query))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(page))
+}
+
+/// Clear it: `{cleared: n}`, and one `audit-cleared` row says so.
+async fn clear_audit(State(state): State<Shared>) -> Answer {
+    let audit = state.host.audit.clone();
+    let cleared = tokio::task::spawn_blocking(move || audit.clear())
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "cleared": cleared })))
 }
 
 async fn stop_session(State(state): State<Shared>) -> Answer {

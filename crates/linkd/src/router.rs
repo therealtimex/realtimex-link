@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::actions::{is_physical_key, run_actions};
+use crate::audit::{self, Outcome, Who};
 use crate::backend::Backend;
 use crate::clients::Authenticated;
 use crate::clipboard_share::{self, ClipboardShare, Pulled, POLL_MS};
@@ -151,6 +152,10 @@ struct Peer {
     /// What the viewer was last told it shows, and the list it was told: a fresh list is
     /// pushed only when that changes.
     told: Mutex<(Option<String>, Vec<Value>)>,
+    /// For its activity row when it ends (audit.rs): who, since when, and its input summed.
+    who: Who,
+    started: i64,
+    input: Mutex<serde_json::Map<String, Value>>,
 }
 
 pub struct Shared {
@@ -372,6 +377,46 @@ fn no_store(mut response: Response) -> Response {
     response
 }
 
+// --- the activity log (audit.rs) ---------------------------------------------------------
+
+/// How this listener's clients come: over the tailnet or Public Exposure.
+fn via_of(shared: &Shared) -> &'static str {
+    if shared.public {
+        "public"
+    } else {
+        "tailnet"
+    }
+}
+
+/// An activity row about `client`'s request of `kind`: ok, or its error.
+fn audit_row<T>(
+    shared: &Shared,
+    client: &Authenticated,
+    kind: &'static str,
+    result: &ApiResult<T>,
+    detail: Value,
+) {
+    if let Some(host) = shared.host.upgrade() {
+        host.audit
+            .outcome(Who::client(client, via_of(shared)), kind, result, detail);
+    }
+}
+
+/// A view's row when it ends: `display`, how long, and its input (a person's isn't kept per
+/// batch, design §1.4 rule 5).
+fn audit_view(shared: &Shared, who: Who, started: i64, display: Option<String>, input: serde_json::Map<String, Value>) {
+    if let Some(host) = shared.host.upgrade() {
+        let mut detail = json!({ "durationMs": (now_ms() - started).max(0) });
+        if let Some(display) = display {
+            detail["display"] = json!(display);
+        }
+        if !input.is_empty() {
+            detail["input"] = Value::Object(input);
+        }
+        host.audit.note(who, "view", Outcome::Ok, None, detail);
+    }
+}
+
 // --- failed sign-ins ---------------------------------------------------------------------
 
 fn blocked(shared: &Shared, key: &str) -> bool {
@@ -506,6 +551,7 @@ async fn connect(
     let via = if shared.public { "public" } else { "tailnet" };
     match host.admit(&body, &address, via, password_blocked).await {
         Ok(admitted) => {
+            audit_connect(&host, &body, &admitted, via);
             if admitted.wrong_password {
                 fail(&shared, &key);
                 if shared.public {
@@ -549,6 +595,65 @@ async fn connect(
         }
         Err(error) => error.into_response(),
     }
+}
+
+/// A `connect` row for each sign-in's outcome (a new pending request is written where it is made,
+/// host.rs). A refused computer was never admitted: only what it calls itself is kept.
+fn audit_connect(host: &Host, body: &Value, admitted: &crate::host::Admitted, via: &str) {
+    if admitted.status == 202 {
+        return;
+    }
+    let asked = body.get("client");
+    let actor = if asked.and_then(|c| c.get("actor")).and_then(Value::as_str) == Some("agent") {
+        "agent"
+    } else {
+        "person"
+    };
+    if admitted.status == 200 {
+        let client = admitted.body.get("client");
+        let control = client.and_then(|c| c.pointer("/permissions/control")) == Some(&Value::Bool(true));
+        host.audit.note(
+            Who {
+                actor: actor.into(),
+                via: via.into(),
+                ..Who::owner(client)
+            },
+            "connect",
+            Outcome::Ok,
+            None,
+            json!({
+                "admittedBy": admitted.body.get("admittedBy"),
+                "permission": if control { "control" } else { "view" },
+            }),
+        );
+        return;
+    }
+    let named = |key: &str| {
+        asked
+            .and_then(|c| c.get(key))
+            .and_then(Value::as_str)
+            .map(|text| crate::requests::clean_name(Some(&json!(text))))
+            .filter(|text| !text.is_empty())
+    };
+    let code = admitted
+        .body
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::error::status_code(admitted.status).to_string());
+    host.audit.note(
+        Who {
+            client_id: None,
+            client_name: named("name"),
+            machine: named("machine"),
+            actor: actor.into(),
+            via: via.into(),
+        },
+        "connect",
+        Outcome::of_status(admitted.status),
+        Some(&code),
+        json!({}),
+    );
 }
 
 /// A pending request's poll (ADR-2611 §1.4). The request id is the requester's capability; an
@@ -695,6 +800,24 @@ macro_rules! signed_with {
     };
 }
 
+/// As signed_with!, and a refusal for lack of `permission` is an activity row of `kind`.
+macro_rules! signed_for {
+    ($shared:expr, $headers:expr, $peer:expr, $permission:expr, $kind:expr) => {
+        match signed(&$shared, &$headers, &$peer) {
+            Err(response) => return *response,
+            Ok(signed) => match require(&signed, $permission) {
+                Ok(()) => signed,
+                Err(response) => {
+                    let refused: ApiResult<()> =
+                        Err(ApiError::coded(403, "view-only", "not allowed"));
+                    audit_row(&$shared, &signed.client, $kind, &refused, json!({}));
+                    return *response;
+                }
+            },
+        }
+    };
+}
+
 // --- the screen and input ----------------------------------------------------------------
 
 async fn status(
@@ -734,9 +857,20 @@ async fn screenshot(
     if let Some(display) = &display {
         params["display"] = json!(display);
     }
-    let shot = match shared.backend.call("screenshot", params).await {
+    let shot = shared
+        .backend
+        .call("screenshot", params)
+        .await
+        .map_err(http_error);
+    let shown = shot
+        .as_ref()
+        .ok()
+        .and_then(|shot| shot["display"].as_str().map(str::to_string))
+        .or(display.clone());
+    audit_row(&shared, &signed.client, "screenshot", &shot, json!({ "display": shown }));
+    let shot = match shot {
         Ok(shot) => shot,
-        Err(error) => return http_error(error).into_response(),
+        Err(error) => return error.into_response(),
     };
     let (width, height) = (
         shot["width"].as_u64().unwrap_or(0),
@@ -936,16 +1070,22 @@ async fn actions(
     headers: HeaderMap,
     Body64(body): Body64,
 ) -> Response {
-    let signed = signed_with!(shared, headers, peer, "control");
+    let signed = signed_for!(shared, headers, peer, "control", "actions");
     let display = displays::named(body.get("display"));
+    let actions = body.get("actions");
+    let detail = audit::actions_detail(actions, display.as_deref());
     if let Err(error) = require_display(&shared, display.as_deref()).await {
+        audit_row(&shared, &signed.client, "actions", &Err::<(), _>(error.clone()), detail);
         return error.into_response();
     }
-    let actions = body.get("actions");
     let display = display.as_deref();
-    match perform_actions(&shared, &signed.client, actions, false, false, display, display).await {
+    let result = perform_actions(&shared, &signed.client, actions, false, false, display, display)
+        .await
+        .map_err(http_error);
+    audit_row(&shared, &signed.client, "actions", &result, detail);
+    match result {
         Ok(result) => Json(result).into_response(),
-        Err(error) => http_error(error).into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -977,13 +1117,15 @@ async fn list_windows(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let _signed = signed_with!(shared, headers, peer, "view");
+    let signed = signed_with!(shared, headers, peer, "view");
     let display = query.get("display").filter(|d| !d.is_empty()).cloned();
     let listed = async {
         require_display(&shared, display.as_deref()).await?;
         shared.backend.call("windows", json!({})).await
     };
-    match listed.await {
+    let listed = listed.await;
+    audit_row(&shared, &signed.client, "windows", &listed, json!({ "display": display }));
+    match listed {
         Ok(answer) => {
             let windows = windows_on(&answer, display.as_deref());
             no_store(Json(json!({ "windows": windows })).into_response())
@@ -1013,13 +1155,20 @@ async fn focus_window(
     headers: HeaderMap,
     Body64(body): Body64,
 ) -> Response {
-    let signed = signed_with!(shared, headers, peer, "control");
+    let signed = signed_for!(shared, headers, peer, "control", "focus");
     let id = body.get("id").and_then(Value::as_str).unwrap_or("");
     if crate::winid::WindowId::parse(id).is_none() {
         return ApiError::bad_request("id must be a window id from GET /remote-control/windows")
             .into_response();
     }
-    match shared.backend.call("focus_window", json!({ "window": id })).await {
+    let focused = shared.backend.call("focus_window", json!({ "window": id })).await;
+    let app = focused
+        .as_ref()
+        .ok()
+        .and_then(|answer| answer.pointer("/window/app"))
+        .cloned();
+    audit_row(&shared, &signed.client, "focus", &focused, json!({ "app": app }));
+    match focused {
         Ok(answer) => {
             (shared.log)(&format!(
                 "[remote-control] focused a window for {}",
@@ -1088,7 +1237,13 @@ async fn wait_for_change(
     Body64(body): Body64,
 ) -> Response {
     let signed = signed_with!(shared, headers, peer, "view");
-    match run_wait(&shared, signed.client.id(), &body).await {
+    let waited = run_wait(&shared, signed.client.id(), &body).await;
+    let detail = match &waited {
+        Ok(answer) => json!({ "display": answer.get("display"), "changed": answer.get("changed") }),
+        Err(_) => json!({ "display": displays::named(body.get("display")) }),
+    };
+    audit_row(&shared, &signed.client, "wait", &waited, detail);
+    match waited {
         Ok(answer) => no_store(Json(answer).into_response()),
         Err(error) => error.into_response(),
     }
@@ -1236,6 +1391,8 @@ async fn frames(
         "[remote-control] live view started for {}",
         signed.client.name()
     ));
+    let viewer = Who::client(&signed.client, via_of(&shared));
+    let started = now_ms();
     let task_shared = shared.clone();
     tokio::spawn(async move {
         let shared = task_shared;
@@ -1345,6 +1502,7 @@ async fn frames(
             "[remote-control] live view ended for {}",
             signed.client.name()
         ));
+        audit_view(&shared, viewer, started, display, serde_json::Map::new());
     });
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
     let mut response = Response::new(body);
@@ -1465,6 +1623,13 @@ fn close_peer(shared: &Arc<Shared>, session: u64) {
             poll.abort();
         }
     }
+    audit_view(
+        shared,
+        peer.who.clone(),
+        peer.started,
+        lock(&peer.display).clone(),
+        std::mem::take(&mut *lock(&peer.input)),
+    );
     // Nothing more runs for this view. A button it still holds would stay down: let go of it
     // once the actions already running are done.
     peer.closed.store(true, Ordering::SeqCst);
@@ -1860,7 +2025,10 @@ async fn act(
     )
     .await;
     match &performed {
-        Ok(_) => settle_held(&mut lock(&peer.held_keys), actions),
+        Ok(_) => {
+            settle_held(&mut lock(&peer.held_keys), actions);
+            audit::view_input(actions, &mut lock(&peer.input));
+        }
         // A failed batch (input-blocked, screen-locked, an error part way, a refused action)
         // releases every key the view holds: it can't know which of its actions ran, so it
         // forgets its own (#2909).
@@ -2132,6 +2300,9 @@ async fn peer_offer(
         display: Mutex::new(display),
         follows: AtomicBool::new(follows),
         told: Mutex::new((None, Vec::new())),
+        who: Who::client(&signed.client, via_of(&shared)),
+        started: now_ms(),
+        input: Mutex::new(serde_json::Map::new()),
     });
     lock(&shared.peers).insert(session, entry);
     ensure_display_poll(&shared);
@@ -2174,8 +2345,56 @@ fn note(shared: &Shared, client: &Authenticated, transfer: Value) {
     }
 }
 
+/// The root folder's name a transfer used ("Downloads"), never its full path.
+fn folder_name(folder: &std::path::Path) -> Option<String> {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// What a clipboard's content is, for its activity row.
+fn clipboard_kind(content: &Value) -> Option<&'static str> {
+    match content.get("kind").and_then(Value::as_str)? {
+        "text" => Some("text"),
+        "image" => Some("image"),
+        "files" => Some("files"),
+        _ => None,
+    }
+}
+
 fn note_pulled(shared: &Shared, pulled: Option<Pulled>) {
     let Some(pulled) = pulled else { return };
+    if let Some(host) = shared.host.upgrade() {
+        let client = &pulled.client;
+        let text = |name: &str| {
+            client
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let who = Who {
+            client_id: text("id"),
+            client_name: text("name"),
+            machine: text("machine"),
+            actor: text("actor").unwrap_or_else(|| "person".into()),
+            via: via_of(shared).into(),
+        };
+        host.audit.note(
+            who,
+            "transfer",
+            Outcome::Ok,
+            None,
+            json!({
+                "op": "get",
+                "direction": "from-this-computer",
+                "files": pulled.names,
+                "count": pulled.count,
+                "bytes": pulled.size,
+                "folder": pulled.folder,
+            }),
+        );
+    }
     let name = pulled
         .client
         .get("name")
@@ -2210,14 +2429,21 @@ async fn run_transfer(
     client: &Authenticated,
     message: &Value,
 ) -> ApiResult<Value> {
+    let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     if !client.may("control") {
-        return Err(ApiError::coded(
+        let refused = Err(ApiError::coded(
             403,
             "view-only",
             "This client is not allowed to control",
         ));
+        let what = if clipboard_share::handles(kind) {
+            "clipboard"
+        } else {
+            "transfer"
+        };
+        audit_row(shared, client, what, &refused, json!({}));
+        return refused;
     }
-    let kind = message.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
         "xfer_begin" => files_work(|| shared.transfers.begin(session, message)),
         "xfer_chunk" => files_work(|| shared.transfers.chunk(session, message)),
@@ -2234,10 +2460,31 @@ async fn run_transfer(
                     client.name()
                 ));
                 note(shared, client, json!({ "kind": "image", "size": size }));
+                audit_row(
+                    shared,
+                    client,
+                    "transfer",
+                    &Ok::<(), ApiError>(()),
+                    json!({ "op": "paste-image", "direction": "to-this-computer", "count": 1, "bytes": size }),
+                );
                 Ok(json!({ "pasted": true }))
             }
             Ended::Stored => Ok(json!({ "stored": true })),
             Ended::Saved { name, folder, size } => {
+                audit_row(
+                    shared,
+                    client,
+                    "transfer",
+                    &Ok::<(), ApiError>(()),
+                    json!({
+                        "op": "send",
+                        "direction": "to-this-computer",
+                        "files": [name],
+                        "count": 1,
+                        "bytes": size,
+                        "folder": folder_name(&folder),
+                    }),
+                );
                 let folder = folder.to_string_lossy().into_owned();
                 (shared.log)(&format!(
                     "[remote-control] {} sent {name} ({size} bytes) to {folder}",
@@ -2301,6 +2548,19 @@ async fn run_transfer(
                 client,
                 json!({ "kind": "files", "count": names.len(), "name": names.first(), "size": group.size }),
             );
+            audit_row(
+                shared,
+                client,
+                "transfer",
+                &Ok::<(), ApiError>(()),
+                json!({
+                    "op": "paste-files",
+                    "direction": "to-this-computer",
+                    "files": names,
+                    "count": names.len(),
+                    "bytes": group.size,
+                }),
+            );
             Ok(json!({ "pasted": names.len() }))
         }
         "clipboard_watch" => {
@@ -2323,7 +2583,15 @@ async fn run_transfer(
             Ok(answer)
         }
         "clipboard_get" => {
-            let content = shared.backend.call("clipboard_read", json!({})).await?;
+            let content = shared.backend.call("clipboard_read", json!({})).await;
+            audit_row(
+                shared,
+                client,
+                "clipboard",
+                &content,
+                json!({ "direction": "read", "kind": content.as_ref().ok().and_then(clipboard_kind) }),
+            );
+            let content = content?;
             Ok(match shared.clipboard.announce(session, &content) {
                 Some(mut shown) => {
                     if let Some(fields) = shown.as_object_mut() {
@@ -2348,12 +2616,36 @@ async fn run_transfer(
             note_pulled(shared, pulled);
             Ok(json!({}))
         }
-        "fs_list" => files_work(|| file_browse::list(&shared.home, message)),
+        "fs_list" => {
+            let listed = files_work(|| file_browse::list(&shared.home, message));
+            let count = listed
+                .as_ref()
+                .ok()
+                .and_then(|answer| answer.get("entries"))
+                .and_then(Value::as_array)
+                .map(Vec::len);
+            audit_row(
+                shared,
+                client,
+                "transfer",
+                &listed,
+                json!({
+                    "op": "list",
+                    "direction": "from-this-computer",
+                    "count": count,
+                    "folder": message.get("folder"),
+                }),
+            );
+            listed
+        }
         "fs_pull" => {
             let (path, name, size) =
                 files_work(|| file_browse::pull_target(&shared.home, message))?;
             let batch = message.get("batch").and_then(Value::as_str);
-            let pull = shared.clipboard.offer_file(session, path, size, batch);
+            let folder = message.get("folder").and_then(Value::as_str);
+            let pull = shared
+                .clipboard
+                .offer_file(session, path, size, batch, folder);
             Ok(json!({ "pull": pull, "name": name, "size": size }))
         }
         _ => Err(ApiError::bad_request("Unknown message")),
@@ -2412,6 +2704,17 @@ async fn poll_clipboard(shared: &Arc<Shared>) -> ApiResult<()> {
             shared.clipboard.announce(&session, &content),
             session.parse::<u64>(),
         ) {
+            // A copy here went to that viewer: a read of this computer's clipboard.
+            let viewer = lock(&shared.peers).get(&number).map(|peer| peer.who.clone());
+            if let (Some(who), Some(host)) = (viewer, shared.host.upgrade()) {
+                host.audit.note(
+                    who,
+                    "clipboard",
+                    Outcome::Ok,
+                    None,
+                    json!({ "direction": "read", "kind": clipboard_kind(&content) }),
+                );
+            }
             send_to_peer(shared, number, message);
         }
     }
@@ -2716,6 +3019,9 @@ done
             display: Mutex::new(Some("1".into())),
             follows: AtomicBool::new(true),
             told: Mutex::new((None, Vec::new())),
+            who: Who::default(),
+            started: 0,
+            input: Mutex::new(serde_json::Map::new()),
         })
     }
 

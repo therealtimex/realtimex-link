@@ -37,6 +37,8 @@ struct Batch {
     client: Option<Value>,
     pending: HashSet<String>,
     done: Vec<(String, u64)>,
+    /// The folder a Get files selection came from ("Downloads"), for the activity log.
+    folder: Option<String>,
 }
 
 /// Files of this computer fetched to the end (one notice per batch).
@@ -46,6 +48,9 @@ pub struct Pulled {
     pub count: usize,
     pub name: String,
     pub size: u64,
+    /// Every file's name (not its path), and the folder they came from when picked with Get files.
+    pub names: Vec<String>,
+    pub folder: Option<String>,
 }
 
 #[derive(Default)]
@@ -103,6 +108,8 @@ impl State {
             count: batch.done.len(),
             name: first,
             size: batch.done.iter().map(|(_, size)| size).sum(),
+            names: batch.done.iter().map(|(name, _)| name.clone()).collect(),
+            folder: batch.folder,
         })
     }
 
@@ -139,6 +146,7 @@ impl State {
                 client: None,
                 pending: HashSet::new(),
                 done: Vec::new(),
+                folder: None,
             });
             entry.pending.insert(id.clone());
         }
@@ -359,19 +367,27 @@ impl ClipboardShare {
         }
     }
 
-    /// A file picked with Get files, in its selection's batch (one notice for all of it).
+    /// A file picked with Get files from `folder`, in its selection's batch (one notice for all
+    /// of it).
     pub fn offer_file(
         &self,
         session: &str,
         path: PathBuf,
         size: u64,
         batch: Option<&str>,
+        folder: Option<&str>,
     ) -> String {
         let batch: String = batch
             .filter(|b| !b.is_empty())
             .map_or_else(uuid, |b| b.chars().take(64).collect());
-        self.state()
-            .add_pull(session, Source::File(path), size, Some(batch), true)
+        let mut state = self.state();
+        let id = state.add_pull(session, Source::File(path), size, Some(batch.clone()), true);
+        if let Some(entry) = state.batches.get_mut(&format!("{session}:{batch}")) {
+            if entry.folder.is_none() {
+                entry.folder = folder.map(|f| f.chars().take(64).collect());
+            }
+        }
+        id
     }
 }
 
@@ -434,8 +450,8 @@ mod tests {
         std::fs::write(&a, "aa").unwrap();
         std::fs::write(&b, "bbb").unwrap();
         let share = ClipboardShare::default();
-        let first = share.offer_file("1", a, 2, Some("sel"));
-        let second = share.offer_file("1", b, 3, Some("sel"));
+        let first = share.offer_file("1", a, 2, Some("sel"), Some("Documents"));
+        let second = share.offer_file("1", b, 3, Some("sel"), Some("Documents"));
         let client = json!({ "name": "Laptop" });
         let (_, notice) = share
             .chunk("1", Some(&client), &json!({ "pull": first, "offset": 0 }))
@@ -449,6 +465,9 @@ mod tests {
             (notice.count, notice.size, notice.name.as_str()),
             (2, 5, "a.txt")
         );
+        // For the activity log: names only, and the folder they came from.
+        assert_eq!(notice.names, ["a.txt", "b.txt"]);
+        assert_eq!(notice.folder.as_deref(), Some("Documents"));
     }
 
     #[test]

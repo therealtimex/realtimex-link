@@ -222,6 +222,19 @@ kebab-case.
   `GET /v1/inbox?after=&limit=` (arrival order) → `{ items: [{ id, endpoint, receivedAt, method, path, headers,
   body (base64) }], total }`; `POST /v1/inbox/ack { exposureId, ids }` → `{ acked }`. Only the
   current account's deliveries are listed or acknowledged.
+- **`audit`** (realtimex-ai-app#3055 §1.4): the activity log, on this computer only (no remote
+  route reads it). `GET /v1/host/audit?before=<id>&limit=<1..200>&client=<id>&kind=<kind>` →
+  `{ entries: [{ id, at, clientId, clientName, machine, actor, via, kind, outcome, code, detail }],
+  next, retentionDays: 30, dropped }`, newest first, paged by `next`; `DELETE /v1/host/audit` →
+  `{ cleared }`, leaving one `audit-cleared` row. Kinds: `connect`, `access` (the owner's changes:
+  `allowed`, `denied`, `permission`, `blocked`, `allowed-again`, `removed`, `disconnected`,
+  `new-password`, about the client named in the row), `view`, `screenshot`, `actions`, `windows`,
+  `focus`, `wait`, `clipboard`, `transfer`, `ax-read`, `ax-act`, `audit-cleared`. `detail` holds
+  whitelisted keys only: never typed or pasted text, clipboard or file contents, element names or
+  values, window titles or credentials; a key only with a modifier or as a named key. Kept 30 days
+  and at most 50,000 rows; rows that couldn't be saved count in `dropped` (also the overview's
+  `auditDropped`): remote control never waits on the log. Schema 3 of `remote-host.db` only adds
+  the table, so an older Link still opens the file.
 - `PUT /v1/origin`, `/v1/shared`, `/v1/artifacts`, `/v1/webhooks` and `POST /v1/inbox/ack` name the
   adopted exposure; any other is 409 `exposure-mismatch`.
 - **Public request bodies** (413 beyond): `a` and `e` 1 MiB, `h` 15 MiB, `m` 50 MiB, `p` 10 MiB.

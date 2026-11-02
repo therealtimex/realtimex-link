@@ -4,6 +4,11 @@
 //!
 //! Schema 2 (realtimex-ai-app#2836 M3) adds `inbox`: webhook deliveries Link kept while RealTimeX
 //! wasn't running, until RealTimeX acknowledges them (inbox.rs).
+//!
+//! Schema 3 (realtimex-ai-app#3055) adds `audit`, the activity log (audit.rs). It only adds a
+//! table, so an older Link still opens the file and leaves the table alone: `schema_version`
+//! names the oldest schema that can read the file ([`COMPATIBLE_VERSION`]), `schema_level` the
+//! schema it has.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,7 +22,10 @@ use serde_json::Value;
 use crate::files;
 use crate::util::iso_now;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
+/// The oldest schema whose Link can use this file: `schema_version` says so, and a Link refuses
+/// only a file whose `schema_version` is newer than its own. Changes that only add tables leave it.
+pub const COMPATIBLE_VERSION: u32 = 2;
 pub const DB_FILE: &str = "remote-host.db";
 
 #[derive(Debug)]
@@ -53,18 +61,22 @@ impl Store {
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         )?;
-        let version: u32 = db
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(0);
-        if version > SCHEMA_VERSION {
-            return Err(StoreTooNew(version).into());
+        let read = |key: &str| -> Result<u32> {
+            Ok(db
+                .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(0))
+        };
+        let compatible = read("schema_version")?;
+        if compatible > SCHEMA_VERSION {
+            return Err(StoreTooNew(compatible).into());
         }
+        // What the file has: an older Link writes schema_version only (and back to its own after
+        // a newer one added tables), so the level is the larger of the two.
+        let version = compatible.max(read("schema_level")?);
         if version < 1 {
             db.execute_batch(
                 "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)",
@@ -88,7 +100,31 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS inbox_received ON inbox (received_at);",
             )?;
         }
-        set_meta(&db, "schema_version", &SCHEMA_VERSION.to_string())?;
+        if version < 3 {
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS audit (
+                    id INTEGER PRIMARY KEY,
+                    at INTEGER NOT NULL,
+                    client_id TEXT,
+                    client_name TEXT,
+                    machine TEXT,
+                    actor TEXT,
+                    via TEXT,
+                    kind TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    code TEXT,
+                    detail TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS audit_at ON audit (at);
+                 CREATE INDEX IF NOT EXISTS audit_client ON audit (client_id, id);",
+            )?;
+        }
+        set_meta(
+            &db,
+            "schema_version",
+            &compatible.max(COMPATIBLE_VERSION).to_string(),
+        )?;
+        set_meta(&db, "schema_level", &SCHEMA_VERSION.to_string())?;
         Ok(Self {
             db: Mutex::new(db),
             changes: Mutex::default(),
@@ -353,6 +389,122 @@ impl Store {
     }
 }
 
+/// A row of the activity log as stored (audit.rs decides what it may hold).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditRow {
+    /// Given by SQLite when saved (0 before).
+    pub id: i64,
+    pub at: i64,
+    pub client_id: Option<String>,
+    pub client_name: Option<String>,
+    pub machine: Option<String>,
+    pub actor: String,
+    pub via: String,
+    pub kind: String,
+    pub outcome: String,
+    pub code: Option<String>,
+    /// JSON, or None for no detail.
+    pub detail: Option<String>,
+}
+
+impl Store {
+    /// Save these rows together (one transaction).
+    pub fn audit_insert(&self, rows: &[AuditRow]) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO audit (at, client_id, client_name, machine, actor, via, kind, outcome, code, detail) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for row in rows {
+                insert.execute(params![
+                    row.at,
+                    row.client_id,
+                    row.client_name,
+                    row.machine,
+                    row.actor,
+                    row.via,
+                    row.kind,
+                    row.outcome,
+                    row.code,
+                    row.detail
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Up to `limit` rows older than `before` (an id), newest first, of `client` and `kind` when
+    /// given; and the cursor for the next page (None when nothing older matches).
+    pub fn audit_page(
+        &self,
+        before: Option<i64>,
+        limit: usize,
+        client: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<(Vec<AuditRow>, Option<i64>)> {
+        let db = self.db();
+        let mut statement = db.prepare(
+            "SELECT id, at, client_id, client_name, machine, actor, via, kind, outcome, code, detail \
+             FROM audit WHERE id < ?1 AND (?2 IS NULL OR client_id = ?2) AND (?3 IS NULL OR kind = ?3) \
+             ORDER BY id DESC LIMIT ?4",
+        )?;
+        // One more than asked: whether there is a next page.
+        let rows = statement.query_map(
+            params![before.unwrap_or(i64::MAX), client, kind, limit as i64 + 1],
+            |row| {
+                Ok(AuditRow {
+                    id: row.get(0)?,
+                    at: row.get(1)?,
+                    client_id: row.get(2)?,
+                    client_name: row.get(3)?,
+                    machine: row.get(4)?,
+                    actor: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    via: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    kind: row.get(7)?,
+                    outcome: row.get(8)?,
+                    code: row.get(9)?,
+                    detail: row.get(10)?,
+                })
+            },
+        )?;
+        let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next = if rows.len() > limit {
+            rows.truncate(limit);
+            rows.last().map(|row| row.id)
+        } else {
+            None
+        };
+        Ok((rows, next))
+    }
+
+    /// Delete every row; answers how many there were.
+    pub fn audit_clear(&self) -> Result<u64> {
+        Ok(self.db().execute("DELETE FROM audit", [])? as u64)
+    }
+
+    /// Rows from before `before` (ms), and all but the newest `keep`, go; answers how many went.
+    pub fn audit_prune(&self, before: i64, keep: i64) -> Result<usize> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let mut removed = tx.execute("DELETE FROM audit WHERE at < ?1", [before])?;
+        removed += tx.execute(
+            "DELETE FROM audit WHERE id <= (SELECT id FROM audit ORDER BY id DESC LIMIT 1 OFFSET ?1)",
+            [keep],
+        )?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Writes to the log fail from now on (audit.rs's dropped counter).
+    #[cfg(test)]
+    pub fn audit_break_for_test(&self) {
+        self.db().execute_batch("DROP TABLE audit").unwrap();
+    }
+}
+
 fn set_state(db: &Connection, key: &str, value: &Value) -> Result<()> {
     if value.is_null() {
         bail!("No value to save for {key}");
@@ -399,6 +551,42 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn the_activity_log_is_added_and_an_older_link_can_still_open_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store.db().execute_batch("DROP TABLE audit").unwrap();
+            store.db().execute("DELETE FROM meta WHERE key = 'schema_level'", []).unwrap();
+        }
+        // A schema-2 file gains the table; it still says schema 2 is enough to read it.
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.meta_get("schema_version").as_deref(), Some("2"));
+        assert_eq!(store.meta_get("schema_level").as_deref(), Some("3"));
+        assert_eq!(store.audit_page(None, 10, None, None).unwrap().0.len(), 0);
+        // An older Link opening it writes schema_version 2 again and leaves the table: the next
+        // open keeps the rows.
+        store
+            .audit_insert(&[AuditRow {
+                id: 0,
+                at: 1,
+                client_id: None,
+                client_name: None,
+                machine: None,
+                actor: "owner".into(),
+                via: "local".into(),
+                kind: "access".into(),
+                outcome: "ok".into(),
+                code: None,
+                detail: None,
+            }])
+            .unwrap();
+        store.meta_set("schema_version", "2").unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.audit_page(None, 10, None, None).unwrap().0.len(), 1);
     }
 
     #[test]
