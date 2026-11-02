@@ -970,8 +970,8 @@ mod tests {
     }
 
     /// Elsewhere than macOS under the supervisor, a detected helper is available.
-    #[test]
-    fn a_detected_helper_is_available_without_a_supervisor() {
+    #[tokio::test]
+    async fn a_detected_helper_is_available_without_a_supervisor() {
         let backend = Backend::with_detected(Detected {
             binary: Some(PathBuf::from("/nonexistent/rtx-control")),
             reason: None,
