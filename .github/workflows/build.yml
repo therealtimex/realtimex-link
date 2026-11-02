@@ -159,6 +159,9 @@ jobs:
         timeout-minutes: 15
         run: |
           cargo test --locked -p rtx-linkd -- launchd:: unattended:: autostart::
+          # The change-detection thumbnail and the agents' window floor (#3055): rtx-screens has no
+          # libvpx, so it is quick here, on the runner every test build has.
+          cargo test --locked -p rtx-screens -- macos::tests
       - name: Build (Windows)
         if: matrix.script == 'windows'
         shell: pwsh
