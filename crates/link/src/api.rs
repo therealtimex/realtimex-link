@@ -110,6 +110,8 @@ pub struct Api {
     token: String,
     agent: ureq::Agent,
     pub version: String,
+    /// The daemon's local API features (GET /v1/version): the window offers only what it has.
+    pub features: Vec<String>,
 }
 
 /// The daemon answered with an error: its status, and its message (what the error shows).
@@ -151,6 +153,7 @@ impl Api {
             token,
             agent,
             version: String::new(),
+            features: Vec::new(),
         };
         let version = api.get("/v1/version")?;
         if version.get("protocol").and_then(Value::as_u64) != Some(PROTOCOL) {
@@ -161,6 +164,16 @@ impl Api {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        api.features = version
+            .get("features")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(api)
     }
 
@@ -232,6 +245,20 @@ impl Api {
         Self::answer(
             self.agent
                 .get(format!("{}{path}", self.base))
+                .header("Authorization", format!("Bearer {}", self.token))
+                .call(),
+        )
+    }
+
+    /// Whether the daemon has this local API feature.
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+
+    pub fn delete(&self, path: &str) -> Result<Value> {
+        Self::answer(
+            self.agent
+                .delete(format!("{}{path}", self.base))
                 .header("Authorization", format!("Bearer {}", self.token))
                 .call(),
         )
@@ -351,7 +378,7 @@ mod tests {
     }
 
     fn api(base: String, timeout: Duration) -> Api {
-        Api { base, token: "t".into(), agent: agent(timeout), version: String::new() }
+        Api { base, token: "t".into(), agent: agent(timeout), version: String::new(), features: Vec::new() }
     }
 
     /// Review of !13: an answer later than the usual deadline (the person at the macOS password

@@ -283,6 +283,8 @@ pub enum Icon {
     Gear,
     /// Lucide's "arrow-left".
     ArrowLeft,
+    /// Lucide's "trash-2" (the Activity tab's Clear…).
+    Trash,
 }
 
 /// RealTimeX's ghost icon button (variant="ghost" size="icon"): no fill until hovered, the focus
@@ -306,7 +308,76 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response
             );
         }
         let stroke = Stroke::new(1.6, tokens.text);
-        let center = rect.center();
+        paint_icon(painter, icon, rect.center(), stroke);
+    }
+    response.on_hover_text(label)
+}
+
+/// A button with an icon before its text (RealTimeX's outline button with a leading icon).
+pub fn icon_text_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> egui::Response {
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let padding = ui.spacing().button_padding;
+    let size = egui::vec2(
+        padding.x * 2.0 + ICON_SIZE + 6.0 + galley.size().x,
+        CONTROL_HEIGHT.max(galley.size().y + padding.y * 2.0),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), text));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            CONTROL_RADIUS,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        if response.has_focus() {
+            painter.rect_stroke(
+                rect,
+                CONTROL_RADIUS,
+                Stroke::new(FOCUS_WIDTH, tokens(ui).link),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let color = if ui.is_enabled() {
+            visuals.text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let icon_center = egui::pos2(rect.left() + padding.x + ICON_SIZE / 2.0, rect.center().y);
+        paint_icon(painter, icon, icon_center, Stroke::new(1.5, color));
+        let text_pos = egui::pos2(
+            rect.left() + padding.x + ICON_SIZE + 6.0,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        painter.galley(text_pos, galley, color);
+    }
+    response
+}
+
+/// How wide `icon_text_button` draws `text`.
+pub fn icon_text_button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    ui.spacing().button_padding.x * 2.0 + ICON_SIZE + 6.0 + galley.size().x
+}
+
+/// An icon's size: 16 pt across, Lucide's 24 scaled.
+const ICON_SIZE: f32 = 16.0;
+
+fn paint_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, stroke: Stroke) {
+    {
         match icon {
             Icon::Gear => {
                 // Eight teeth around a ring, and the hole: 16 pt across, Lucide's 24 scaled.
@@ -339,9 +410,17 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response
                     stroke,
                 );
             }
+            Icon::Trash => {
+                let p = |x: f32, y: f32| center + egui::vec2(x, y);
+                // The lid, its handle, the can and two slats.
+                painter.line_segment([p(-6.5, -4.0), p(6.5, -4.0)], stroke);
+                painter.line(vec![p(-2.5, -4.0), p(-2.5, -6.5), p(2.5, -6.5), p(2.5, -4.0)], stroke);
+                painter.line(vec![p(-5.0, -4.0), p(-4.2, 6.5), p(4.2, 6.5), p(5.0, -4.0)], stroke);
+                painter.line_segment([p(-1.6, -1.0), p(-1.6, 4.0)], stroke);
+                painter.line_segment([p(1.6, -1.0), p(1.6, 4.0)], stroke);
+            }
         }
     }
-    response.on_hover_text(label)
 }
 
 /// The on/off switch, as RealTimeX draws it: a --theme-button-primary track with a white knob when
