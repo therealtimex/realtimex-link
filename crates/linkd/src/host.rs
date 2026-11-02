@@ -1123,6 +1123,11 @@ impl Host {
         self.relay.stop();
         self.close_listener().await;
         self.backend.dispose();
+        // Accessibility reads still adding up to their minute become rows now, and the writer
+        // saves what it has (at most 5 s); a crash still loses them (the log is best-effort).
+        self.audit.flush_reads(true);
+        let audit = self.audit.clone();
+        let _ = tokio::task::spawn_blocking(move || audit.flush()).await;
     }
 
     /// End the open live views of clients `matches` accepts.
