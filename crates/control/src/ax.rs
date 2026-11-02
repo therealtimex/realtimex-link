@@ -21,8 +21,10 @@
 //! - **Crashes:** no JSON envelope is `ax-crashed` (rtx-linkd answers reads `unavailable` and
 //!   actions `ax-failed`, delivery unknown). Three crashes or timeouts within 60 s switch `ax` off
 //!   for 5 minutes (`unavailable`, `retryAfterMs` the time left).
-//! - **Version:** the first call of each process checks `agent-desktop version` is the pinned one;
-//!   otherwise `ax` is `unavailable` ("reinstall RealTimeX Link").
+//! - **Version:** before its first call, each process checks `agent-desktop version` is the pinned
+//!   one, with a budget of its own (`VERSION_CHECK`; rtx-linkd waits that much longer), so the
+//!   check never eats into the call's deadline. A pass is kept for the process; a failure answers
+//!   `unavailable` ("reinstall RealTimeX Link") and is checked again after `VERSION_RETRY`.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -44,6 +46,10 @@ const BREAKER_OPEN: Duration = Duration::from_secs(5 * 60);
 /// keep the pipe open).
 const DRAIN: Duration = Duration::from_millis(500);
 const POLL: Duration = Duration::from_millis(10);
+/// The version check's own budget (rtx-linkd's `VERSION_CHECK` waits for it).
+pub const VERSION_CHECK: Duration = Duration::from_secs(5);
+/// After a failed version check, `ax` is off this long, then checked again.
+pub const VERSION_RETRY: Duration = Duration::from_secs(60);
 
 /// The subcommands rtx-linkd may run, each with the flags it may pass and how many values
 /// (after `--`) it takes; the first value of a ref command is a ref.
@@ -484,6 +490,50 @@ pub fn is_pinned(envelope: &Value) -> bool {
     version.trim_start_matches('v') == PINNED_VERSION
 }
 
+/// This process's version check: not run yet, passed (kept), or failed at a time (run again
+/// after VERSION_RETRY).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Version {
+    #[default]
+    Unchecked,
+    Pinned,
+    Failed(Instant),
+}
+
+impl Version {
+    /// Whether the check runs before this call, or how long `ax` stays off.
+    pub fn due(self, now: Instant) -> Result<bool, Duration> {
+        match self {
+            Version::Unchecked => Ok(true),
+            Version::Pinned => Ok(false),
+            Version::Failed(at) => {
+                let again = at + VERSION_RETRY;
+                if now >= again {
+                    Ok(true)
+                } else {
+                    Err(again - now)
+                }
+            }
+        }
+    }
+
+    /// The check's result, as of `now`.
+    pub fn checked(pinned: bool, now: Instant) -> Self {
+        if pinned {
+            Version::Pinned
+        } else {
+            Version::Failed(now)
+        }
+    }
+}
+
+fn wrong_version() -> Value {
+    failure(
+        "unavailable",
+        format!("agent-desktop isn't version {PINNED_VERSION}: reinstall RealTimeX Link"),
+    )
+}
+
 /// A finished call, for the control loop to answer.
 pub struct Done {
     pub id: Value,
@@ -494,8 +544,8 @@ pub struct Done {
 pub struct Ax {
     binary: Option<PathBuf>,
     busy: Arc<AtomicBool>,
-    /// The version check of this process: None until the first call has run it.
-    version: Arc<Mutex<Option<bool>>>,
+    /// The version check of this process.
+    version: Arc<Mutex<Version>>,
     breaker: Breaker,
 }
 
@@ -504,7 +554,7 @@ impl Default for Ax {
         Self {
             binary: None,
             busy: Arc::new(AtomicBool::new(false)),
-            version: Arc::new(Mutex::new(None)),
+            version: Arc::new(Mutex::new(Version::Unchecked)),
             breaker: Breaker::default(),
         }
     }
@@ -548,6 +598,16 @@ impl Ax {
                 "agent-desktop isn't installed with RealTimeX Link: reinstall RealTimeX Link",
             ));
         };
+        // A failed version check: off until it is due again.
+        let check = self.version.lock().unwrap_or_else(|p| p.into_inner()).due(Instant::now());
+        let check = match check {
+            Ok(check) => check,
+            Err(left) => {
+                let mut body = wrong_version();
+                body["retryAfterMs"] = json!(left.as_millis() as u64);
+                return Some(body);
+            }
+        };
         if self.busy.swap(true, Ordering::SeqCst) {
             let mut body = failure("busy", "Another accessibility call is running");
             body["retryAfterMs"] = json!(500);
@@ -571,24 +631,23 @@ impl Ax {
                     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
                 }
             }
-            let checked = *version.lock().unwrap_or_else(|p| p.into_inner());
-            let pinned = checked.unwrap_or_else(|| {
-                let run = run_cli(&binary, &["version".to_string()], LIST, state_dir.as_deref());
+            // Its own budget, before the call's: the call keeps its whole deadline.
+            let pinned = !check || {
+                let run = run_cli(&binary, &["version".to_string()], VERSION_CHECK, state_dir.as_deref());
                 let ok = envelope(&run.stdout).is_some_and(|e| is_pinned(&e));
                 if !ok {
-                    eprintln!("[ax] agent-desktop isn't version {PINNED_VERSION}: accessibility is off");
+                    eprintln!(
+                        "[ax] agent-desktop isn't version {PINNED_VERSION}: accessibility is off for {} s",
+                        VERSION_RETRY.as_secs()
+                    );
                 }
-                *version.lock().unwrap_or_else(|p| p.into_inner()) = Some(ok);
+                *version.lock().unwrap_or_else(|p| p.into_inner()) = Version::checked(ok, Instant::now());
                 ok
-            });
+            };
             let reply = if !pinned {
-                Reply {
-                    body: failure(
-                        "unavailable",
-                        format!("agent-desktop isn't version {PINNED_VERSION}: reinstall RealTimeX Link"),
-                    ),
-                    failed: false,
-                }
+                let mut body = wrong_version();
+                body["retryAfterMs"] = json!(VERSION_RETRY.as_millis() as u64);
+                Reply { body, failed: false }
             } else {
                 reply_of(run_cli(&binary, &argv, timeout, state_dir.as_deref()))
             };
@@ -660,6 +719,18 @@ mod tests {
         let left = breaker.open(start + Duration::from_secs(91)).unwrap();
         assert!(left > Duration::from_secs(298) && left <= BREAKER_OPEN);
         assert_eq!(breaker.open(start + Duration::from_secs(91) + BREAKER_OPEN), None);
+    }
+
+    #[test]
+    fn the_version_check_backs_off_then_tries_again() {
+        let start = Instant::now();
+        assert_eq!(Version::Unchecked.due(start), Ok(true));
+        assert_eq!(Version::Pinned.due(start), Ok(false));
+        let failed = Version::checked(false, start);
+        let left = failed.due(start + Duration::from_secs(10)).unwrap_err();
+        assert_eq!(left, VERSION_RETRY - Duration::from_secs(10));
+        assert_eq!(failed.due(start + VERSION_RETRY), Ok(true));
+        assert_eq!(Version::checked(true, start), Version::Pinned);
     }
 
     #[test]
@@ -780,6 +851,63 @@ mod tests {
             let off = ax.start(json!(3), &request, |_| {}).unwrap();
             assert_eq!(off["code"], "unavailable");
             assert!(off["retryAfterMs"].as_u64().unwrap() > 0);
+        }
+
+        /// A version that fails once is checked again after VERSION_RETRY, and a pass is kept.
+        #[test]
+        fn a_failed_version_check_is_tried_again_later() {
+            let dir = std::env::temp_dir().join(format!("rtx-ax-{}-flaky", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("agent-desktop");
+            let seen = dir.join("seen");
+            // The first `version` answers nothing (not ready yet); later ones the pinned version.
+            std::fs::write(
+                &path,
+                format!(
+                    concat!(
+                        "#!/bin/sh\n",
+                        "if [ \"$1\" = version ]; then\n",
+                        "  if [ -e '{seen}' ]; then echo '{{\"ok\":true,\"data\":{{\"version\":\"{pinned}\"}}}}'; else touch '{seen}'; fi\n",
+                        "  exit 0\n",
+                        "fi\n",
+                        "echo \"$1\" >> '{calls}'\n",
+                        "echo '{{\"ok\":true,\"data\":[]}}'\n",
+                    ),
+                    pinned = PINNED_VERSION,
+                    seen = seen.display(),
+                    calls = dir.join("calls").display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut ax = Ax::with_binary(path);
+            let (send, receive) = mpsc::channel();
+            let request = json!({ "argv": ["list-apps"] });
+            let first = send.clone();
+            assert!(ax.start(json!(1), &request, move |done| first.send(done).unwrap()).is_none());
+            let done = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(done.reply.body["code"], "unavailable");
+            assert!(!done.reply.failed);
+            // Off for now, answered at once (no CLI run), with the time left.
+            let off = ax.start(json!(2), &request, |_| {}).unwrap();
+            assert_eq!(off["code"], "unavailable");
+            let left = off["retryAfterMs"].as_u64().unwrap();
+            assert!(left > 50_000 && left <= VERSION_RETRY.as_millis() as u64, "{left}");
+            assert!(!dir.join("calls").exists());
+            // A minute later it is checked again, passes, and the call runs.
+            *ax.version.lock().unwrap() = Version::Failed(Instant::now() - VERSION_RETRY);
+            let second = send.clone();
+            assert!(ax.start(json!(3), &request, move |done| second.send(done).unwrap()).is_none());
+            let done = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(done.reply.body["ok"], true);
+            assert_eq!(*ax.version.lock().unwrap(), Version::Pinned);
+            // Kept: the next call doesn't check again.
+            let _ = std::fs::remove_file(&seen);
+            let third = send;
+            assert!(ax.start(json!(4), &request, move |done| third.send(done).unwrap()).is_none());
+            assert_eq!(receive.recv_timeout(Duration::from_secs(5)).unwrap().reply.body["ok"], true);
+            assert_eq!(std::fs::read_to_string(dir.join("calls")).unwrap().lines().count(), 2);
         }
 
         #[test]
