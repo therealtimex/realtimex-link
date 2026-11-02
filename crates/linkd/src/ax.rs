@@ -1134,6 +1134,26 @@ fn likely_actions(role: &str) -> Vec<&'static str> {
     }
 }
 
+/// Several matches, one of them named exactly as asked: the same query again, with `--exact`,
+/// for two results. Only when it finds exactly one is that one the target; a first search cut at
+/// six matches can't tell whether another exact one comes later (Review of QA round 1).
+async fn exactly_one<D: Desktop>(
+    desktop: &D,
+    ax: &Ax,
+    caller: &Caller,
+    target: &Target,
+    query: &Value,
+    budget: Budget,
+) -> ApiResult<Option<Value>> {
+    let mut exact = query.clone();
+    exact["exact"] = Value::Bool(true);
+    let found = find_in(desktop, ax, caller, target, &exact, 2, budget).await?;
+    Ok(match found.as_slice() {
+        [one] if exact_match(&found, query).is_some() => Some(one.clone()),
+        _ => None,
+    })
+}
+
 /// Of several matches, the one named exactly as the query's `name` (ignoring case and spaces
 /// around it), when only one is: `find --name Clear` acts on "Clear", not "Clear entry" or
 /// "Clear all memory" (QA of realtimex-ai-app#3055).
@@ -1452,16 +1472,9 @@ pub async fn act<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value
     let value = body.get("value").and_then(Value::as_str);
     let entry = ax.lookup(&caller.owner, reference)?;
     let acted = act_on(desktop, &entry, reference, action, value, !caller.local, Budget::default()).await?;
-    let mut answer = json!({
-        "ref": reference,
-        "action": action,
-        "via": acted.via,
-        "delivery": if acted.delivery == Delivery::Done { "done" } else { "unknown" },
-    });
-    if let Some(value) = acted.value {
-        answer["value"] = value;
-    }
-    Ok((answer, entry, acted.via))
+    let via = acted.via;
+    let answer = acted_json(reference, action, &entry.role, acted);
+    Ok((answer, entry, via))
 }
 
 /// What a batch step is.
@@ -1624,13 +1637,14 @@ async fn act_step<D: Desktop>(
     let action = text_field(act, "action").unwrap_or("");
     let value = act.get("value").and_then(Value::as_str);
     let acted = act_on(desktop, &entry, reference, action, value, !caller.local, budget).await;
+    let role = entry.role.clone();
     notes.push(Note::Act {
         entry: Some(entry),
         action: action.to_string(),
         via: acted.as_ref().ok().map(|a| a.via),
         error: acted.as_ref().err().cloned(),
     });
-    acted.map(|acted| acted_json(reference, action, acted))
+    acted.map(|acted| acted_json(reference, action, &role, acted))
 }
 
 /// One step of a batch, within `budget`; its rows go to `notes` as they happen.
@@ -1667,9 +1681,15 @@ async fn run_step<D: Desktop>(
         Step::Find { query, then } => {
             notes.push(Note::Read { window: target.window.clone(), app: target.app.clone() });
             let matches = find_in(desktop, ax, caller, target, query, CANDIDATES as u64 + 1, budget).await?;
+            let exact = match matches.as_slice() {
+                [_, _, ..] if (*then).is_some_and(|t| !t.is_null()) && exact_match(&matches, query).is_some() => {
+                    exactly_one(desktop, ax, caller, target, query, budget).await?
+                }
+                _ => None,
+            };
             let chosen = match matches.as_slice() {
                 [one] => Some(one),
-                many => exact_match(many, query),
+                _ => exact.as_ref(),
             };
             match ((*then).filter(|t| !t.is_null()), matches.as_slice(), chosen) {
                 (None, _, _) => Ok(json!({ "matches": matches })),
@@ -1686,10 +1706,13 @@ async fn run_step<D: Desktop>(
     }
 }
 
-fn acted_json(reference: &str, action: &str, acted: Acted) -> Value {
+/// An act's answer. `role`: the element's role when its ref was handed out (never a name or
+/// value), so a caller logs what was acted on, also for a batch's find-then-act.
+fn acted_json(reference: &str, action: &str, role: &str, acted: Acted) -> Value {
     let mut answer = json!({
         "ref": reference,
         "action": action,
+        "role": role,
         "via": acted.via,
         "delivery": if acted.delivery == Delivery::Done { "done" } else { "unknown" },
     });
@@ -2517,26 +2540,70 @@ mod tests {
     fn find_then_acts_on_the_one_named_exactly() {
         let ax = Ax::new(None);
         let c1 = caller("c1");
+        let button = |r: &str, name: &str| json!({ "interactive": true, "ref_id": r, "role": "button", "name": name, "states": [] });
         let clears = ok(json!({ "matches": [
-            { "interactive": true, "ref_id": "@f1:e1", "role": "button", "name": "Clear all memory", "states": [] },
-            { "interactive": true, "ref_id": "@f1:e2", "role": "button", "name": "Clear entry", "states": [] },
-            { "interactive": true, "ref_id": "@f1:e3", "role": "button", "name": " clear ", "states": [] },
+            button("@f1:e1", "Clear all memory"), button("@f1:e2", "Clear entry"), button("@f1:e3", " clear "),
         ]}));
-        let body = json!({ "window": "m:42", "steps": [{ "find": { "name": "Clear" }, "then": { "action": "click" } }] });
-        let fake = Fake::new(vec![clears.clone(), ok(json!({ "disposition": { "delivery": "delivered_verified" } }))]);
+        let body = json!({ "window": "m:42", "steps": [{ "find": { "role": "button", "name": "Clear" }, "then": { "action": "click" } }] });
+        // Calculator: one exact Clear among the substring matches, confirmed by an --exact search.
+        let fake = Fake::new(vec![
+            clears.clone(),
+            ok(json!({ "matches": [button("@f2:e1", "Clear")] })),
+            ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
+        ]);
         let (answer, _) = block(batch(&fake, &ax, &c1, &body)).unwrap();
         assert_eq!(answer["results"][0]["ok"], true, "{answer}");
-        assert_eq!(answer["results"][0]["data"]["ref"], "@f1:e3");
-        assert_eq!(fake.calls()[1], vec!["click", "--", "@f1:e3"]);
-        // No exact one (or two of them): still ambiguous.
+        assert_eq!(answer["results"][0]["data"]["ref"], "@f2:e1");
+        assert_eq!(answer["results"][0]["data"]["role"], "button");
+        let again = &fake.calls()[1];
+        assert!(again.contains(&"--exact".to_string()) && again.contains(&"--limit=2".to_string()), "{again:?}");
+        assert!(again.contains(&"--role=button".to_string()), "the query's other constraints stay: {again:?}");
+        assert_eq!(fake.calls()[2], vec!["click", "--", "@f2:e1"]);
+        // Another exact Clear past the first search's six: the --exact search finds two, so it
+        // stays ambiguous and nothing acts.
+        let six = ok(json!({ "matches": [
+            button("@f3:e1", "Clear"), button("@f3:e2", "Clear entry"), button("@f3:e3", "Clear history"),
+            button("@f3:e4", "Clear all memory"), button("@f3:e5", "Clear selection"), button("@f3:e6", "Clear formatting"),
+        ]}));
+        let fake = Fake::new(vec![six, ok(json!({ "matches": [button("@f4:e1", "Clear"), button("@f4:e2", "Clear")] }))]);
+        let (answer, _) = block(batch(&fake, &ax, &c1, &body)).unwrap();
+        assert_eq!(answer["results"][0]["error"]["code"], "ambiguous-target", "{answer}");
+        assert_eq!(fake.calls().len(), 2, "no act: {:?}", fake.calls());
+        assert!(fake.calls().iter().all(|call| call[0] == "find"));
+        // No exact one: ambiguous at once, without a second search.
         let body = json!({ "window": "m:42", "steps": [{ "find": { "name": "Cle" }, "then": { "action": "click" } }] });
         let fake = Fake::new(vec![clears]);
         let (answer, _) = block(batch(&fake, &ax, &c1, &body)).unwrap();
         assert_eq!(answer["results"][0]["error"]["code"], "ambiguous-target");
+        assert_eq!(fake.calls().len(), 1);
         // `exact: true` goes to agent-desktop as --exact.
         let fake = Fake::new(vec![ok(json!({ "matches": [] }))]);
         block(find(&fake, &ax, &c1, &json!({ "window": "m:42", "name": "Clear", "exact": true }))).unwrap();
         assert!(fake.calls()[0].contains(&"--exact".to_string()), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn an_act_answer_names_the_role_never_the_name() {
+        let ax = Ax::new(None);
+        let c1 = caller("c1");
+        let fake = Fake::new(vec![ok(tree()), ok(json!({ "disposition": { "delivery": "delivered_verified" } }))]);
+        block(snapshot_of(&fake, &ax, "c1"));
+        let (answer, _, _) = block(act(&fake, &ax, &c1, &json!({ "ref": "@s1:e1", "action": "click" }))).unwrap();
+        assert_eq!(answer["role"], "button");
+        assert!(answer.get("name").is_none());
+        // A mixed batch: each acting step says its own role.
+        let fake = Fake::new(vec![
+            ok(json!({ "matches": [{ "interactive": true, "ref_id": "@f5:e1", "role": "button", "name": "7", "states": [] }] })),
+            ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
+            ok(json!({ "disposition": { "delivery": "delivered_verified" } })),
+        ]);
+        let body = json!({ "window": "m:42", "steps": [
+            { "find": { "name": "7" }, "then": { "action": "click" } },
+            { "act": { "ref": "@s1:e2", "action": "set-value", "value": "1" } },
+        ]});
+        let (answer, _) = block(batch(&fake, &ax, &c1, &body)).unwrap();
+        assert_eq!(answer["results"][0]["data"]["role"], "button", "{answer}");
+        assert_eq!(answer["results"][1]["data"]["role"], "textfield", "{answer}");
     }
 
     #[test]
