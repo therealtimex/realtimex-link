@@ -1142,7 +1142,11 @@ impl LinkApp {
                 let combo_response = if whole {
                     combo.response.clone()
                 } else {
-                    combo.response.clone().on_hover_text(selected.as_str())
+                    // Wrapped inside the window too: a tooltip as wide as the name ran past it.
+                    combo.response.clone().on_hover_ui(|ui| {
+                        ui.set_max_width(list_width(ui.ctx().content_rect().width()));
+                        ui.add(egui::Label::new(selected.as_str()).wrap());
+                    })
                 };
                 keep_focus(&mut self.open_combo, ctx, &combo_response);
                 if focus_filter && ready {
