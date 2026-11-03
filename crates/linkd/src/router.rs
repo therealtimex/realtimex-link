@@ -162,6 +162,10 @@ pub struct Shared {
     host: Weak<Host>,
     /// The Public Exposure listener (see the module comment).
     public: bool,
+    /// The local API's `/v1/rc/*` (realtimex-ai-app#3095): an agent on this computer, named by
+    /// `X-RTX-Caller`, behind the local API's own token. No sign-in, no client record, and no
+    /// "Allow remote control" or listener: localhost is not remote control.
+    local: bool,
     backend: Arc<Backend>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
     failures: Mutex<HashMap<String, Vec<i64>>>,
@@ -220,10 +224,12 @@ impl Listener {
     }
 }
 
-/// The state behind one set of Remote Control routes (`public`: the Public Exposure relay's).
+/// The state behind one set of Remote Control routes (`public`: the Public Exposure relay's;
+/// `local`: the local API's `/v1/rc/*`).
 fn new_shared(
     host: Weak<Host>,
     public: bool,
+    local: bool,
     log: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> std::io::Result<Arc<Shared>> {
     let backend = host
@@ -234,6 +240,7 @@ fn new_shared(
     let shared = Arc::new(Shared {
         host,
         public,
+        local,
         backend,
         log,
         failures: Mutex::new(HashMap::new()),
@@ -290,6 +297,44 @@ fn routes(shared: &Arc<Shared>) -> Router {
         .with_state(shared.clone())
 }
 
+/// The routes an agent on this computer uses under the local API's `/v1/rc` (realtimex-ai-app
+/// #3095): the same handlers as `/remote-control/*`, without its sign-in (`connect`,
+/// `connect/requests*`), the MJPEG and WebRTC live views (`frames`, `peer/offer`) and `ax/*`
+/// (served at `/v1/ax/*`).
+fn local_router(shared: &Arc<Shared>) -> Router {
+    Router::new()
+        .route("/hello", get(hello))
+        .route("/status", get(status))
+        .route("/screenshot", post(screenshot))
+        .route("/displays", get(list_displays))
+        .route("/windows", get(list_windows))
+        .route("/windows/focus", post(focus_window))
+        .route("/wait", post(wait_for_change))
+        .route("/actions", post(actions))
+        .route("/transfer", post(transfer))
+        .route("/stop", post(stop))
+        .fallback(|| async { ApiError::new(404, "Not found") })
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(shared.clone())
+}
+
+/// The Remote Control routes for agents on this computer (`/v1/rc/*`, local_api.rs): served on
+/// the local API, behind its 127.0.0.1 and token guard. They work with "Allow remote control" off
+/// and without Tailscale or the relay: nothing here checks hosting (realtimex-ai-app#3095).
+pub struct LocalRoutes {
+    /// Holds its state (the daemon's lifetime: sessions end with the process).
+    pub router: Router,
+}
+
+impl LocalRoutes {
+    pub fn new(host: Weak<Host>, log: Arc<dyn Fn(&str) + Send + Sync>) -> std::io::Result<Self> {
+        let shared = new_shared(host, false, true, log)?;
+        Ok(Self {
+            router: local_router(&shared),
+        })
+    }
+}
+
 /// Serve the Remote Control routes on exactly one address (the Tailscale IP).
 pub async fn start_listener(
     address: &str,
@@ -306,7 +351,7 @@ pub async fn start_listener(
         ));
     }
     let socket = tokio::net::TcpListener::bind(SocketAddr::new(ip, port)).await?;
-    let shared = new_shared(host, false, log)?;
+    let shared = new_shared(host, false, false, log)?;
     let routes = routes(&shared);
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
@@ -333,7 +378,7 @@ pub struct PublicRoutes {
 
 impl PublicRoutes {
     pub fn new(host: Weak<Host>, log: Arc<dyn Fn(&str) + Send + Sync>) -> std::io::Result<Self> {
-        let shared = new_shared(host, true, log)?;
+        let shared = new_shared(host, true, false, log)?;
         let router = routes(&shared);
         Ok(Self { shared, router })
     }
@@ -388,7 +433,9 @@ fn no_store(mut response: Response) -> Response {
 
 /// How this listener's clients come: over the tailnet or Public Exposure.
 fn via_of(shared: &Shared) -> &'static str {
-    if shared.public {
+    if shared.local {
+        "local"
+    } else if shared.public {
         "public"
     } else {
         "tailnet"
@@ -744,6 +791,9 @@ fn signed(
     headers: &HeaderMap,
     peer: &SocketAddr,
 ) -> Result<Signed, Box<Response>> {
+    if shared.local {
+        return local_signed(headers, peer);
+    }
     let address = peer.ip().to_string();
     let key = format!("token:{}", source_of(peer.ip()));
     if blocked(shared, &key) {
@@ -785,6 +835,29 @@ fn signed(
             ))
         }
     }
+}
+
+/// An agent on this computer (`/v1/rc/*`): the local API's guard already checked its token, so
+/// the caller is whoever `X-RTX-Caller` names (as `/v1/ax/*`, 400 without it). It may view and
+/// control, its id is `local:<caller id>` (its screenshots, waits and transfers are its own), and
+/// its Activity rows say `via: local`. No client record, and no check of "Allow remote control".
+fn local_signed(headers: &HeaderMap, peer: &SocketAddr) -> Result<Signed, Box<Response>> {
+    let header = headers.get("x-rtx-caller").and_then(|v| v.to_str().ok());
+    let caller =
+        crate::ax::Caller::local(header).map_err(|error| Box::new(error.into_response()))?;
+    let name = caller.who.client_name.clone().unwrap_or_default();
+    Ok(Signed {
+        client: Authenticated {
+            client: json!({
+                "id": caller.owner,
+                "name": name,
+                "permissions": { "view": true, "control": true },
+            }),
+            actor: "agent",
+        },
+        token: String::new(),
+        address: peer.ip().to_string(),
+    })
 }
 
 fn require(signed: &Signed, permission: &str) -> Result<(), Box<Response>> {
@@ -3009,6 +3082,119 @@ mod tests {
         assert!(windows_on(&json!({}), None).is_empty());
     }
 
+    /// realtimex-ai-app#3095: `/v1/rc/*` for an agent on this computer.
+    #[cfg(unix)]
+    mod local_rc {
+        use super::*;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        const CALLER: &str = r#"{"id":"ws1:t1","name":"Thread one"}"#;
+
+        fn local(dir: &std::path::Path) -> (Arc<Shared>, Router) {
+            std::fs::write(dir.join("displays.json"), "[]").unwrap();
+            let backend = Backend::with_detected(crate::backend::Detected {
+                binary: Some(fake_helper(dir)),
+                reason: None,
+                code: None,
+            });
+            let shared = test_shared_as(backend, dir, true);
+            let router = local_router(&shared);
+            (shared, router)
+        }
+
+        async fn send(router: &Router, method: &str, path: &str, caller: Option<&str>, body: Value) -> Response {
+            let mut request = Request::builder().method(method).uri(path);
+            if let Some(caller) = caller {
+                request = request.header("x-rtx-caller", caller);
+            }
+            let mut request = request
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50000))));
+            router.clone().oneshot(request).await.unwrap()
+        }
+
+        /// The Human's requirement: localhost is not remote control. The router here has no host
+        /// at all (so no "Allow remote control", no listener, no Tailscale or relay), and the
+        /// screenshot and the actions still reach rtx-control.
+        #[tokio::test]
+        async fn screenshot_and_actions_work_with_hosting_off() {
+            let dir = tempfile::tempdir().unwrap();
+            let (shared, router) = local(dir.path());
+            assert!(shared.host.upgrade().is_none());
+            let shot = send(&router, "POST", "/screenshot", Some(CALLER), json!({})).await;
+            assert_eq!(shot.status(), StatusCode::OK);
+            assert!(shot.headers().contains_key("x-screen-width"));
+            let acted = send(
+                &router,
+                "POST",
+                "/actions",
+                Some(CALLER),
+                json!({ "actions": [{ "type": "click", "x": 10, "y": 20 }] }),
+            )
+            .await;
+            assert_eq!(acted.status(), StatusCode::OK);
+            let ops: Vec<String> = requests_of(dir.path())
+                .iter()
+                .filter_map(|r| r["op"].as_str().map(str::to_string))
+                .collect();
+            assert!(ops.contains(&"screenshot".to_string()), "{ops:?}");
+            assert!(ops.iter().any(|op| op != "screenshot"), "{ops:?}");
+        }
+
+        #[tokio::test]
+        async fn every_call_needs_x_rtx_caller() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_shared, router) = local(dir.path());
+            for (method, path) in [("POST", "/screenshot"), ("POST", "/actions"), ("GET", "/status"), ("POST", "/stop")] {
+                let refused = send(&router, method, path, None, json!({})).await;
+                assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{path}");
+                let bad = send(&router, method, path, Some("not json"), json!({})).await;
+                assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "{path}");
+            }
+        }
+
+        /// No sign-in, no live views and no ax here: those are 404.
+        #[tokio::test]
+        async fn sign_in_live_views_and_ax_are_not_mounted() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_shared, router) = local(dir.path());
+            for (method, path) in [
+                ("POST", "/connect"),
+                ("GET", "/connect/requests/x"),
+                ("GET", "/frames"),
+                ("POST", "/peer/offer"),
+                ("POST", "/ax/act"),
+                ("POST", "/remote-control/screenshot"),
+            ] {
+                let answer = send(&router, method, path, Some(CALLER), json!({})).await;
+                assert_eq!(answer.status(), StatusCode::NOT_FOUND, "{path}");
+            }
+        }
+
+        /// The caller is an agent that may view and control, as `local:<id>`, via `local`.
+        #[test]
+        fn the_local_caller_is_an_agent_with_control() {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-rtx-caller", CALLER.parse().unwrap());
+            let peer = SocketAddr::from(([127, 0, 0, 1], 1));
+            let signed = local_signed(&headers, &peer).ok().unwrap();
+            assert_eq!(signed.client.id(), "local:ws1:t1");
+            assert_eq!(signed.client.name(), "Thread one");
+            assert!(signed.client.may("view") && signed.client.may("control"));
+            assert_eq!(signed.client.actor, "agent");
+            let dir = tempfile::tempdir().unwrap();
+            let (shared, _router) = local(dir.path());
+            assert_eq!(via_of(&shared), "local");
+            let who = Who::client(&signed.client, via_of(&shared));
+            assert_eq!((who.client_id.as_deref(), who.via.as_str()), (Some("local:ws1:t1"), "local"));
+        }
+    }
+
     #[test]
     fn hello_lists_the_agent_features() {
         for feature in ["errors-v2", "windows", "wait", "displays"] {
@@ -3076,9 +3262,15 @@ done
 
     #[cfg(unix)]
     fn test_shared(backend: Arc<Backend>, dir: &std::path::Path) -> Arc<Shared> {
+        test_shared_as(backend, dir, false)
+    }
+
+    #[cfg(unix)]
+    fn test_shared_as(backend: Arc<Backend>, dir: &std::path::Path, local: bool) -> Arc<Shared> {
         Arc::new(Shared {
             host: Weak::new(),
             public: false,
+            local,
             backend,
             log: Arc::new(|_: &str| {}),
             failures: Mutex::new(HashMap::new()),
