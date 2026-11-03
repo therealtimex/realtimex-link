@@ -255,9 +255,19 @@ kebab-case.
   routes for an agent on this computer, with hosting on or off. `X-RTX-Caller:
   {"id":"<workspaceId>:<threadId>","name":"<thread name>"}` (≤ 512 bytes) is required (else
   400); refs belong to that caller; Activity rows are `actor:"agent"`, `via:"local"`,
-  `clientId:"local:<id>"`, `clientName` the thread's name. No pixel fallback for these (it would
-  move the person's own pointer). Link holds no per-app policy: a local agent runs as the same
-  OS user, so any allow-list is a guard rail with full visibility, not containment.
+  `clientId:"local:<id>"`, `clientName` the thread's name. `type` falls back to a click and paste
+  as it does remotely (realtimex-ai-app#3095). Link holds no per-app policy: a local agent runs as
+  the same OS user, so any allow-list is a guard rail with full visibility, not containment.
+- **`local-rc`** (realtimex-ai-app#3095): this computer like a remote one. `GET /v1/rc/hello`,
+  `GET /v1/rc/status`, `POST /v1/rc/screenshot`, `GET /v1/rc/displays`, `GET /v1/rc/windows`,
+  `POST /v1/rc/windows/focus`, `POST /v1/rc/wait`, `POST /v1/rc/actions`, `POST /v1/rc/transfer`
+  and `POST /v1/rc/stop`: the same handlers, bodies and answers as `/remote-control/*` (the
+  screenshot's JPEG body and `x-screen-width|height|display|frame` headers included), behind this
+  API's guard (127.0.0.1 and the token). `X-RTX-Caller` as for `local-ax` (else 400) instead of a
+  sign-in: the caller may view and control, as `local:<id>`, and its screenshots, waits and
+  transfers are its own; Activity rows as for `local-ax`. They work with "Allow remote control"
+  off and without Tailscale or the relay: localhost is not remote control. No `connect`,
+  connection requests, `frames`, `peer/offer` or `ax/*` here (404).
 - `PUT /v1/origin`, `/v1/shared`, `/v1/artifacts`, `/v1/webhooks` and `POST /v1/inbox/ack` name the
   adopted exposure; any other is 409 `exposure-mismatch`.
 - **Public request bodies** (413 beyond): `a` and `e` 1 MiB, `h` 15 MiB, `m` 50 MiB, `p` 10 MiB.

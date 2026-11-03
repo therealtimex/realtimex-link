@@ -188,14 +188,18 @@ fn bundled() -> bool {
         .is_some_and(|path| path.is_file())
 }
 
+/// Whether `type` may fall back to a click and paste (the real pointer moves): for every caller,
+/// remote and local alike (realtimex-ai-app#3095: this computer works like a remote one).
+const PIXELS_ALLOWED: bool = true;
+
 /// Who is asking: whose refs, for the Activity log, and whether it may act.
 #[derive(Clone, Debug)]
 pub struct Caller {
     pub owner: String,
     pub who: Who,
     pub control: bool,
-    /// An agent on this computer (`/v1/ax/*`): no pixel fallback (it would move the person's own
-    /// pointer, A3), and its own wording for a missing permission.
+    /// An agent on this computer (`/v1/ax/*`): its own wording for a missing permission. It gets
+    /// the pixel fallback as a remote client does (realtimex-ai-app#3095).
     pub local: bool,
 }
 
@@ -1434,7 +1438,8 @@ async fn type_chain<D: Desktop>(
             }
         }
     }
-    // 3. A click at its centre and a paste (the real pointer moves); not for local agents.
+    // 3. A click at its centre and a paste (the real pointer moves), for local agents too
+    // (realtimex-ai-app#3095).
     let bounds = bounds_for(desktop, entry, reference, budget).await;
     if pixels_allowed {
         if let Some(bounds) = &bounds {
@@ -1471,7 +1476,7 @@ pub async fn act<D: Desktop>(desktop: &D, ax: &Ax, caller: &Caller, body: &Value
     let action = text_field(body, "action").ok_or_else(|| ApiError::bad_request("action is required"))?;
     let value = body.get("value").and_then(Value::as_str);
     let entry = ax.lookup(&caller.owner, reference)?;
-    let acted = act_on(desktop, &entry, reference, action, value, !caller.local, Budget::default()).await?;
+    let acted = act_on(desktop, &entry, reference, action, value, PIXELS_ALLOWED, Budget::default()).await?;
     let via = acted.via;
     let answer = acted_json(reference, action, &entry.role, acted);
     Ok((answer, entry, via))
@@ -1636,7 +1641,7 @@ async fn act_step<D: Desktop>(
 ) -> ApiResult<Value> {
     let action = text_field(act, "action").unwrap_or("");
     let value = act.get("value").and_then(Value::as_str);
-    let acted = act_on(desktop, &entry, reference, action, value, !caller.local, budget).await;
+    let acted = act_on(desktop, &entry, reference, action, value, PIXELS_ALLOWED, budget).await;
     let role = entry.role.clone();
     notes.push(Note::Act {
         entry: Some(entry),

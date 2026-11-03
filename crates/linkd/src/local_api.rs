@@ -75,12 +75,23 @@ pub struct LocalState {
     pub window: Mutex<std::collections::HashMap<String, u32>>,
     /// How often another rtx-link asked the running one to show its window (GET /v1/status).
     pub show_window: AtomicU64,
+    /// `/v1/rc/*` (router.rs `LocalRoutes`, realtimex-ai-app#3095): the Remote Control routes for
+    /// agents on this computer, behind this API's guard. None: not served (feature `local-rc` off).
+    pub rc: Option<crate::router::LocalRoutes>,
 }
 
 type Shared = Arc<LocalState>;
 
 pub fn router(state: Shared) -> Router {
-    Router::new()
+    let mut router = Router::new();
+    // Agents on this computer (realtimex-ai-app#3095): screenshots, input, displays, windows,
+    // wait, transfers and stop with the same handlers as /remote-control/*, X-RTX-Caller on every
+    // call. Behind this API's guard (127.0.0.1 and the token); they work with "Allow remote
+    // control" off and without Tailscale or the relay.
+    if let Some(rc) = &state.rc {
+        router = router.nest_service("/v1/rc", rc.router.clone());
+    }
+    router
         .route(HELLO_PATH, post(hello))
         .route("/v1/version", get(version))
         .route("/v1/status", get(status))
@@ -247,16 +258,21 @@ async fn hello(State(state): State<Shared>, Body64(body): Body64) -> Answer {
 }
 
 async fn version(State(state): State<Shared>) -> Json<Value> {
-    Json(json!({ "protocol": PROTOCOL, "version": state.version, "features": features() }))
+    Json(json!({ "protocol": PROTOCOL, "version": state.version, "features": features(state.rc.is_some()) }))
 }
 
 /// FEATURES, and Start with this computer (realtimex-link#10) only where Link has a service
 /// for it. RealTimeX shows its setting only when this is listed, and never requires it.
-fn features() -> Vec<&'static str> {
+/// `rc`: whether /v1/rc/* is served (realtimex-ai-app#3095).
+fn features(rc: bool) -> Vec<&'static str> {
     let mut features = FEATURES.to_vec();
     // /v1/ax/* (realtimex-ai-app#3055 Addendum 2): only where the remote `ax` is served.
     if crate::ax::enabled() {
         features.push("local-ax");
+    }
+    // /v1/rc/* (realtimex-ai-app#3095): this computer like a remote one.
+    if rc {
+        features.push("local-rc");
     }
     if crate::unattended::supported() {
         features.push("unattended");
@@ -1145,8 +1161,15 @@ mod tests {
 
     #[test]
     fn start_with_this_computer_is_listed_only_on_windows() {
-        assert_eq!(features().contains(&"unattended"), cfg!(windows));
-        assert!(features().starts_with(FEATURES));
+        assert_eq!(features(false).contains(&"unattended"), cfg!(windows));
+        assert!(features(false).starts_with(FEATURES));
+    }
+
+    /// realtimex-ai-app#3095: `local-rc` exactly when /v1/rc/* is served.
+    #[test]
+    fn local_rc_is_listed_when_served() {
+        assert!(features(true).contains(&"local-rc"));
+        assert!(!features(false).contains(&"local-rc"));
     }
 
     #[test]

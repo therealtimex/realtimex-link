@@ -101,10 +101,16 @@ pub async fn start(options: Options) -> Result<Daemon> {
         shutdown: shutdown.clone(),
         window: Default::default(),
         show_window: Default::default(),
+        // /v1/rc/* (realtimex-ai-app#3095): its own Remote Control state, local mode.
+        rc: crate::router::LocalRoutes::new(Arc::downgrade(&host), options.log.clone())
+            .map_err(|error| (options.log)(&format!("[remote-control] no /v1/rc: {error}")))
+            .ok(),
     });
     let (stop_api, stopped) = oneshot::channel::<()>();
     let routes = local_api::router(state);
     let api = tokio::spawn(async move {
+        // The peer address (ConnectInfo): /v1/rc/*'s handlers are the remote ones, which read it.
+        let routes = routes.into_make_service_with_connect_info::<SocketAddr>();
         let _ = axum::serve(socket, routes)
             .with_graceful_shutdown(async move {
                 let _ = stopped.await;
