@@ -792,7 +792,18 @@ fn signed(
     peer: &SocketAddr,
 ) -> Result<Signed, Box<Response>> {
     if shared.local {
-        return local_signed(headers, peer);
+        let signed = local_signed(headers, peer)?;
+        // It holds the session as a signed-in client would (host.authenticate), so Link shows
+        // who controls this computer, with Stop: "RealTimeX on this computer · <thread name>",
+        // as /v1/ax's callers are called.
+        if let Ok(host) = host_of(shared) {
+            host.hold_session(
+                signed.client.id(),
+                &local_session_name(signed.client.name()),
+                "agent",
+            );
+        }
+        return Ok(signed);
     }
     let address = peer.ip().to_string();
     let key = format!("token:{}", source_of(peer.ip()));
@@ -858,6 +869,15 @@ fn local_signed(headers: &HeaderMap, peer: &SocketAddr) -> Result<Signed, Box<Re
         token: String::new(),
         address: peer.ip().to_string(),
     })
+}
+
+/// How Link names an agent on this computer that holds the session.
+fn local_session_name(thread: &str) -> String {
+    if thread.is_empty() {
+        "RealTimeX on this computer".into()
+    } else {
+        format!("RealTimeX on this computer · {thread}")
+    }
 }
 
 fn require(signed: &Signed, permission: &str) -> Result<(), Box<Response>> {
@@ -2950,6 +2970,13 @@ async fn stop(
         end_streams(&shared, &|client_id: &str| client_id == id);
         return Json(json!({ "stopped": true })).into_response();
     }
+    // An agent on this computer: its session ends with it, so Link stops showing it.
+    if shared.local {
+        if let Ok(host) = host_of(&shared) {
+            host.stop_session().await;
+            return Json(json!({ "stopped": true })).into_response();
+        }
+    }
     match shared.backend.stop().await {
         Ok(()) => Json(json!({ "stopped": true })).into_response(),
         Err(error) => error.into_response(),
@@ -3176,9 +3203,57 @@ mod tests {
             }
         }
 
-        /// The caller is an agent that may view and control, as `local:<id>`, via `local`.
+        /// Review of !18: a local agent holds the session as a signed-in client does, so Link shows
+        /// it with Stop; `/v1/rc/stop` ends it. With a real Host and hosting off.
+        #[tokio::test]
+        async fn the_local_session_shows_and_stop_ends_it() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("displays.json"), "[]").unwrap();
+            let backend = Backend::with_detected(crate::backend::Detected {
+                binary: Some(fake_helper(dir.path())),
+                reason: None,
+                code: None,
+            });
+            let data = dir.path().join("data");
+            let store = Arc::new(crate::store::Store::open(&data).unwrap());
+            let secrets = crate::secret_box::SecretBox::new(&data);
+            let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_: &str| {});
+            let host = Host::new(store, secrets, backend, 0, log.clone());
+            assert_eq!(host.overview().await["allowIncoming"], false);
+            let routes = LocalRoutes::new(Arc::downgrade(&host), log).unwrap();
+
+            let shot = send(&routes.router, "POST", "/screenshot", Some(CALLER), json!({})).await;
+            assert_eq!(shot.status(), StatusCode::OK);
+            let acted = send(
+                &routes.router,
+                "POST",
+                "/actions",
+                Some(CALLER),
+                json!({ "actions": [{ "type": "click", "x": 1, "y": 2 }] }),
+            )
+            .await;
+            assert_eq!(acted.status(), StatusCode::OK);
+            let session = host.overview().await["session"].clone();
+            assert_eq!(session["active"], true, "{session}");
+            assert_eq!(session["clientId"], "local:ws1:t1");
+            assert_eq!(session["clientName"], "RealTimeX on this computer · Thread one");
+            assert_eq!(session["actor"], "agent");
+
+            let stopped = send(&routes.router, "POST", "/stop", Some(CALLER), json!({})).await;
+            assert_eq!(stopped.status(), StatusCode::OK);
+            assert_eq!(host.overview().await["session"]["active"], false);
+            assert_eq!(host.overview().await["allowIncoming"], false);
+        }
+
         #[test]
-        fn the_local_caller_is_an_agent_with_control() {
+        fn a_local_session_is_named_after_its_thread() {
+            assert_eq!(local_session_name("Thread one"), "RealTimeX on this computer · Thread one");
+            assert_eq!(local_session_name(""), "RealTimeX on this computer");
+        }
+
+        /// The caller is an agent that may view and control, as `local:<id>`, via `local`.
+        #[tokio::test]
+        async fn the_local_caller_is_an_agent_with_control() {
             let mut headers = HeaderMap::new();
             headers.insert("x-rtx-caller", CALLER.parse().unwrap());
             let peer = SocketAddr::from(([127, 0, 0, 1], 1));

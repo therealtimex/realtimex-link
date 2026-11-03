@@ -778,6 +778,15 @@ impl Host {
     pub fn authenticate(&self, token: &str, address: Option<&str>) -> Option<Authenticated> {
         let client = self.clients.authenticate(token, address)?;
         self.note_active(&client);
+        self.hold_session(client.id(), client.name(), client.actor);
+        Some(client)
+    }
+
+    /// Who holds the current session, which the settings page and the window show with Stop: a
+    /// signed-in client's request (authenticate), or an agent on this computer (`/v1/rc/*`,
+    /// realtimex-ai-app#3095), which never signs in. A new holder, or the first request after the
+    /// session ended, starts it anew.
+    pub fn hold_session(&self, id: &str, name: &str, actor: &str) {
         let started = self.backend.started();
         let mut state = self.state();
         let holder = state
@@ -786,12 +795,11 @@ impl Host {
             .and_then(|s| s.get("clientId"))
             .and_then(Value::as_str)
             .map(String::from);
-        if !started || holder.as_deref() != Some(client.id()) {
+        if !started || holder.as_deref() != Some(id) {
             state.session = Some(
-                json!({ "clientId": client.id(), "clientName": client.name(), "since": iso_now() }),
+                json!({ "clientId": id, "clientName": name, "actor": actor, "since": iso_now() }),
             );
         }
-        Some(client)
     }
 
     pub fn token_expired(&self, token: &str) -> bool {
