@@ -49,7 +49,14 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 # Windows: a --background start's window cloaked until it is opened (dock.rs, veil).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    # open_url: ShellExecuteW (Shell + its SHOW_WINDOW_CMD) on a COM-initialised thread.
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # The .exe's icon, version information and manifest (build.rs, crates/windows_resources.rs).
 [target.'cfg(windows)'.build-dependencies]
