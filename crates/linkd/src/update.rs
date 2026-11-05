@@ -832,7 +832,7 @@ mod tests {
         let pkexec = dir.join("pkexec");
         fake(&pkexec, &format!("echo \"pkexec $*\" >> '{}'; exit 1", log.display()));
         fake(&installed.join("rtx-link"), &format!("echo \"rtx-link $*\" >> '{}'", log.display()));
-        let status = std::process::Command::new("/bin/sh")
+        let status = crate::util::command("/bin/sh")
             .args(["-c", LINUX_HELPER, "update"])
             .arg(&pkexec)
             .arg("/tmp/new/rtx-linkd")
