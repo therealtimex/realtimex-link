@@ -622,6 +622,15 @@ const LINUX_INSTALL_DIR: &str = "/opt/RealTimeX Link";
 const LINUX_HELPER: &str =
     r#""$1" --disable-internal-agent "$2" install "$3"; "$3/rtx-link" --background"#;
 
+/// Whether /proc/self/status says this process runs with no_new_privs (it can't gain privileges).
+#[cfg(any(target_os = "linux", test))]
+fn no_new_privs(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.strip_prefix("NoNewPrivs:")
+            .is_some_and(|value| value.trim() == "1")
+    })
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
@@ -632,6 +641,15 @@ mod platform {
         let installed = crate::install::source()?;
         if installed != Path::new(LINUX_INSTALL_DIR) {
             bail!("Only RealTimeX Link installed in {LINUX_INSTALL_DIR} updates itself");
+        }
+        // A process started with no_new_privs (inherited, e.g. from an app the Electron updater
+        // relaunched) can't gain root: pkexec would exit 127 without asking for a password.
+        if no_new_privs(&std::fs::read_to_string("/proc/self/status").unwrap_or_default()) {
+            bail!(
+                "This RealTimeX Link can't ask for an administrator's password because the program \
+                 that started it doesn't allow it; quit Link, open it from the applications menu \
+                 and update again"
+            );
         }
         if !Path::new(PKEXEC).is_file() {
             bail!(
@@ -813,6 +831,13 @@ mod tests {
         } else {
             assert!(name.is_none());
         }
+    }
+
+    #[test]
+    fn no_new_privs_is_read_from_proc_status() {
+        assert!(no_new_privs("Name:\trtx-linkd\nNoNewPrivs:\t1\nSeccomp:\t0\n"));
+        assert!(!no_new_privs("Name:\trtx-linkd\nNoNewPrivs:\t0\n"));
+        assert!(!no_new_privs(""));
     }
 
     /// The Linux helper installs through pkexec, and starts the installed Link even when the
