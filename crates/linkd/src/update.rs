@@ -13,13 +13,15 @@
 //!   the same Microsoft root, with the same subject and the same Trusted Signing profile EKU as
 //!   this rtx-linkd), started for the person to confirm (it asks for administrator). A detached
 //!   helper waits for it and starts the installed Link again if nothing runs it.
-//! - Linux: /opt needs root, so the window opens the release page (the .deb / .rpm are there).
+//! - Linux: the release's archive (checked against SHA256SUMS), unpacked into a folder only this
+//!   user can write, then installed with that build's `rtx-linkd install` into /opt/RealTimeX
+//!   Link through pkexec, which asks for an administrator's password the way RealTimeX's own
+//!   update does. A detached helper does it (installing stops this daemon) and starts the
+//!   installed Link again afterwards; a cancelled password prompt leaves the old Link running.
 
 use std::path::Path;
-// Only the macOS and Windows updates run programs; Linux opens the release page.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::process::Command;
-#[cfg(any(target_os = "macos", windows))]
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -85,6 +87,7 @@ fn asset_name(version: &str) -> Option<String> {
     match std::env::consts::OS {
         "macos" => Some(format!("realtimex-link-macos-{arch}.tar.gz")),
         "windows" => Some(format!("RealTimeX-Link-Setup-{version}.exe")),
+        "linux" => Some(format!("realtimex-link-linux-{arch}.tar.gz")),
         _ => None,
     }
 }
@@ -159,8 +162,8 @@ impl Updater {
         Ok(self.status())
     }
 
-    /// Update to the latest release. Linux (and an unsigned or not-installed Link): { open: page }
-    /// for the window to open instead.
+    /// Update to the latest release. A platform without a release archive: { open: page } for
+    /// the window to open instead.
     pub async fn install(self: &Arc<Self>) -> Result<Value> {
         let release = lock(&self.state)
             .latest
@@ -325,6 +328,25 @@ pub(crate) fn codesign_requirement(team: &str) -> Option<String> {
 const MACOS_HELPER: &str =
     r#""$1" install "$2"; /usr/bin/open -g -a "$2" --args --background"#;
 
+/// Start a helper in its own session, so it outlives this daemon when an install stops it.
+#[cfg(unix)]
+fn detached(command: &mut Command) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid has no preconditions; it runs in the child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
@@ -393,23 +415,6 @@ mod platform {
                 .arg(&installed),
         )?;
         Ok(json!({ "started": true }))
-    }
-
-    fn detached(command: &mut Command) -> Result<()> {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid has no preconditions; it runs in the child before exec.
-        unsafe {
-            command.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        Ok(())
     }
 }
 
@@ -604,12 +609,75 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Where Link installs itself on Linux (RealTimeX's installer and the .deb / .rpm put it there too).
+#[cfg(any(target_os = "linux", all(test, unix)))]
+const LINUX_INSTALL_DIR: &str = "/opt/RealTimeX Link";
+
+/// What the Linux helper runs: install the new Link as root through pkexec ($1 pkexec, $2 the new
+/// rtx-linkd, $3 the installed folder; pkexec asks for an administrator's password in the
+/// session), then start the installed Link in the background whether that worked or not (`;`,
+/// not `&&`). The install stops the running Link only once it can replace it, and a second
+/// rtx-link leaves when one already runs, so a cancelled prompt keeps the old Link.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+const LINUX_HELPER: &str =
+    r#""$1" --disable-internal-agent "$2" install "$3"; "$3/rtx-link" --background"#;
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::*;
+
+    const PKEXEC: &str = "/usr/bin/pkexec";
+
+    pub fn start(dir: &Path, archive: &Path) -> Result<Value> {
+        let installed = crate::install::source()?;
+        if installed != Path::new(LINUX_INSTALL_DIR) {
+            bail!("Only RealTimeX Link installed in {LINUX_INSTALL_DIR} updates itself");
+        }
+        if !Path::new(PKEXEC).is_file() {
+            bail!(
+                "Updating needs pkexec (polkit) to ask for an administrator's password; install \
+                 the .deb or .rpm from the release page instead"
+            );
+        }
+        // root runs what is unpacked here: only this user may write the folder. A folder of its
+        // own, since the install copies the whole folder rtx-linkd is in (not the archive).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let unpacked = dir.join("RealTimeX Link");
+        std::fs::create_dir(&unpacked)?;
+        let status = crate::util::command("tar")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(&unpacked)
+            .status()?;
+        if !status.success() {
+            bail!("couldn't unpack {}", archive.display());
+        }
+        let linkd = unpacked.join("rtx-linkd");
+        if !linkd.is_file() {
+            bail!("the downloaded archive has no rtx-linkd");
+        }
+        // Installing stops this daemon (and the window): a helper of its own installs and starts
+        // the installed Link, in the background like at login.
+        detached(
+            crate::util::command("/bin/sh")
+                .args(["-c", LINUX_HELPER, "update", PKEXEC])
+                .arg(&linkd)
+                .arg(&installed),
+        )?;
+        Ok(json!({ "started": true }))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod platform {
     use super::*;
 
     pub fn start(_dir: &Path, _file: &Path) -> Result<Value> {
-        bail!("Linux updates come from the release page")
+        bail!("This platform's updates come from the release page")
     }
 }
 
@@ -740,8 +808,47 @@ mod tests {
             assert!(name.unwrap().starts_with("realtimex-link-macos-"));
         } else if cfg!(windows) {
             assert_eq!(name.unwrap(), "RealTimeX-Link-Setup-1.2.3.exe");
+        } else if cfg!(target_os = "linux") {
+            assert!(name.unwrap().starts_with("realtimex-link-linux-"));
         } else {
             assert!(name.is_none());
         }
+    }
+
+    /// The Linux helper installs through pkexec, and starts the installed Link even when the
+    /// install fails or its password prompt is cancelled (a fake pkexec exiting 1 here).
+    #[cfg(unix)]
+    #[test]
+    fn the_linux_helper_installs_as_root_then_starts_link_either_way() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rtx-link-helper-{}", std::process::id()));
+        let installed = dir.join("RealTimeX Link");
+        std::fs::create_dir_all(&installed).unwrap();
+        let log = dir.join("log");
+        let fake = |path: &Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let pkexec = dir.join("pkexec");
+        fake(&pkexec, &format!("echo \"pkexec $*\" >> '{}'; exit 1", log.display()));
+        fake(&installed.join("rtx-link"), &format!("echo \"rtx-link $*\" >> '{}'", log.display()));
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", LINUX_HELPER, "update"])
+            .arg(&pkexec)
+            .arg("/tmp/new/rtx-linkd")
+            .arg(&installed)
+            .status()
+            .unwrap();
+        let ran = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success());
+        assert_eq!(
+            ran,
+            format!(
+                "pkexec --disable-internal-agent /tmp/new/rtx-linkd install {}\nrtx-link --background\n",
+                installed.display()
+            )
+        );
+        assert_eq!(LINUX_INSTALL_DIR, "/opt/RealTimeX Link");
     }
 }

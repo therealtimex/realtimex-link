@@ -112,7 +112,9 @@ RealTimeX installs Link in the same places, so either one installs or updates it
 downgrade. Link also updates itself (`crates/linkd/src/update.rs`): it looks for a newer release at
 start and every six hours, and the window and tray offer Update. On macOS it installs the signed
 archive once codesign confirms the same Team ID, then reopens; on Windows it starts the signed
-installer once Authenticode confirms the same publisher; on Linux it opens the release page. **Releases** (`.gitlab-ci.yml`): Link's code lives on
+installer once Authenticode confirms the same publisher; on Linux it installs the release archive
+(checked against SHA256SUMS) into `/opt/RealTimeX Link` with `pkexec`, which asks for an
+administrator's password, then starts again. **Releases** (`.gitlab-ci.yml`): Link's code lives on
 `rtgit.rta.vn/rtlab/rtwebteam/realtimex-link`, and this GitHub repository is its public push
 mirror; send changes there. Each push runs the GitLab pipeline, which builds on GitHub Actions
 here (`ci/github_build.py`). A `vX.Y.Z` tag (protected, and equal to Cargo.toml's version) builds

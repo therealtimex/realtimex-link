@@ -183,8 +183,9 @@ pub fn set_unattended(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context
     });
 }
 
-/// Update to the latest release: the daemon installs it and the new Link starts itself, or (Linux)
-/// the release page opens for its .deb / .rpm.
+/// Update to the latest release: the daemon installs it (on Linux after an administrator's
+/// password, through pkexec) and the new Link starts itself, or, where Link has no release archive
+/// to install, the release page opens.
 pub fn start_update(shared: &Shared, refresh: &Sender<()>, ctx: &egui::Context) {
     let (shared, refresh, ctx) = (shared.clone(), refresh.clone(), ctx.clone());
     std::thread::spawn(move || {
