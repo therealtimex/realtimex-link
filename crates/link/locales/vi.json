@@ -27,6 +27,7 @@
   "update.downloading": "Đang tải xuống…",
   "update.installing": "Đang cài đặt…",
   "update.update": "Cập nhật",
+  "update.failed": "Bản cập nhật gần nhất chưa được cài đặt",
   "account.title": "Tài khoản",
   "account.signedIn": "Đã đăng nhập",
   "account.signOut": "Đăng xuất",

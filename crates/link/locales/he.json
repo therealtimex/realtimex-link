@@ -27,6 +27,7 @@
   "update.downloading": "מוריד…",
   "update.installing": "מתקין…",
   "update.update": "עדכן",
+  "update.failed": "העדכון האחרון לא הותקן",
   "account.title": "חשבון",
   "account.signedIn": "מחובר",
   "account.signOut": "התנתק",

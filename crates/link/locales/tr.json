@@ -27,6 +27,7 @@
   "update.downloading": "İndiriliyor…",
   "update.installing": "Yükleniyor…",
   "update.update": "Güncelle",
+  "update.failed": "Son güncelleme yüklenmedi",
   "account.title": "Hesap",
   "account.signedIn": "Oturum açıldı",
   "account.signOut": "Oturumu kapat",

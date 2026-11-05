@@ -27,6 +27,7 @@
   "update.downloading": "جارٍ التنزيل…",
   "update.installing": "جارٍ التثبيت…",
   "update.update": "تحديث",
+  "update.failed": "لم يتم تثبيت التحديث الأخير",
   "account.title": "الحساب",
   "account.signedIn": "تم تسجيل الدخول",
   "account.signOut": "تسجيل الخروج",

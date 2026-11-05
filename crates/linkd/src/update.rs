@@ -13,13 +13,15 @@
 //!   the same Microsoft root, with the same subject and the same Trusted Signing profile EKU as
 //!   this rtx-linkd), started for the person to confirm (it asks for administrator). A detached
 //!   helper waits for it and starts the installed Link again if nothing runs it.
-//! - Linux: /opt needs root, so the window opens the release page (the .deb / .rpm are there).
+//! - Linux: the release's archive (checked against SHA256SUMS), unpacked into a folder only this
+//!   user can write, then installed with that build's `rtx-linkd install` into /opt/RealTimeX
+//!   Link through pkexec, which asks for an administrator's password the way RealTimeX's own
+//!   update does. A detached helper does it (installing stops this daemon) and starts the
+//!   installed Link again afterwards; a cancelled password prompt leaves the old Link running.
 
 use std::path::Path;
-// Only the macOS and Windows updates run programs; Linux opens the release page.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::process::Command;
-#[cfg(any(target_os = "macos", windows))]
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -56,7 +58,12 @@ struct Release {
 struct State {
     latest: Option<Release>,
     busy: Option<&'static str>,
+    /// The last release check's error (cleared by the next check that works).
     error: Option<String>,
+    /// Why the last update wasn't installed (Linux: a cancelled password prompt, a failed
+    /// install, also one the restarted Link found at start). Kept apart from `error`, so a release
+    /// check doesn't clear it before it was seen; the next Update clears it.
+    install_error: Option<String>,
     checked_at: Option<String>,
 }
 
@@ -85,6 +92,7 @@ fn asset_name(version: &str) -> Option<String> {
     match std::env::consts::OS {
         "macos" => Some(format!("realtimex-link-macos-{arch}.tar.gz")),
         "windows" => Some(format!("RealTimeX-Link-Setup-{version}.exe")),
+        "linux" => Some(format!("realtimex-link-linux-{arch}.tar.gz")),
         _ => None,
     }
 }
@@ -103,6 +111,10 @@ impl Updater {
         if self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(base) = crate::paths::data_dir().map(|dir| dir.join(LINUX_ATTEMPTS)) {
+            self.recover_linux_attempts(&base);
+        }
         let me = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(FIRST_CHECK).await;
@@ -119,7 +131,7 @@ impl Updater {
         }
     }
 
-    /// For the window: { current, latest, available, page, busy, error, checkedAt }.
+    /// For the window: { current, latest, available, page, busy, error, installError, checkedAt }.
     pub fn status(&self) -> Value {
         let state = lock(&self.state);
         let latest = state.latest.as_ref();
@@ -130,6 +142,7 @@ impl Updater {
             "page": latest.map(|r| r.page.clone()),
             "busy": state.busy,
             "error": state.error,
+            "installError": state.install_error,
             "checkedAt": state.checked_at,
         })
     }
@@ -137,6 +150,12 @@ impl Updater {
     /// Look for the latest release now.
     pub async fn check(&self) -> Result<Value> {
         let release = tokio::task::spawn_blocking(latest_release).await?;
+        self.record_check(release);
+        Ok(self.status())
+    }
+
+    /// A release check's answer. Leaves `install_error` alone: an unseen failed install stays.
+    fn record_check(&self, release: Result<Release>) {
         let mut state = lock(&self.state);
         state.checked_at = Some(crate::util::iso_now());
         match release {
@@ -155,12 +174,10 @@ impl Updater {
                 state.error = Some(format!("Couldn't check for updates: {error:#}"));
             }
         }
-        drop(state);
-        Ok(self.status())
     }
 
-    /// Update to the latest release. Linux (and an unsigned or not-installed Link): { open: page }
-    /// for the window to open instead.
+    /// Update to the latest release. A platform without a release archive: { open: page } for
+    /// the window to open instead.
     pub async fn install(self: &Arc<Self>) -> Result<Value> {
         let release = lock(&self.state)
             .latest
@@ -177,15 +194,22 @@ impl Updater {
             }
             state.busy = Some("downloading");
             state.error = None;
+            state.install_error = None;
         }
         let me = self.clone();
         let outcome =
             tokio::task::spawn_blocking(move || me.download_and_start(&release, &name)).await?;
         let mut state = lock(&self.state);
-        state.busy = None;
         match outcome {
-            Ok(answer) => Ok(answer),
+            // Linux: the helper is still asking for the password and installing; it stays busy
+            // (no second Update) until the helper's outcome is in (`settle`).
+            Ok(answer) if answer.get("pending") == Some(&Value::Bool(true)) => Ok(answer),
+            Ok(answer) => {
+                state.busy = None;
+                Ok(answer)
+            }
             Err(error) => {
+                state.busy = None;
                 state.error = Some(format!("{error:#}"));
                 drop(state);
                 self.log(&format!("failed: {error:#}"));
@@ -194,7 +218,51 @@ impl Updater {
         }
     }
 
-    fn download_and_start(&self, release: &Release, name: &str) -> Result<Value> {
+    /// The Linux helper's outcome: the update is no longer busy, and a failure or a cancelled
+    /// password prompt shows in the status. (Once installed, the installer has stopped this
+    /// daemon and the new Link runs, so this mostly reports what didn't happen.)
+    #[cfg(any(target_os = "linux", test))]
+    fn settle(&self, outcome: LinuxOutcome) {
+        let mut state = lock(&self.state);
+        state.busy = None;
+        state.install_error = match &outcome {
+            LinuxOutcome::Installed => None,
+            other => Some(other.message()),
+        };
+        drop(state);
+        self.log(&format!("Linux install: {}", outcome.message()));
+    }
+
+    /// At start: what a Linux update helper left after its install stopped the daemon that
+    /// started it (the installer stops Link before it copies, so a failure there has no other
+    /// reader). Reported once, and the attempt's folder removed; an attempt without a result yet
+    /// is left to its helper, unless it is a day old.
+    #[cfg(any(target_os = "linux", test))]
+    fn recover_linux_attempts(&self, base: &Path) {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(outcome) = LinuxOutcome::take(&dir) {
+                self.settle(outcome);
+                let _ = std::fs::remove_dir_all(&dir);
+            } else if entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(24 * 60 * 60))
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    fn download_and_start(self: &Arc<Self>, release: &Release, name: &str) -> Result<Value> {
         let url = |file: &str| {
             release
                 .assets
@@ -226,6 +294,20 @@ impl Updater {
             release.version,
             file.display()
         ));
+        #[cfg(target_os = "linux")]
+        {
+            let mut helper = platform::start(&dir, &file)?;
+            let me = self.clone();
+            std::thread::spawn(move || {
+                let _ = helper.wait();
+                // Only reached when the install didn't stop this daemon; otherwise the restarted
+                // Link's daemon finds the result (`recover_linux_attempts`).
+                me.settle(LinuxOutcome::take(&dir).unwrap_or(LinuxOutcome::Unknown));
+                let _ = std::fs::remove_dir_all(&dir);
+            });
+            Ok(json!({ "started": true, "pending": true }))
+        }
+        #[cfg(not(target_os = "linux"))]
         platform::start(&dir, &file)
     }
 }
@@ -325,6 +407,24 @@ pub(crate) fn codesign_requirement(team: &str) -> Option<String> {
 const MACOS_HELPER: &str =
     r#""$1" install "$2"; /usr/bin/open -g -a "$2" --args --background"#;
 
+/// Start a helper in its own session, so it outlives this daemon when an install stops it.
+#[cfg(unix)]
+fn detached(command: &mut Command) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid has no preconditions; it runs in the child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    Ok(command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?)
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
@@ -393,23 +493,6 @@ mod platform {
                 .arg(&installed),
         )?;
         Ok(json!({ "started": true }))
-    }
-
-    fn detached(command: &mut Command) -> Result<()> {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid has no preconditions; it runs in the child before exec.
-        unsafe {
-            command.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        Ok(())
     }
 }
 
@@ -527,10 +610,30 @@ fn download_dir(version: &str) -> Result<std::path::PathBuf> {
     if crate::service::active() {
         return Ok(crate::service::update_dir()?);
     }
-    let dir = std::env::temp_dir().join(format!("realtimex-link-update-{version}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    // Linux: a folder of this attempt's own, which no other attempt removes or refills while its
+    // helper (root, after a password prompt that may wait) still runs what is in it.
+    #[cfg(target_os = "linux")]
+    {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        // In Link's own folder, where the restarted Link looks for the result at start.
+        let base = crate::paths::data_dir()
+            .map(|dir| dir.join(LINUX_ATTEMPTS))
+            .unwrap_or_else(|| std::env::temp_dir().join("realtimex-link-updates"));
+        std::fs::create_dir_all(&base)?;
+        let dir = base.join(format!("{version}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        Ok(dir)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let dir = std::env::temp_dir().join(format!("realtimex-link-update-{version}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
 }
 
 #[cfg(windows)]
@@ -604,12 +707,183 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Where Link installs itself on Linux (RealTimeX's installer and the .deb / .rpm put it there too).
+#[cfg(any(target_os = "linux", all(test, unix)))]
+const LINUX_INSTALL_DIR: &str = "/opt/RealTimeX Link";
+
+/// What the Linux helper runs: install the new Link as root through pkexec ($1 pkexec, $2 the new
+/// rtx-linkd, $3 the installed folder; pkexec asks for an administrator's password in the
+/// session), write pkexec's exit status and the install's output (its error is a JSON line on
+/// stdout) and errors into $4 (this attempt's folder) for whichever daemon runs afterwards to
+/// report; then start the installed Link in the background
+/// whether that worked or not (`;`, not `&&`). The install stops the running Link only once it
+/// can replace it, and a second rtx-link leaves when one already runs, so a cancelled prompt
+/// keeps the old Link.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+const LINUX_HELPER: &str = r#""$1" --disable-internal-agent "$2" install "$3" >"$4/install.out" 2>"$4/install.log"; echo $? >"$4/result"; "$3/rtx-link" --background &"#;
+
+/// The folder (in Link's data folder) that holds each Linux update attempt's own folder.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_ATTEMPTS: &str = "updates";
+
+/// How the Linux helper's pkexec ended (pkexec: 126 the person dismissed the password prompt,
+/// 127 not authorized or no way to ask; else the installer's own status).
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum LinuxOutcome {
+    Installed,
+    Cancelled,
+    NotAuthorized(String),
+    Failed(String),
+    Unknown,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl LinuxOutcome {
+    /// `out`: the installer's stdout (a JSON line, with `error` when it failed); `log`: stderr
+    /// (pkexec's own messages).
+    fn from(result: Option<&str>, out: &str, log: &str) -> Self {
+        let installer_error = out.lines().rev().find_map(|line| {
+            serde_json::from_str::<Value>(line.trim())
+                .ok()?
+                .get("error")?
+                .as_str()
+                .map(str::to_string)
+        });
+        let detail = installer_error.unwrap_or_else(|| {
+            log.lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default()
+                .to_string()
+        });
+        match result.map(str::trim).and_then(|code| code.parse::<i32>().ok()) {
+            Some(0) => Self::Installed,
+            Some(126) => Self::Cancelled,
+            Some(127) => Self::NotAuthorized(detail),
+            Some(code) => Self::Failed(if detail.is_empty() {
+                format!("exit status {code}")
+            } else {
+                detail
+            }),
+            None => Self::Unknown,
+        }
+    }
+
+    /// What the helper left in this attempt's folder, claimed once: renaming the result is what
+    /// decides whether the old daemon's waiter or the restarted daemon reports it. None while
+    /// the helper hasn't finished (or another reader took it).
+    fn take(dir: &Path) -> Option<Self> {
+        let taken = dir.join("result.taken");
+        std::fs::rename(dir.join("result"), &taken).ok()?;
+        let result = std::fs::read_to_string(&taken).ok();
+        let out = std::fs::read_to_string(dir.join("install.out")).unwrap_or_default();
+        let log = std::fs::read_to_string(dir.join("install.log")).unwrap_or_default();
+        Some(Self::from(result.as_deref(), &out, &log))
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Installed => "installed".to_string(),
+            Self::Cancelled => {
+                "Update cancelled: no administrator's password was given. Click Update to try again"
+                    .to_string()
+            }
+            Self::NotAuthorized(detail) => {
+                // Product/UX (realtimex-link!20): what to do next, with What's new (the release
+                // page, in the same card) as the fallback.
+                let mut message = "Couldn't get an administrator's permission to update. If no \
+                                   password prompt appeared, this computer can't show one here: \
+                                   ask an administrator to update RealTimeX Link, or install the \
+                                   .deb or .rpm from What's new"
+                    .to_string();
+                if !detail.is_empty() {
+                    message.push_str(&format!(" (Details: {detail})"));
+                }
+                message
+            }
+            Self::Failed(detail) => format!("The update couldn't be installed: {detail}"),
+            Self::Unknown => "The update didn't finish; click Update to try again".to_string(),
+        }
+    }
+}
+
+/// Whether /proc/self/status says this process runs with no_new_privs (it can't gain privileges).
+#[cfg(any(target_os = "linux", test))]
+fn no_new_privs(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.strip_prefix("NoNewPrivs:")
+            .is_some_and(|value| value.trim() == "1")
+    })
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::*;
+
+    const PKEXEC: &str = "/usr/bin/pkexec";
+
+    /// Start the helper; the caller waits for it and reports its outcome.
+    pub fn start(dir: &Path, archive: &Path) -> Result<std::process::Child> {
+        let installed = crate::install::source()?;
+        if installed != Path::new(LINUX_INSTALL_DIR) {
+            bail!("Only RealTimeX Link installed in {LINUX_INSTALL_DIR} updates itself");
+        }
+        // A process started with no_new_privs (inherited, e.g. from an app the Electron updater
+        // relaunched) can't gain root: pkexec would exit 127 without asking for a password.
+        if no_new_privs(&std::fs::read_to_string("/proc/self/status").unwrap_or_default()) {
+            bail!(
+                "This RealTimeX Link can't ask for an administrator's password because the program \
+                 that started it doesn't allow it; quit Link, open it from the applications menu \
+                 and update again"
+            );
+        }
+        if !Path::new(PKEXEC).is_file() {
+            bail!(
+                "Updating needs pkexec (polkit) to ask for an administrator's password; install \
+                 the .deb or .rpm from the release page instead"
+            );
+        }
+        // root runs what is unpacked here: only this user may write the folder. A folder of its
+        // own, since the install copies the whole folder rtx-linkd is in (not the archive).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let unpacked = dir.join("RealTimeX Link");
+        std::fs::create_dir(&unpacked)?;
+        let status = crate::util::command("tar")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(&unpacked)
+            .status()?;
+        if !status.success() {
+            bail!("couldn't unpack {}", archive.display());
+        }
+        let linkd = unpacked.join("rtx-linkd");
+        if !linkd.is_file() {
+            bail!("the downloaded archive has no rtx-linkd");
+        }
+        // Installing stops this daemon (and the window): a helper in a session of its own
+        // installs and starts the installed Link, in the background like at login.
+        detached(
+            crate::util::command("/bin/sh")
+                .args(["-c", LINUX_HELPER, "update", PKEXEC])
+                .arg(&linkd)
+                .arg(&installed)
+                .arg(dir),
+        )
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod platform {
     use super::*;
 
     pub fn start(_dir: &Path, _file: &Path) -> Result<Value> {
-        bail!("Linux updates come from the release page")
+        bail!("This platform's updates come from the release page")
     }
 }
 
@@ -740,8 +1014,267 @@ mod tests {
             assert!(name.unwrap().starts_with("realtimex-link-macos-"));
         } else if cfg!(windows) {
             assert_eq!(name.unwrap(), "RealTimeX-Link-Setup-1.2.3.exe");
+        } else if cfg!(target_os = "linux") {
+            assert!(name.unwrap().starts_with("realtimex-link-linux-"));
         } else {
             assert!(name.is_none());
         }
+    }
+
+    #[test]
+    fn no_new_privs_is_read_from_proc_status() {
+        assert!(no_new_privs("Name:\trtx-linkd\nNoNewPrivs:\t1\nSeccomp:\t0\n"));
+        assert!(!no_new_privs("Name:\trtx-linkd\nNoNewPrivs:\t0\n"));
+        assert!(!no_new_privs(""));
+    }
+
+    /// The Linux helper installs through pkexec, records pkexec's status and the install's errors
+    /// in the attempt's folder, and starts the installed Link even when the password prompt was
+    /// cancelled (a fake pkexec exiting 126 here) without hiding that status.
+    #[cfg(unix)]
+    #[test]
+    fn the_linux_helper_records_the_outcome_then_starts_link_either_way() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rtx-link-helper-{}", std::process::id()));
+        let installed = dir.join("RealTimeX Link");
+        let attempt = dir.join("attempt");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::create_dir_all(&attempt).unwrap();
+        let log = dir.join("log");
+        let fake = |path: &Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let pkexec = dir.join("pkexec");
+        fake(
+            &pkexec,
+            &format!(
+                "echo \"pkexec $*\" >> '{}'; echo 'Request dismissed' >&2; exit 126",
+                log.display()
+            ),
+        );
+        let started = dir.join("started");
+        fake(
+            &installed.join("rtx-link"),
+            &format!("echo \"rtx-link $*\" > '{}'", started.display()),
+        );
+        let status = crate::util::command("/bin/sh")
+            .args(["-c", LINUX_HELPER, "update"])
+            .arg(&pkexec)
+            .arg("/tmp/new/rtx-linkd")
+            .arg(&installed)
+            .arg(&attempt)
+            .status()
+            .unwrap();
+        // rtx-link is started in the background: give it a moment.
+        for _ in 0..50 {
+            if started.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let ran = std::fs::read_to_string(&log).unwrap();
+        let restarted = std::fs::read_to_string(&started).unwrap_or_default();
+        let outcome = LinuxOutcome::take(&attempt);
+        let again = LinuxOutcome::take(&attempt);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success());
+        assert_eq!(
+            ran,
+            format!(
+                "pkexec --disable-internal-agent /tmp/new/rtx-linkd install {}\n",
+                installed.display()
+            )
+        );
+        assert_eq!(restarted, "rtx-link --background\n");
+        assert_eq!(outcome, Some(LinuxOutcome::Cancelled));
+        assert_eq!(again, None, "a result is reported once");
+        assert_eq!(LINUX_INSTALL_DIR, "/opt/RealTimeX Link");
+    }
+
+    #[test]
+    fn linux_outcomes_tell_cancelled_from_failed() {
+        assert_eq!(LinuxOutcome::from(Some("0\n"), "", ""), LinuxOutcome::Installed);
+        assert_eq!(
+            LinuxOutcome::from(Some("126\n"), "", "Request dismissed"),
+            LinuxOutcome::Cancelled
+        );
+        assert_eq!(
+            LinuxOutcome::from(Some("127\n"), "", "Error executing command as another user: No authentication agent found.\n"),
+            LinuxOutcome::NotAuthorized(
+                "Error executing command as another user: No authentication agent found.".into()
+            )
+        );
+        assert_eq!(
+            LinuxOutcome::from(Some("1\n"), "", "warn\nRealTimeX Link did not stop: /opt/RealTimeX Link\n\n"),
+            LinuxOutcome::Failed("RealTimeX Link did not stop: /opt/RealTimeX Link".into())
+        );
+        assert_eq!(
+            LinuxOutcome::from(Some("3"), "", ""),
+            LinuxOutcome::Failed("exit status 3".into())
+        );
+        assert_eq!(LinuxOutcome::from(None, "", ""), LinuxOutcome::Unknown);
+        // The installer reports its failure as a JSON line on stdout: that is the reason.
+        assert_eq!(
+            LinuxOutcome::from(
+                Some("1\n"),
+                "{\"error\":\"could not install /opt/RealTimeX Link: No space left on device\"}\n",
+                "some stderr noise\n"
+            ),
+            LinuxOutcome::Failed(
+                "could not install /opt/RealTimeX Link: No space left on device".into()
+            )
+        );
+        assert!(LinuxOutcome::Cancelled.message().contains("cancelled"));
+        assert_eq!(
+            LinuxOutcome::NotAuthorized("No authentication agent found.".into()).message(),
+            "Couldn't get an administrator's permission to update. If no password prompt \
+             appeared, this computer can't show one here: ask an administrator to update \
+             RealTimeX Link, or install the .deb or .rpm from What's new (Details: No \
+             authentication agent found.)"
+        );
+        assert_eq!(
+            LinuxOutcome::NotAuthorized(String::new()).message(),
+            "Couldn't get an administrator's permission to update. If no password prompt \
+             appeared, this computer can't show one here: ask an administrator to update \
+             RealTimeX Link, or install the .deb or .rpm from What's new"
+        );
+    }
+
+    fn pending_updater() -> Arc<Updater> {
+        let updater = Updater::new(Weak::new());
+        {
+            let mut state = lock(&updater.state);
+            state.latest = Some(Release {
+                version: "999.0.0".into(),
+                page: "https://example.invalid/releases/v999.0.0".into(),
+                assets: Vec::new(),
+            });
+            // What install() leaves while the Linux helper still waits for the password.
+            state.busy = Some("installing");
+        }
+        updater
+    }
+
+    /// While a Linux helper waits for the password, a second Update is refused (it would
+    /// otherwise start another install over the first), until the helper's outcome settles it.
+    #[test]
+    fn a_pending_linux_install_refuses_a_second_update_until_it_settles() {
+        let updater = pending_updater();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let second = runtime.block_on(updater.install());
+        assert!(format!("{:#}", second.unwrap_err()).contains("already under way"));
+        assert_eq!(updater.status()["busy"], json!("installing"));
+
+        updater.settle(LinuxOutcome::Cancelled);
+        let status = updater.status();
+        assert_eq!(status["busy"], Value::Null);
+        assert!(status["installError"].as_str().unwrap().contains("cancelled"));
+    }
+
+    #[test]
+    fn a_failed_linux_install_reports_why() {
+        let updater = pending_updater();
+        updater.settle(LinuxOutcome::NotAuthorized("No authentication agent found.".into()));
+        let status = updater.status();
+        assert_eq!(status["busy"], Value::Null);
+        assert!(status["installError"]
+            .as_str()
+            .unwrap()
+            .contains("No authentication agent found."));
+        updater.settle(LinuxOutcome::Installed);
+        assert_eq!(updater.status()["installError"], Value::Null);
+    }
+
+    /// The installer stops Link (and the daemon whose waiter would report) before it copies; a
+    /// copy that then fails is found by the restarted Link's daemon at start, with the
+    /// installer's own reason, once.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_after_the_installer_stopped_the_daemon_shows_in_the_restarted_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("rtx-link-recover-{}", std::process::id()));
+        let base = root.join(LINUX_ATTEMPTS);
+        let attempt = base.join("9.9.9-1-1");
+        let installed = root.join("RealTimeX Link");
+        std::fs::create_dir_all(&attempt).unwrap();
+        std::fs::create_dir_all(&installed).unwrap();
+        let fake = |path: &Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // pkexec runs the installer, which (having stopped Link) fails while copying: its error
+        // is a JSON line on stdout, its status 1.
+        let pkexec = root.join("pkexec");
+        fake(
+            &pkexec,
+            r#"echo '{"error":"could not install /opt/RealTimeX Link: No space left on device"}'; exit 1"#,
+        );
+        fake(&installed.join("rtx-link"), "exit 0");
+        let status = crate::util::command("/bin/sh")
+            .args(["-c", LINUX_HELPER, "update"])
+            .arg(&pkexec)
+            .arg("/tmp/new/rtx-linkd")
+            .arg(&installed)
+            .arg(&attempt)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // No waiter ran (its daemon was stopped): the restarted Link's Updater starts fresh.
+        let restarted = Updater::new(Weak::new());
+        restarted.recover_linux_attempts(&base);
+        let reported = restarted.status();
+        let attempt_left = attempt.exists();
+        // Once: a second start finds nothing more to report.
+        let again = Updater::new(Weak::new());
+        again.recover_linux_attempts(&base);
+        let reported_again = again.status();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(reported["busy"], Value::Null);
+        assert_eq!(
+            reported["installError"].as_str().unwrap(),
+            "The update couldn't be installed: could not install /opt/RealTimeX Link: No space \
+             left on device"
+        );
+        assert!(!attempt_left, "the attempt's folder is removed once reported");
+        assert_eq!(reported_again["installError"], Value::Null);
+
+        // The restarted Link knows no release yet (latest None, not available): the window shows
+        // installError on its own. The first release check, which works, must not dismiss it.
+        assert_eq!(reported["available"], json!(false));
+        restarted.record_check(Ok(Release {
+            version: "999.0.0".into(),
+            page: "https://example.invalid/releases/v999.0.0".into(),
+            assets: Vec::new(),
+        }));
+        let after_check = restarted.status();
+        assert_eq!(after_check["available"], json!(true));
+        assert_eq!(after_check["error"], Value::Null);
+        assert_eq!(after_check["installError"], reported["installError"]);
+        // Nor does one that fails: that is the check's own error, beside it.
+        restarted.record_check(Err(anyhow!("offline")));
+        let after_failed_check = restarted.status();
+        assert!(after_failed_check["error"].as_str().unwrap().contains("offline"));
+        assert_eq!(after_failed_check["installError"], reported["installError"]);
+    }
+
+    /// An attempt still waiting for its password prompt (no result yet) is left to its helper.
+    #[test]
+    fn an_attempt_without_a_result_is_left_alone() {
+        let root = std::env::temp_dir().join(format!("rtx-link-pending-{}", std::process::id()));
+        let base = root.join(LINUX_ATTEMPTS);
+        let attempt = base.join("9.9.9-2-2");
+        std::fs::create_dir_all(&attempt).unwrap();
+        let updater = Updater::new(Weak::new());
+        updater.recover_linux_attempts(&base);
+        let still_there = attempt.exists();
+        let status = updater.status();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(still_there);
+        assert_eq!(status["installError"], Value::Null);
     }
 }

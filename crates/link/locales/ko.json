@@ -27,6 +27,7 @@
   "update.downloading": "다운로드하는 중…",
   "update.installing": "설치하는 중…",
   "update.update": "업데이트",
+  "update.failed": "마지막 업데이트가 설치되지 않았습니다",
   "account.title": "계정",
   "account.signedIn": "로그인됨",
   "account.signOut": "로그아웃",
