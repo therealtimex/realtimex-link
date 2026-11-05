@@ -791,11 +791,15 @@ impl LinuxOutcome {
                     .to_string()
             }
             Self::NotAuthorized(detail) => {
-                let mut message = "Couldn't get an administrator's permission to update (no \
-                                   password prompt in this session?)"
+                // Product/UX (realtimex-link!20): what to do next, with What's new (the release
+                // page, in the same card) as the fallback.
+                let mut message = "Couldn't get an administrator's permission to update. If no \
+                                   password prompt appeared, this computer can't show one here: \
+                                   ask an administrator to update RealTimeX Link, or install the \
+                                   .deb or .rpm from What's new"
                     .to_string();
                 if !detail.is_empty() {
-                    message.push_str(&format!(": {detail}"));
+                    message.push_str(&format!(" (Details: {detail})"));
                 }
                 message
             }
@@ -1122,7 +1126,19 @@ mod tests {
             )
         );
         assert!(LinuxOutcome::Cancelled.message().contains("cancelled"));
-        assert!(LinuxOutcome::NotAuthorized("x".into()).message().ends_with(": x"));
+        assert_eq!(
+            LinuxOutcome::NotAuthorized("No authentication agent found.".into()).message(),
+            "Couldn't get an administrator's permission to update. If no password prompt \
+             appeared, this computer can't show one here: ask an administrator to update \
+             RealTimeX Link, or install the .deb or .rpm from What's new (Details: No \
+             authentication agent found.)"
+        );
+        assert_eq!(
+            LinuxOutcome::NotAuthorized(String::new()).message(),
+            "Couldn't get an administrator's permission to update. If no password prompt \
+             appeared, this computer can't show one here: ask an administrator to update \
+             RealTimeX Link, or install the .deb or .rpm from What's new"
+        );
     }
 
     fn pending_updater() -> Arc<Updater> {
