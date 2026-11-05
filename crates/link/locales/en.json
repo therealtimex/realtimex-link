@@ -27,6 +27,7 @@
   "update.downloading": "Downloading…",
   "update.installing": "Installing…",
   "update.update": "Update",
+  "update.failed": "The last update wasn't installed",
   "account.title": "Account",
   "account.signedIn": "Signed in",
   "account.signOut": "Sign out",

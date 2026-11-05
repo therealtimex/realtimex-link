@@ -27,6 +27,7 @@
   "update.downloading": "Se descarcă…",
   "update.installing": "Se instalează…",
   "update.update": "Actualizează",
+  "update.failed": "Ultima actualizare nu a fost instalată",
   "account.title": "Cont",
   "account.signedIn": "Conectat",
   "account.signOut": "Deconectare",

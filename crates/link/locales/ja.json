@@ -27,6 +27,7 @@
   "update.downloading": "ダウンロードしています…",
   "update.installing": "インストールしています…",
   "update.update": "更新",
+  "update.failed": "前回の更新はインストールされませんでした",
   "account.title": "アカウント",
   "account.signedIn": "サインイン済み",
   "account.signOut": "サインアウト",

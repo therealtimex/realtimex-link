@@ -27,6 +27,7 @@
   "update.downloading": "Allalaadimine…",
   "update.installing": "Paigaldamine…",
   "update.update": "Uuenda",
+  "update.failed": "Viimast uuendust ei paigaldatud",
   "account.title": "Konto",
   "account.signedIn": "Sisse logitud",
   "account.signOut": "Logi välja",

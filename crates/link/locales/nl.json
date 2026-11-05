@@ -27,6 +27,7 @@
   "update.downloading": "Downloaden…",
   "update.installing": "Installeren…",
   "update.update": "Bijwerken",
+  "update.failed": "De laatste update is niet geïnstalleerd",
   "account.title": "Account",
   "account.signedIn": "Aangemeld",
   "account.signOut": "Afmelden",

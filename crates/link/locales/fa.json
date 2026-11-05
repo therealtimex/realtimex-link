@@ -27,6 +27,7 @@
   "update.downloading": "در حال دانلود…",
   "update.installing": "در حال نصب…",
   "update.update": "به‌روزرسانی",
+  "update.failed": "آخرین به‌روزرسانی نصب نشد",
   "account.title": "حساب",
   "account.signedIn": "وارد شده",
   "account.signOut": "خروج",

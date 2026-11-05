@@ -27,6 +27,7 @@
   "update.downloading": "Pobieranie…",
   "update.installing": "Instalowanie…",
   "update.update": "Aktualizuj",
+  "update.failed": "Ostatnia aktualizacja nie została zainstalowana",
   "account.title": "Konto",
   "account.signedIn": "Zalogowano",
   "account.signOut": "Wyloguj",

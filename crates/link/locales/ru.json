@@ -27,6 +27,7 @@
   "update.downloading": "Загрузка…",
   "update.installing": "Установка…",
   "update.update": "Обновить",
+  "update.failed": "Последнее обновление не установлено",
   "account.title": "Аккаунт",
   "account.signedIn": "Вход выполнен",
   "account.signOut": "Выйти",

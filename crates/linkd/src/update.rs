@@ -58,7 +58,12 @@ struct Release {
 struct State {
     latest: Option<Release>,
     busy: Option<&'static str>,
+    /// The last release check's error (cleared by the next check that works).
     error: Option<String>,
+    /// Why the last update wasn't installed (Linux: a cancelled password prompt, a failed
+    /// install, also one the restarted Link found at start). Kept apart from `error`, so a release
+    /// check doesn't clear it before it was seen; the next Update clears it.
+    install_error: Option<String>,
     checked_at: Option<String>,
 }
 
@@ -126,7 +131,7 @@ impl Updater {
         }
     }
 
-    /// For the window: { current, latest, available, page, busy, error, checkedAt }.
+    /// For the window: { current, latest, available, page, busy, error, installError, checkedAt }.
     pub fn status(&self) -> Value {
         let state = lock(&self.state);
         let latest = state.latest.as_ref();
@@ -137,6 +142,7 @@ impl Updater {
             "page": latest.map(|r| r.page.clone()),
             "busy": state.busy,
             "error": state.error,
+            "installError": state.install_error,
             "checkedAt": state.checked_at,
         })
     }
@@ -144,6 +150,12 @@ impl Updater {
     /// Look for the latest release now.
     pub async fn check(&self) -> Result<Value> {
         let release = tokio::task::spawn_blocking(latest_release).await?;
+        self.record_check(release);
+        Ok(self.status())
+    }
+
+    /// A release check's answer. Leaves `install_error` alone: an unseen failed install stays.
+    fn record_check(&self, release: Result<Release>) {
         let mut state = lock(&self.state);
         state.checked_at = Some(crate::util::iso_now());
         match release {
@@ -162,8 +174,6 @@ impl Updater {
                 state.error = Some(format!("Couldn't check for updates: {error:#}"));
             }
         }
-        drop(state);
-        Ok(self.status())
     }
 
     /// Update to the latest release. A platform without a release archive: { open: page } for
@@ -184,6 +194,7 @@ impl Updater {
             }
             state.busy = Some("downloading");
             state.error = None;
+            state.install_error = None;
         }
         let me = self.clone();
         let outcome =
@@ -214,7 +225,7 @@ impl Updater {
     fn settle(&self, outcome: LinuxOutcome) {
         let mut state = lock(&self.state);
         state.busy = None;
-        state.error = match &outcome {
+        state.install_error = match &outcome {
             LinuxOutcome::Installed => None,
             other => Some(other.message()),
         };
@@ -1144,7 +1155,7 @@ mod tests {
         updater.settle(LinuxOutcome::Cancelled);
         let status = updater.status();
         assert_eq!(status["busy"], Value::Null);
-        assert!(status["error"].as_str().unwrap().contains("cancelled"));
+        assert!(status["installError"].as_str().unwrap().contains("cancelled"));
     }
 
     #[test]
@@ -1153,12 +1164,12 @@ mod tests {
         updater.settle(LinuxOutcome::NotAuthorized("No authentication agent found.".into()));
         let status = updater.status();
         assert_eq!(status["busy"], Value::Null);
-        assert!(status["error"]
+        assert!(status["installError"]
             .as_str()
             .unwrap()
             .contains("No authentication agent found."));
         updater.settle(LinuxOutcome::Installed);
-        assert_eq!(updater.status()["error"], Value::Null);
+        assert_eq!(updater.status()["installError"], Value::Null);
     }
 
     /// The installer stops Link (and the daemon whose waiter would report) before it copies; a
@@ -1209,12 +1220,30 @@ mod tests {
 
         assert_eq!(reported["busy"], Value::Null);
         assert_eq!(
-            reported["error"].as_str().unwrap(),
+            reported["installError"].as_str().unwrap(),
             "The update couldn't be installed: could not install /opt/RealTimeX Link: No space \
              left on device"
         );
         assert!(!attempt_left, "the attempt's folder is removed once reported");
-        assert_eq!(reported_again["error"], Value::Null);
+        assert_eq!(reported_again["installError"], Value::Null);
+
+        // The restarted Link knows no release yet (latest None, not available): the window shows
+        // installError on its own. The first release check, which works, must not dismiss it.
+        assert_eq!(reported["available"], json!(false));
+        restarted.record_check(Ok(Release {
+            version: "999.0.0".into(),
+            page: "https://example.invalid/releases/v999.0.0".into(),
+            assets: Vec::new(),
+        }));
+        let after_check = restarted.status();
+        assert_eq!(after_check["available"], json!(true));
+        assert_eq!(after_check["error"], Value::Null);
+        assert_eq!(after_check["installError"], reported["installError"]);
+        // Nor does one that fails: that is the check's own error, beside it.
+        restarted.record_check(Err(anyhow!("offline")));
+        let after_failed_check = restarted.status();
+        assert!(after_failed_check["error"].as_str().unwrap().contains("offline"));
+        assert_eq!(after_failed_check["installError"], reported["installError"]);
     }
 
     /// An attempt still waiting for its password prompt (no result yet) is left to its helper.
@@ -1230,6 +1259,6 @@ mod tests {
         let status = updater.status();
         let _ = std::fs::remove_dir_all(&root);
         assert!(still_there);
-        assert_eq!(status["error"], Value::Null);
+        assert_eq!(status["installError"], Value::Null);
     }
 }

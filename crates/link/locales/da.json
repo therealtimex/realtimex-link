@@ -27,6 +27,7 @@
   "update.downloading": "Henter…",
   "update.installing": "Installerer…",
   "update.update": "Opdater",
+  "update.failed": "Den seneste opdatering blev ikke installeret",
   "account.title": "Konto",
   "account.signedIn": "Logget ind",
   "account.signOut": "Log ud",

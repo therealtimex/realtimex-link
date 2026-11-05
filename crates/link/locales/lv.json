@@ -27,6 +27,7 @@
   "update.downloading": "Lejupielādē…",
   "update.installing": "Instalē…",
   "update.update": "Atjaunināt",
+  "update.failed": "Pēdējais atjauninājums netika instalēts",
   "account.title": "Konts",
   "account.signedIn": "Pieteicies",
   "account.signOut": "Izrakstīties",

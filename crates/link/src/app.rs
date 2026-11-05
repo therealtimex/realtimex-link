@@ -748,6 +748,15 @@ fn access_label(control: bool) -> String {
     })
 }
 
+/// Why the last update wasn't installed (the daemon's update status `installError`), shown in
+/// the update card whether or not a newer Link is known.
+fn update_install_error(update: &Value) -> Option<&str> {
+    update
+        .get("installError")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+}
+
 fn text(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -1097,12 +1106,19 @@ impl eframe::App for LinkApp {
 }
 
 impl LinkApp {
-    /// A newer RealTimeX Link: Update, and how it is going.
+    /// A newer RealTimeX Link: Update, and how it is going. Why the last update wasn't installed
+    /// shows even when no newer Link is known yet (the restarted Link, before its first check).
     fn update_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, update: Option<&Value>) {
         let Some(update) = update else { return };
         let available = update.get("available") == Some(&Value::Bool(true));
         let error = update.get("error").and_then(Value::as_str);
+        let install_error = update_install_error(update);
         if !available {
+            if let Some(reason) = install_error {
+                alert(ui, Tone::Danger, &t("update.failed"), |ui| {
+                    ui.label(reason);
+                });
+            }
             return;
         }
         let latest = text(update, "latest");
@@ -1141,8 +1157,8 @@ impl LinkApp {
                         }
                     });
                 });
-                if let Some(error) = error {
-                    ui.label(RichText::new(error).color(tone_colors(ui, Tone::Danger).2));
+                for message in [install_error, error].into_iter().flatten() {
+                    ui.label(RichText::new(message).color(tone_colors(ui, Tone::Danger).2));
                 }
             },
         );
@@ -2074,6 +2090,24 @@ impl LinkApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed install the restarted Link recovered shows before its first release check
+    /// (nothing available yet) and after it, whatever that check's own error.
+    #[test]
+    fn a_failed_install_shows_with_or_without_an_available_update() {
+        let before_check = json!({ "available": false, "latest": null, "error": null,
+            "installError": "The update couldn't be installed: No space left on device" });
+        assert_eq!(
+            update_install_error(&before_check),
+            Some("The update couldn't be installed: No space left on device")
+        );
+        let after_check = json!({ "available": true, "latest": "9.9.9", "error": null,
+            "installError": "The update couldn't be installed: No space left on device" });
+        assert!(update_install_error(&after_check).is_some());
+        assert_eq!(update_install_error(&json!({ "available": false, "installError": null })), None);
+        assert_eq!(update_install_error(&json!({ "available": false, "installError": "" })), None);
+        assert!(!t("update.failed").is_empty());
+    }
 
     fn refused(status: u16, code: Option<&str>) -> anyhow::Result<()> {
         Err(crate::api::Refused { status, code: code.map(str::to_string), message: String::new() }.into())

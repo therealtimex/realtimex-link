@@ -27,6 +27,7 @@
   "update.downloading": "Download in corso…",
   "update.installing": "Installazione in corso…",
   "update.update": "Aggiorna",
+  "update.failed": "L'ultimo aggiornamento non è stato installato",
   "account.title": "Account",
   "account.signedIn": "Accesso effettuato",
   "account.signOut": "Esci",

@@ -27,6 +27,7 @@
   "update.downloading": "正在下载…",
   "update.installing": "正在安装…",
   "update.update": "更新",
+  "update.failed": "上次的更新未安装",
   "account.title": "账户",
   "account.signedIn": "已登录",
   "account.signOut": "退出登录",
