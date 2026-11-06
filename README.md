@@ -100,7 +100,10 @@ RealTimeX ships RealTimeX Link and manages it from Settings → Sharing → Remo
 also works on its own, for a computer that should be controlled from RealTimeX elsewhere without
 RealTimeX installed here: download it from
 [Releases](https://github.com/therealtimex/realtimex-link/releases), sign in to your RealTimeX
-account in its window and turn on **Allow remote control**.
+account in its window and turn on **Allow remote control**. Turned off, no other computer can
+control or view this one, not even one admitted before: a live view ends, and their requests,
+through Tailscale or the relay, are refused with `403 not-accepting`. They are kept, and work
+again once Allow is turned on. Agents in RealTimeX on this computer aren't affected.
 
 | Platform | Download | Installs to |
 | --- | --- | --- |

@@ -287,10 +287,18 @@ impl Host {
         }
     }
 
-    /// Whether other computers may connect now: allowed, and Link is kept running.
-    fn incoming(&self) -> bool {
+    /// Whether other computers may connect now: allowed, and Link is kept running. Off, every
+    /// remote client is refused, admitted or not (realtimex-ai-app#3173); agents on this computer
+    /// (`/v1/rc/*`, `/v1/ax/*`) don't ask.
+    pub fn incoming(&self) -> bool {
         let state = self.state();
         state.allow_incoming && state.keep_running
+    }
+
+    /// Tests: "Allow remote control" without the listener, Tailscale or the backend.
+    #[cfg(test)]
+    pub(crate) fn set_incoming_for_test(&self, allow: bool) {
+        self.state().allow_incoming = allow;
     }
 
     /// This computer's own Public Exposure (relay.rs): { state, url, detail }.
@@ -774,8 +782,14 @@ impl Host {
         (self.log)(&format!("[remote-control] transfer by {name}: {transfer}"));
     }
 
-    /// Every request of a signed-in client; also tracks who holds the current session.
+    /// Every request of a signed-in client; also tracks who holds the current session. With
+    /// "Allow remote control" off, no client is signed in (realtimex-ai-app#3173): the relay
+    /// still carries requests, and a live view's per-frame check ends it. The client is kept, so
+    /// its token works again once Allow is on.
     pub fn authenticate(&self, token: &str, address: Option<&str>) -> Option<Authenticated> {
+        if !self.incoming() {
+            return None;
+        }
         let client = self.clients.authenticate(token, address)?;
         self.note_active(&client);
         self.hold_session(client.id(), client.name(), client.actor);

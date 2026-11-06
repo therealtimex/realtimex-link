@@ -773,7 +773,8 @@ impl Relay {
     }
 
     /// The relay runs while "Keep RealTimeX Link running" is on; Remote Control's own routes
-    /// refuse while incoming control is off.
+    /// refuse every client while incoming control is off (host.admit for sign-ins,
+    /// host.authenticate and router.rs `signed` for signed-in clients, realtimex-ai-app#3173).
     fn wanted(host: &Host) -> bool {
         host.settings().keep_running
             // RealTimeX signed out (§6.2): nothing goes through Link until it signs in again.
