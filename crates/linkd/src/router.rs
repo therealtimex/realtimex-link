@@ -816,6 +816,18 @@ fn signed(
         .unwrap_or("");
     let token = header.strip_prefix("Bearer ").unwrap_or("").to_string();
     let host = host_of(shared).map_err(|error| Box::new(error.into_response()))?;
+    // Allow remote control off: refused as a new sign-in is (host.admit), not as a bad token, so
+    // the client keeps its token and nothing counts toward blocking it (realtimex-ai-app#3173).
+    if !host.incoming() {
+        return Err(Box::new(
+            ApiError::coded(
+                403,
+                "not-accepting",
+                "This computer does not accept remote control",
+            )
+            .into_response(),
+        ));
+    }
     let client = if token.is_empty() {
         None
     } else {
@@ -3249,6 +3261,76 @@ mod tests {
         fn a_local_session_is_named_after_its_thread() {
             assert_eq!(local_session_name("Thread one"), "RealTimeX on this computer · Thread one");
             assert_eq!(local_session_name(""), "RealTimeX on this computer");
+        }
+
+        /// realtimex-ai-app#3173: "Allow remote control" off refuses a client admitted before, on
+        /// the relay's routes too (403 not-accepting, never a bad token), keeps it, and lets it
+        /// in again once Allow is on. Agents on this computer (`/v1/rc/*`) aren't refused.
+        #[tokio::test]
+        async fn allow_off_refuses_admitted_clients_until_it_is_on_again() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("displays.json"), "[]").unwrap();
+            let backend = Backend::with_detected(crate::backend::Detected {
+                binary: Some(fake_helper(dir.path())),
+                reason: None,
+                code: None,
+            });
+            let data = dir.path().join("data");
+            let store = Arc::new(crate::store::Store::open(&data).unwrap());
+            let secrets = crate::secret_box::SecretBox::new(&data);
+            let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_: &str| {});
+            let host = Host::new(store, secrets, backend, 0, log.clone());
+            host.change_password(None).await.unwrap();
+            host.set_incoming_for_test(true);
+            let admitted = host
+                .admit(
+                    &json!({ "password": host.password(), "client": { "id": "c1", "name": "ThinkPad" } }),
+                    "100.64.0.2",
+                    "public",
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(admitted.status, 200, "{}", admitted.body);
+            let token = admitted.body["token"].as_str().unwrap().to_string();
+
+            // The relay's routes (public), as a client reaches them through Public Exposure.
+            let relayed = routes(&new_shared(Arc::downgrade(&host), true, false, log.clone()).unwrap());
+            let status = |router: Router| {
+                let token = token.clone();
+                async move {
+                    let mut request = Request::builder()
+                        .method("GET")
+                        .uri("/remote-control/status")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap();
+                    request
+                        .extensions_mut()
+                        .insert(ConnectInfo(SocketAddr::from(([100, 64, 0, 2], 50000))));
+                    router.oneshot(request).await.unwrap()
+                }
+            };
+            assert_eq!(status(relayed.clone()).await.status(), StatusCode::OK);
+
+            host.set_incoming_for_test(false);
+            let refused = status(relayed.clone()).await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(refused.into_body(), 1 << 16).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "not-accepting", "{body}");
+            assert!(host.authenticate(&token, Some("100.64.0.2")).is_none());
+            // Refusals don't count toward blocking the client: still refused for Allow, not 429.
+            for _ in 0..20 {
+                assert_eq!(status(relayed.clone()).await.status(), StatusCode::FORBIDDEN);
+            }
+            // An agent on this computer still works.
+            let local = LocalRoutes::new(Arc::downgrade(&host), log).unwrap();
+            let shot = send(&local.router, "POST", "/screenshot", Some(CALLER), json!({})).await;
+            assert_eq!(shot.status(), StatusCode::OK);
+
+            host.set_incoming_for_test(true);
+            assert_eq!(status(relayed).await.status(), StatusCode::OK);
         }
 
         /// The caller is an agent that may view and control, as `local:<id>`, via `local`.
