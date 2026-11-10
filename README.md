@@ -141,7 +141,9 @@ and the draft is published, as Link's latest unless a newer release is out (`ci/
 - **Reopen RealTimeX if it crashes** (realtimex-ai-app#3241, Settings, this computer's own Link):
   the tray watches the installed RealTimeX through the `app-session.json` it writes in Link's data
   folder, and reopens it after an exit it didn't announce: after 3, 10 and 30 s, stopping at the 4th
-  in 10 minutes until RealTimeX next starts normally (`crates/link/src/supervise.rs`; decisions in
+  in 10 minutes until RealTimeX next starts normally. An exit announced as `backend-down` (its server
+  stays down after RealTimeX's own restarts; the app sends it only while `app-supervision.json` shows
+  Link watching it with the setting on) is reopened the same way (`crates/link/src/supervise.rs`; decisions in
   `app-supervision.log`). `GET/POST /v1/supervision {enabled}`; `GET /v1/status` has
   `reopenRealtimex` and `supervision: {state, last}`.
 - **Account:** Link signs in to the RealTimeX account itself: Sign in opens the browser at

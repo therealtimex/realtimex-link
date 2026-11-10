@@ -57,6 +57,10 @@ pub const ENV_DROPPED: [&str; 4] = [
 const DEFAULT_EXECUTABLE: &str = "RealTimeX.AI";
 /// At most this many exit times are kept (the window keeps far fewer).
 const MAX_EXITS: usize = 16;
+/// The exit reason RealTimeX gives when its server is down for good (its own server restarts gave
+/// up). The app quits by itself only while Link watches it with the setting on (`watching` and
+/// `enabled` in app-supervision.json), and Link reopens it like a crash: counted, with back-off.
+pub const BACKEND_DOWN: &str = "backend-down";
 
 /// SIGTERM or SIGHUP reached the tray (macOS and Linux logout and shutdown).
 static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -600,13 +604,16 @@ fn from_iso(text: &str) -> Option<i64> {
         .map(|at| at.timestamp_millis())
 }
 
-/// `app-supervision.json`: `{schema, state, exits, last}`.
-fn state_json(memory: &Memory, last: &Value) -> Value {
+/// `app-supervision.json`: `{schema, state, exits, last, enabled, watching}`. RealTimeX reads
+/// `enabled`, `state` and `watching.pid` to know Link would reopen it after a server-down exit.
+fn state_json(memory: &Memory, last: &Value, enabled: bool, watching: Option<u32>) -> Value {
     json!({
         "schema": 1,
         "state": if memory.stopped { "stopped" } else { "watching" },
         "exits": memory.exits.iter().map(|at| iso(*at)).collect::<Vec<_>>(),
         "last": last,
+        "enabled": enabled,
+        "watching": watching.map(|pid| json!({ "pid": pid })),
     })
 }
 
@@ -728,6 +735,8 @@ fn replacement(file: Option<&LeaseFile>, dead_pid: u32, died_ms: i64) -> Replace
         return Replacement::None;
     }
     match &lease.exit {
+        // A replacement whose server went down too is no reason to cancel: the relaunch stands.
+        Some(reason) if reason == BACKEND_DOWN => Replacement::None,
         Some(reason) => Replacement::Intended { pid: lease.pid, reason: reason.clone() },
         None => Replacement::Candidate,
     }
@@ -826,7 +835,11 @@ impl Watcher {
 
     /// The setting from rtx-linkd; a turn is a decision of its own (off then on resets).
     fn note_setting(&mut self, on: bool) {
+        let changed = self.setting != on;
         self.setting = on;
+        if changed {
+            self.save();
+        }
         if self.memory.setting != Some(on) {
             self.apply(&Event::Setting);
         }
@@ -858,7 +871,8 @@ impl Watcher {
     }
 
     fn save(&self) {
-        let text = state_json(&self.memory, &self.last).to_string();
+        let watching = self.watched.as_ref().map(|watched| watched.pid);
+        let text = state_json(&self.memory, &self.last, self.setting, watching).to_string();
         if let Err(error) = write_atomically(&self.dir.join(STATE_FILE), text.as_bytes()) {
             eprintln!("supervise: couldn't write {STATE_FILE}: {error}");
         }
@@ -912,6 +926,8 @@ impl Watcher {
             long: false,
         });
         self.refused = None;
+        // RealTimeX reads `watching` before a server-down exit.
+        self.save();
         let version = lease.version.as_deref().unwrap_or("unknown");
         append_log(
             &self.dir,
@@ -933,21 +949,26 @@ impl Watcher {
             .and_then(|file| file.lease.as_ref())
             .filter(|lease| lease.pid == pid)
             .and_then(|lease| lease.exit.clone());
-        if let Some(reason) = announced {
-            self.apply(&Event::Intended);
-            self.record(pid, "intended", &reason, &format!("intended exit pid {pid} ({reason})"));
-            return;
-        }
+        // Its server down for good: reopened like a crash, but named for what it was.
+        let what = match announced {
+            Some(reason) if reason == BACKEND_DOWN => format!("server down pid {pid}"),
+            Some(reason) => {
+                self.apply(&Event::Intended);
+                self.record(pid, "intended", &reason, &format!("intended exit pid {pid} ({reason})"));
+                return;
+            }
+            None => format!("unannounced exit pid {pid}"),
+        };
         match self.apply(&Event::Unannounced) {
             Decision::SettingOff => self.record(
                 pid,
                 "setting-off",
                 "",
-                &format!("unannounced exit pid {pid}; setting off, no relaunch"),
+                &format!("{what}; setting off, no relaunch"),
             ),
             Decision::Relaunch { delay_secs, nth } => {
                 let reason = format!("relaunch in {delay_secs}s ({nth} of 3)");
-                self.record(pid, "relaunch", &reason, &format!("unannounced exit pid {pid} → {reason}"));
+                self.record(pid, "relaunch", &reason, &format!("{what} → {reason}"));
                 self.pending = Some(Pending {
                     pid,
                     died_ms: now_ms(),
@@ -960,7 +981,7 @@ impl Watcher {
                     pid,
                     "stopped",
                     &reason,
-                    &format!("unannounced exit pid {pid}; crash loop, stopped ({reason})"),
+                    &format!("{what}; crash loop, stopped ({reason})"),
                 );
             }
             _ => {}
@@ -1371,7 +1392,7 @@ mod tests {
         let t0 = 1_762_743_600_000;
         let memory = Memory { stopped: true, exits: vec![t0, t0 + MIN], setting: Some(true) };
         let last = json!({ "at": iso(t0), "pid": 4242, "decision": "stopped", "reason": "4 unannounced exits in 10 min" });
-        let text = state_json(&memory, &last).to_string();
+        let text = state_json(&memory, &last, true, None).to_string();
         write_atomically(&dir.path().join(STATE_FILE), text.as_bytes()).unwrap();
         let written: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join(STATE_FILE)).unwrap()).unwrap();
         assert_eq!(written["schema"], 1);
@@ -1539,6 +1560,36 @@ mod tests {
     }
 
     #[test]
+    fn a_server_down_exit_is_reopened_like_a_crash_and_the_app_can_see_link_watching() {
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        // RealTimeX reads these before it quits for a server that stays down.
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(pc.dir.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(state["enabled"], true);
+        assert_eq!(state["state"], "watching");
+        assert_eq!(state["watching"]["pid"], 100);
+        pc.lease(100, Some(BACKEND_DOWN));
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.log().contains("server down pid 100 → relaunch in 3s (1 of 3)"));
+        assert_eq!(pc.watcher.memory.exits.len(), 1, "it counts toward the crash loop");
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(pc.dir.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(state["watching"], Value::Null);
+        pc.expire();
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 1);
+        // The setting turned off is in the file at once.
+        lock(&pc.watcher.shared).status = Some(json!({ "reopenRealtimex": false }));
+        pc.watcher.tick();
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(pc.dir.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(state["enabled"], false);
+    }
+
+    #[test]
     fn only_a_lease_for_another_pid_written_after_the_death_replaces_it() {
         let file = |pid: u32, exit: Option<&str>, mtime_ms: i64| LeaseFile {
             mtime_ms,
@@ -1558,6 +1609,8 @@ mod tests {
             Replacement::Intended { pid: 200, reason: "quit".into() }
         );
         assert_eq!(replacement(Some(&file(200, None, died + 2_000)), 100, died), Replacement::Candidate);
+        // A replacement whose server went down too doesn't cancel the relaunch.
+        assert_eq!(replacement(Some(&file(200, Some(BACKEND_DOWN), died + 2_000)), 100, died), Replacement::None);
         // A lease that doesn't parse is nothing.
         let unreadable = LeaseFile { mtime_ms: died + 2_000, size: 5, lease: None };
         assert_eq!(replacement(Some(&unreadable), 100, died), Replacement::None);
