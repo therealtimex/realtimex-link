@@ -165,11 +165,11 @@ impl LinkApp {
             });
             caption(
                 ui,
-                t(&keep_running_copy(if on {
-                    "link.onDescription"
+                t(&if on {
+                    keep_running_copy("link.onDescription")
                 } else {
-                    "link.offDescription"
-                })),
+                    self.keep_running_off_key("link.offDescription")
+                }),
             );
         });
     }

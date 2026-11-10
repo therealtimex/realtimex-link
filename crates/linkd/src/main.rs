@@ -48,6 +48,7 @@ mod service;
 mod shared;
 mod signin;
 mod store;
+mod supervision;
 mod tailscale;
 mod transfers;
 mod unattended;

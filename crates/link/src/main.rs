@@ -14,6 +14,9 @@ mod cjk;
 mod clipboard;
 mod desktop;
 mod dock;
+// macOS: an rtx-link started outside launchd hands its tray to the KeepAlive job (#3241).
+#[cfg(any(target_os = "macos", test))]
+mod handoff;
 mod i18n;
 #[cfg(target_os = "linux")]
 mod icon;
@@ -26,6 +29,8 @@ mod authorize;
 mod job;
 #[cfg(target_os = "macos")]
 mod launchd;
+// Reopens RealTimeX after a crash (realtimex-ai-app#3241), from the process with the tray.
+mod supervise;
 mod theme;
 mod tray;
 
@@ -46,6 +51,10 @@ fn main() -> eframe::Result {
     // tray icon and the daemon, no window until it is opened from the icon. On Linux the icon is
     // a process of its own (icon.rs).
     let background = std::env::args().any(|arg| arg == "--background");
+    // macOS, this computer's own Link: the LaunchAgent job owns the tray, so launchd's KeepAlive
+    // brings it back after a crash (realtimex-ai-app#3241 Q5). Returns only to carry on as before.
+    #[cfg(target_os = "macos")]
+    handoff::run(background);
     #[cfg(target_os = "linux")]
     if background {
         return icon::run();

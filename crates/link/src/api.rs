@@ -75,6 +75,18 @@ fn default_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("RTX_LINK_DATA_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
     }
+    standard_data_dir()
+}
+
+/// Whether this process belongs to this computer's own Link, the one in the standard folder (no
+/// `--data-dir` elsewhere, no RTX_LINK_DATA_DIR): rtx-linkd's paths::is_standard(). Only that one
+/// watches RealTimeX (supervise.rs) and hands its tray to launchd (main.rs).
+pub fn is_default_instance() -> bool {
+    data_dir() == standard_data_dir()
+}
+
+/// This computer's own Link's folder, whatever the environment says.
+pub fn standard_data_dir() -> PathBuf {
     let home =
         std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
     if cfg!(target_os = "macos") {
@@ -175,6 +187,13 @@ impl Api {
             })
             .unwrap_or_default();
         Ok(api)
+    }
+
+    /// The running daemon, never started from here (the launchd hand-off, main.rs: the job's own
+    /// tray starts it).
+    #[cfg(target_os = "macos")]
+    pub fn running() -> Result<Self> {
+        Self::connect(&data_dir())
     }
 
     /// The running daemon, started (on its own, so hosting outlives the window) when there is none.

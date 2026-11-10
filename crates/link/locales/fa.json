@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "ذخیرهٔ تنظیم ممکن نشد",
   "settings.saveFailed": "Link تنظیم قبلی را نگه داشت. مطمئن شوید RealTimeX Link در حال اجراست، سپس دوباره تلاش کنید.",
   "settings.tryAgain": "دوباره تلاش کنید",
+  "settings.reopenRealtimex": "بازکردن دوبارهٔ RealTimeX در صورت از کار افتادن",
   "settings.startWithComputer": "اجرا همراه با روشن شدن این رایانه",
   "settings.startWithComputerHelp": "RealTimeX Link با روشن شدن این رایانه اجرا می‌شود، بنابراین رایانه‌هایی که اجازه داده‌اید حتی پیش از ورود هر کسی می‌توانند وصل شوند. برای عبور از صفحهٔ ورود، همچنان به گذرواژهٔ Windows نیاز دارند.",
   "settings.startWithComputerHelpMac": "RealTimeX Link با روشن شدن این Mac اجرا می‌شود، بنابراین رایانه‌هایی که اجازه داده‌اید می‌توانند در پنجره ورود و صفحه قفل وصل شوند. برای ورود، همچنان به گذرواژه Mac نیاز دارند. پس از راه‌اندازی دوباره با FileVault روشن، ابتدا باید کسی قفل Mac را پشت همان رایانه باز کند.",

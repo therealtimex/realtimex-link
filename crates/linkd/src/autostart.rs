@@ -2,11 +2,13 @@
 //! starts this daemon. Each platform's own per-user login item: a LaunchAgent on macOS, the Run
 //! key on Windows, an XDG autostart entry on Linux.
 //!
-//! Link owns the login item, and it follows hosting: there while this computer allows remote
-//! control, gone when it doesn't (host.rs). RealTimeX or the person can turn it off
-//! (POST /v1/autostart { enabled: false }); that is kept in the store and respected until they
-//! turn it on again. Only the installed Link writes it, so a build or a copy run from elsewhere
-//! can't point it at itself.
+//! Link owns the login item, and it is there while "Keep RealTimeX Link running" or "Reopen
+//! RealTimeX if it crashes" is on (host.rs; realtimex-ai-app#3241 Q5): with the defaults, always.
+//! It no longer follows Remote Control: the old opt-out (POST /v1/autostart { enabled: false },
+//! store key `autostart-off`) is cleared once at start ([`retire_opt_out`]) and ignored after.
+//! Only the installed Link writes it, so a build or a copy run from elsewhere can't point it at
+//! itself. On macOS the LaunchAgent keeps the tray alive (`KeepAlive {SuccessfulExit=false}`):
+//! launchd starts it again after a crash or a kill, and leaves a Quit (exit 0) alone.
 
 use std::path::{Path, PathBuf};
 
@@ -15,9 +17,11 @@ use serde_json::{json, Value};
 
 use crate::store::Store;
 
-/// The store key of "don't start at login", set through POST /v1/autostart. Absent: the login
-/// item follows hosting (every install from before it, too).
+/// The store key of the retired "don't start at login", which app builds from 2026-10-23 set
+/// through POST /v1/autostart when Remote Control turned off. Removed once at start (#3241).
 pub const OPT_OUT_KEY: &str = "autostart-off";
+/// Set once the old opt-out was cleared, so the clearing (and its log line) happens once.
+pub const OPT_OUT_RETIRED_KEY: &str = "autostart-off-retired";
 
 /// The login item's name: the Run value (Windows), the entry's Name (Linux).
 #[cfg(not(target_os = "macos"))]
@@ -70,17 +74,27 @@ pub fn set(on: bool) -> Result<()> {
     platform::write(&command_line(&app), &app)
 }
 
-/// Whether the person or RealTimeX turned starting at login off.
-pub fn opted_out(store: &Store) -> bool {
-    store.get(OPT_OUT_KEY) == Some(Value::Bool(true))
+/// The one-time migration (#3241 Q5): when the store still has the old opt-out, remove it and
+/// remember that it was retired. True when it cleared one now (the caller logs it), false when
+/// there was none or it was cleared before.
+pub fn retire_opt_out(store: &Store) -> Result<bool> {
+    if store.get(OPT_OUT_RETIRED_KEY) == Some(Value::Bool(true)) && store.get(OPT_OUT_KEY).is_none() {
+        return Ok(false);
+    }
+    let had = store.get(OPT_OUT_KEY).is_some();
+    if had {
+        store.remove(OPT_OUT_KEY)?;
+    }
+    store.set(OPT_OUT_RETIRED_KEY, &json!(true))?;
+    Ok(had)
 }
 
-pub fn set_opted_out(store: &Store, off: bool) -> Result<()> {
-    if off {
-        store.set(OPT_OUT_KEY, &json!(true))
-    } else {
-        store.remove(OPT_OUT_KEY)
-    }
+/// POST /v1/autostart { enabled }, which older RealTimeX builds send from Remote Control: it
+/// changes nothing (#3241 Q5), so the store isn't even read. The line to log for false.
+pub fn requested(on: bool) -> Option<&'static str> {
+    (!on).then_some(
+        "[link] POST /v1/autostart {enabled:false} ignored: start at login no longer follows Remote Control (#3241)",
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +104,11 @@ pub enum Change {
     Keep,
 }
 
-/// What the login item needs: `installed` is this copy being the installed Link (it may write
-/// the item), `present` any item there, `ours` one that starts this installation's rtx-link.
-pub fn change(hosting: bool, opted_out: bool, installed: bool, present: bool, ours: bool) -> Change {
-    if hosting && !opted_out {
+/// What the login item needs: `wanted` is Keep running or Reopen RealTimeX being on (#3241),
+/// `installed` this copy being the installed Link (it may write the item), `present` any item
+/// there, `ours` one that starts this installation's rtx-link in today's form.
+pub fn change(wanted: bool, installed: bool, present: bool, ours: bool) -> Change {
+    if wanted {
         if ours || !installed {
             Change::Keep
         } else {
@@ -106,11 +121,10 @@ pub fn change(hosting: bool, opted_out: bool, installed: bool, present: bool, ou
     }
 }
 
-/// Make the login item match hosting and the opt-out; returns what was done.
-pub fn follow(hosting: bool, opted_out: bool) -> Result<Change> {
+/// Make the login item match `wanted` (Keep running or Reopen RealTimeX); returns what was done.
+pub fn follow(wanted: bool) -> Result<Change> {
     let wanted = change(
-        hosting,
-        opted_out,
+        wanted,
         available(),
         platform::current().is_some(),
         enabled(),
@@ -169,6 +183,50 @@ fn launch_agent_program(text: &str) -> Option<String> {
     )
 }
 
+/// The LaunchAgent for `program` (already escaped for XML). `KeepAlive {SuccessfulExit=false}`
+/// (#3241 Q5): launchd starts the tray again after a crash or a signal, within ThrottleInterval,
+/// and leaves its Quit (exit 0) and a logout alone. `AssociatedBundleIdentifiers` comes after
+/// `ProgramArguments`, so [`launch_agent_program`] still reads the program first.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_text(label: &str, program: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{program}</string>
+    <string>--background</string>
+  </array>
+  <key>AssociatedBundleIdentifiers</key>
+  <string>{ASSOCIATED_APP}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Whether a LaunchAgent is in today's form: it names RealTimeX.AI (#11 M7) and keeps the tray
+/// alive (#3241). An older one is rewritten once.
+#[cfg(any(target_os = "macos", test))]
+fn in_current_form(text: &str) -> bool {
+    names_realtimex(text) && text.contains("<key>KeepAlive</key>")
+}
+
 /// Whether a LaunchAgent names RealTimeX.AI as its app.
 #[cfg(any(target_os = "macos", test))]
 fn names_realtimex(text: &str) -> bool {
@@ -206,40 +264,20 @@ mod platform {
             .find_map(|path| super::launch_agent_program(&std::fs::read_to_string(path).ok()?))
     }
 
-    /// Whether the LaunchAgent is today's, naming RealTimeX.AI as its app (#11 M7).
+    /// Whether the LaunchAgent is today's: naming RealTimeX.AI as its app (#11 M7) and keeping
+    /// the tray alive (#3241).
     pub fn current_form() -> bool {
-        std::fs::read_to_string(plist()).is_ok_and(|text| super::names_realtimex(&text))
+        std::fs::read_to_string(plist()).is_ok_and(|text| super::in_current_form(&text))
             && !plist_named(OLD_LABEL).exists()
     }
 
     pub fn write(program: &str, _app: &Path) -> Result<()> {
         let path = plist();
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let text = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{}</string>
-    <string>--background</string>
-  </array>
-  <key>AssociatedBundleIdentifiers</key>
-  <string>{ASSOCIATED_APP}</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>LimitLoadToSessionType</key>
-  <string>Aqua</string>
-</dict>
-</plist>
-"#,
-            escape(program)
-        );
+        let text = super::launch_agent_text(LABEL, &escape(program));
         std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
-        // The tray this session started keeps running; the next login starts it from the new item.
+        // The tray this session started keeps running; the next login starts it from the new item
+        // (or rtx-link's launchd hand-off bootstraps it, link/src/main.rs).
         super::remove_file(&plist_named(OLD_LABEL))
     }
 
@@ -402,35 +440,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_login_item_follows_hosting_unless_turned_off() {
-        // Hosting on: added by the installed Link, kept when it is already there.
-        assert_eq!(change(true, false, true, false, false), Change::Add);
-        assert_eq!(change(true, false, true, true, false), Change::Add);
-        assert_eq!(change(true, false, true, true, true), Change::Keep);
-        // A copy run from elsewhere doesn't point it at itself.
-        assert_eq!(change(true, false, false, false, false), Change::Keep);
-        assert_eq!(change(true, false, false, true, false), Change::Keep);
-        // Hosting off, or turned off: removed, whichever copy wrote it.
-        assert_eq!(change(false, false, true, true, true), Change::Remove);
-        assert_eq!(change(false, false, false, true, false), Change::Remove);
-        assert_eq!(change(true, true, true, true, true), Change::Remove);
-        assert_eq!(change(false, false, true, false, false), Change::Keep);
-        assert_eq!(change(true, true, true, false, false), Change::Keep);
+    fn the_login_item_follows_keep_running_or_reopen_realtimex() {
+        // #3241 Q5: wanted is keep_running || reopen_realtimex.
+        let wanted = |keep_running: bool, reopen: bool| keep_running || reopen;
+        for (keep_running, reopen) in [(true, true), (true, false), (false, true)] {
+            let on = wanted(keep_running, reopen);
+            // Added by the installed Link, kept when it is already there in today's form.
+            assert_eq!(change(on, true, false, false), Change::Add);
+            assert_eq!(change(on, true, true, false), Change::Add);
+            assert_eq!(change(on, true, true, true), Change::Keep);
+            // A copy run from elsewhere doesn't point it at itself.
+            assert_eq!(change(on, false, false, false), Change::Keep);
+            assert_eq!(change(on, false, true, false), Change::Keep);
+        }
+        // Both off: removed, whichever copy wrote it.
+        let off = wanted(false, false);
+        assert_eq!(change(off, true, true, true), Change::Remove);
+        assert_eq!(change(off, false, true, false), Change::Remove);
+        assert_eq!(change(off, true, false, false), Change::Keep);
     }
 
     #[test]
-    fn turning_it_off_is_kept_across_restarts() {
+    fn the_old_opt_out_is_retired_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        // Installs from before the setting follow hosting.
-        assert!(!opted_out(&store));
-        set_opted_out(&store, true).unwrap();
+        // An install the 2026-10-23 app builds turned off.
+        store.set(OPT_OUT_KEY, &json!(true)).unwrap();
+        assert!(retire_opt_out(&store).unwrap(), "cleared now: the caller logs it");
+        assert_eq!(store.get(OPT_OUT_KEY), None);
+        assert_eq!(store.get(OPT_OUT_RETIRED_KEY), Some(json!(true)));
+        // Kept across restarts, and never logged again.
         drop(store);
         let store = Store::open(dir.path()).unwrap();
-        assert!(opted_out(&store));
-        set_opted_out(&store, false).unwrap();
-        assert!(!opted_out(&store));
+        assert!(!retire_opt_out(&store).unwrap());
+        assert!(!retire_opt_out(&store).unwrap());
+        // An install that never had it: nothing to log, still marked.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = Store::open(fresh_dir.path()).unwrap();
+        assert!(!retire_opt_out(&fresh).unwrap());
+        assert_eq!(fresh.get(OPT_OUT_RETIRED_KEY), Some(json!(true)));
+    }
+
+    #[test]
+    fn turning_start_at_login_off_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let off = requested(false).unwrap();
+        assert!(off.contains("ignored"));
+        assert_eq!(requested(true), None);
+        // No opt-out is written: the login item still follows Keep running or Reopen RealTimeX.
         assert_eq!(store.get(OPT_OUT_KEY), None);
+        assert_eq!(change(true, true, false, false), Change::Add);
+    }
+
+    #[test]
+    fn the_launch_agent_keeps_the_tray_alive() {
+        let text = launch_agent_text(
+            "ai.realtimex.link.agent",
+            "/Applications/RealTimeX Link.app/Contents/MacOS/rtx-link",
+        );
+        assert!(text.contains(
+            "<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>"
+        ));
+        assert!(text.contains("<key>ThrottleInterval</key>\n  <integer>10</integer>"));
+        assert!(text.contains("<key>RunAtLoad</key>\n  <true/>"));
+        assert!(in_current_form(&text));
+        // The program is still read first.
+        assert_eq!(
+            launch_agent_program(&text).as_deref(),
+            Some("/Applications/RealTimeX Link.app/Contents/MacOS/rtx-link")
+        );
+        // An item from before #3241 (no KeepAlive) isn't in today's form: rewritten once.
+        let before = text.replace(
+            "  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n",
+            "",
+        );
+        assert!(names_realtimex(&before));
+        assert!(!in_current_form(&before));
+        assert_eq!(launch_agent_program(&before), launch_agent_program(&text));
     }
 
     #[test]
@@ -455,7 +542,7 @@ mod tests {
         assert_eq!(launch_agent_program(&older), launch_agent_program(today));
         assert!(!names_realtimex(&today.replace("co.realtimex.ai", "com.example.other")));
         // The present-but-not-ours case: rewritten (Change::Add), never removed.
-        assert_eq!(change(true, false, true, true, false), Change::Add);
+        assert_eq!(change(true, true, true, false), Change::Add);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! The theme and the language as Settings shows them, and the changes still on their way to
-//! rtx-linkd. Changes are sent one at a time in the order they were made, so the last one chosen
+//! The theme, the language and "Reopen RealTimeX if it crashes" as Settings shows them, and the
+//! changes still on their way to rtx-linkd. Changes are sent one at a time in the order they were made, so the last one chosen
 //! is the one kept; a change the daemon didn't take goes back only when nothing newer is waiting,
 //! and a status read from before a change never replaces it.
 
@@ -7,16 +7,20 @@
 pub enum Field {
     Theme,
     Language,
+    /// "Reopen RealTimeX if it crashes" (realtimex-ai-app#3241): "true" or "false", sent as
+    /// POST /v1/supervision { enabled }. "" until the daemon says (an older one never does).
+    Reopen,
 }
 
 impl Field {
-    const ALL: [Field; 2] = [Field::Theme, Field::Language];
+    const ALL: [Field; 3] = [Field::Theme, Field::Language, Field::Reopen];
 
-    /// Its name in POST /v1/appearance.
+    /// Its name in POST /v1/appearance; Reopen goes to POST /v1/supervision as `enabled`.
     pub fn key(self) -> &'static str {
         match self {
             Field::Theme => "theme",
             Field::Language => "language",
+            Field::Reopen => "enabled",
         }
     }
 }
@@ -40,14 +44,14 @@ struct Choice {
 
 #[derive(Clone, Debug, Default)]
 pub struct Choices {
-    fields: [Choice; 2],
+    fields: [Choice; 3],
     /// A thread is sending changes.
     pub writing: bool,
 }
 
 /// Which changes had been made when a status read started.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Edits([u64; 2]);
+pub struct Edits([u64; 3]);
 
 impl Choices {
     fn field(&self, field: Field) -> &Choice {
@@ -117,15 +121,19 @@ impl Choices {
     /// A successful GET /v1/status, started when `edits` were the changes made. It sets a field
     /// only when nothing was chosen for it since and nothing is on its way.
     pub fn status(&mut self, edits: Edits, theme: &str, language: &str) {
-        for (field, value) in [(Field::Theme, theme), (Field::Language, language)] {
-            let choice = self.field_mut(field);
-            if choice.edits == edits.0[field as usize]
-                && choice.wanted.is_none()
-                && choice.sending.is_none()
-            {
-                choice.confirmed = value.to_string();
-                choice.shown = value.to_string();
-            }
+        self.status_of(edits, Field::Theme, theme);
+        self.status_of(edits, Field::Language, language);
+    }
+
+    /// The same for one field.
+    pub fn status_of(&mut self, edits: Edits, field: Field, value: &str) {
+        let choice = self.field_mut(field);
+        if choice.edits == edits.0[field as usize]
+            && choice.wanted.is_none()
+            && choice.sending.is_none()
+        {
+            choice.confirmed = value.to_string();
+            choice.shown = value.to_string();
         }
     }
 }
@@ -219,6 +227,30 @@ mod tests {
         send_all(&mut choices, true);
         assert_eq!(choices.shown(Field::Language), "vi");
         assert!(choices.failed().is_empty());
+    }
+
+    #[test]
+    fn reopen_realtimex_goes_through_the_same_ordered_queue() {
+        let mut choices = Choices::default();
+        assert_eq!(choices.shown(Field::Reopen), "", "hidden until the daemon says");
+        let before = choices.edits();
+        choices.status_of(before, Field::Reopen, "true");
+        assert_eq!(choices.shown(Field::Reopen), "true");
+        // A theme change on its way first, then Reopen off: sent after it, in order.
+        choices.choose(Field::Theme, "dark");
+        choices.choose(Field::Reopen, "false");
+        assert_eq!(choices.next_write(), Some((Field::Theme, "dark".into())));
+        assert_eq!(choices.next_write(), None);
+        // A status read from before the change doesn't put it back on.
+        choices.status_of(before, Field::Reopen, "true");
+        assert_eq!(choices.shown(Field::Reopen), "false");
+        choices.finished(Field::Theme, true);
+        assert_eq!(choices.next_write(), Some((Field::Reopen, "false".into())));
+        // Refused: back on, with Try again.
+        choices.finished(Field::Reopen, false);
+        assert_eq!(choices.shown(Field::Reopen), "true");
+        assert_eq!(choices.failed(), vec![(Field::Reopen, "false".to_string())]);
+        assert_eq!(Field::Reopen.key(), "enabled");
     }
 
     #[test]

@@ -131,9 +131,23 @@ and the draft is published, as Link's latest unless a newer release is out (`ci/
   `/Applications/RealTimeX Link.app`, `C:\Program Files\RealTimeX Link`, `/opt/RealTimeX Link`
   (with an applications-menu entry on Linux). It never downgrades, and stops an older Link first.
   RealTimeX runs it from its installers (Windows, Linux) or at start (macOS).
-- **At login:** `GET/POST /v1/autostart` on the local API adds or removes a per-user login item
-  (LaunchAgent, Run key, XDG autostart) that starts `rtx-link --background`. RealTimeX turns it on
-  with its Remote Control plugin and off without it.
+- **At login:** a per-user login item (LaunchAgent, Run key, XDG autostart) starts `rtx-link
+  --background` while **Keep RealTimeX Link running** or **Reopen RealTimeX if it crashes** is on
+  (with the defaults, always; realtimex-ai-app#3241). It no longer follows Remote Control: the old
+  opt-out is cleared once, and `POST /v1/autostart {enabled:false}` is answered but changes nothing.
+  On macOS the LaunchAgent has `KeepAlive {SuccessfulExit=false}`, so launchd starts the tray again
+  after a crash or a kill (not after Quit), and an `rtx-link` started any other way hands the tray
+  to that job.
+- **Reopen RealTimeX if it crashes** (realtimex-ai-app#3241, Settings, this computer's own Link):
+  the tray watches the installed RealTimeX through the `app-session.json` it writes in Link's data
+  folder, and reopens it after an exit it didn't announce: after 3, 10 and 30 s, stopping at the 4th
+  in 10 minutes until RealTimeX next starts normally. When RealTimeX's server stays down after its own
+  restarts, the app asks in the lease (`restart: {reason: backend-down, nonce}`); the watcher answers
+  with `ack: {pid, nonce}` in `app-supervision.json` only with the setting on and no crash-loop stop,
+  owes the reopening from then on (even across a Link restart; Link's Quit withdraws it), and the app
+  quits only after that answer. It is reopened the same way (`crates/link/src/supervise.rs`; decisions in
+  `app-supervision.log`). `GET/POST /v1/supervision {enabled}`; `GET /v1/status` has
+  `reopenRealtimex` and `supervision: {state, last}`.
 - **Account:** Link signs in to the RealTimeX account itself: Sign in opens the browser at
   accounts.realtimex.ai (Keycloak client `realtimex-link`, Authorization Code with PKCE, answered on
   a one-time `127.0.0.1` port), and Link keeps the offline refresh token sealed and renews its own

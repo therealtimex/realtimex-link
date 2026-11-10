@@ -52,6 +52,9 @@ pub const FEATURES: &[&str] = &[
     // realtimex-ai-app#3055 §1.4: GET/DELETE /v1/host/audit (the Activity tab), and
     // `auditDropped` in the overview.
     "audit",
+    // realtimex-ai-app#3241: GET/POST /v1/supervision ("Reopen RealTimeX if it crashes"), and
+    // `reopenRealtimex` and `supervision` in GET /v1/status.
+    "supervision",
 ];
 /// POST /v1/hello's proof: HMAC-SHA256 keyed with the token over this, the daemon's port, and the
 /// caller's nonce (see `hello_proof`).
@@ -99,6 +102,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/autostart", get(autostart).post(set_autostart))
         .route("/v1/unattended", get(unattended).post(set_unattended))
         .route("/v1/appearance", get(appearance).post(set_appearance))
+        .route("/v1/supervision", get(supervision).post(set_supervision))
         .route("/v1/window/open", post(open_window))
         .route("/v1/running", get(running).post(set_running))
         .route(
@@ -303,7 +307,17 @@ async fn status(State(state): State<Shared>) -> Json<Value> {
         // Whether remote control can run here now, and why not (realtimex-link#13), e.g.
         // `no-session-bridge` on macOS under the supervisor.
         "remoteControl": remote_control(&state.host.backend),
+        // "Reopen RealTimeX if it crashes" (#3241), which the tray's watcher follows, and what
+        // the watcher last decided.
+        "reopenRealtimex": state.host.reopen_realtimex(),
+        "supervision": supervision_state(),
     }))
+}
+
+/// The tray watcher's `{state, last}` (supervision.rs).
+fn supervision_state() -> Value {
+    let (state, last) = crate::supervision::state(crate::paths::data_dir().as_deref());
+    json!({ "state": state, "last": last })
 }
 
 fn remote_control(backend: &crate::backend::Backend) -> Value {
@@ -746,9 +760,10 @@ async fn use_realtimex(State(state): State<Shared>) -> Answer {
 
 /// Start at login (autostart.rs): { enabled, available, optedOut }. Available: rtx-link is
 /// installed next to this daemon, in the installed Link, so there is something to start. Opted
-/// out: turned off here, so hosting doesn't add it back. Only the default instance has a login
-/// item (instance.rs): another answers enabled and available false, defaultInstance false.
-async fn autostart(State(state): State<Shared>) -> Answer {
+/// out is always false now: the login item follows Keep running or Reopen RealTimeX, not Remote
+/// Control (#3241 Q5). Only the default instance has a login item (instance.rs): another answers
+/// enabled and available false, defaultInstance false.
+async fn autostart(State(_state): State<Shared>) -> Answer {
     let standard = crate::paths::is_standard();
     // Under Link's service the daemon is SYSTEM, whose HKCU isn't the owner's: the owner's login
     // item was made sure of when Start with this computer was turned on, and stays while it is
@@ -757,20 +772,36 @@ async fn autostart(State(state): State<Shared>) -> Answer {
     Ok(Json(json!({
         "enabled": standard && enabled,
         "available": standard && crate::autostart::available(),
-        "optedOut": state.host.start_at_login_opted_out(),
+        "optedOut": false,
         "defaultInstance": standard,
     })))
 }
 
-/// { enabled: bool }: false turns starting at login off and keeps it off; true lets the login
-/// item follow hosting again (there while this computer allows remote control).
+/// { enabled: bool }, which older RealTimeX builds send from Remote Control: answered in the same
+/// shape, and changes nothing (#3241 Q5); false is logged as ignored.
 async fn set_autostart(State(state): State<Shared>, Body64(body): Body64) -> Answer {
     let on = body
         .get("enabled")
         .and_then(Value::as_bool)
         .ok_or_else(|| ApiError::bad_request("enabled must be true or false"))?;
-    state.host.set_start_at_login(on)?;
+    state.host.set_start_at_login(on);
     autostart(State(state)).await
+}
+
+/// "Reopen RealTimeX if it crashes" (supervision.rs, realtimex-ai-app#3241): { enabled, state,
+/// last }, the state and last decision from the tray's app-supervision.json.
+async fn supervision(State(state): State<Shared>) -> Answer {
+    Ok(Json(crate::supervision::body(
+        &state.host.store,
+        crate::paths::data_dir().as_deref(),
+    )))
+}
+
+/// { enabled: bool } only; any other field is a 400. Nothing here names a program or arguments.
+async fn set_supervision(State(state): State<Shared>, Body64(body): Body64) -> Answer {
+    let on = crate::supervision::parse_body(&body)?;
+    state.host.set_reopen_realtimex(on)?;
+    supervision(State(state)).await
 }
 
 /// Start with this computer (unattended.rs; realtimex-ai-app#2967 contract §6): `{supported,

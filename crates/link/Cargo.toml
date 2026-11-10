@@ -38,10 +38,13 @@ memmap2 = "0.9.12"
 # The window's native handle, to keep a --background start's window off the screen (dock.rs, veil).
 raw-window-handle = "0.6.2"
 
+# SIGTERM passed on to rtx-linkd under launchd (launchd.rs); the RealTimeX watcher's process
+# checks, its session-ending signals and Linux's setsid (supervise.rs, realtimex-ai-app#3241).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 # macOS: in the Dock only while the window is open (dock.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
-# SIGTERM passed on to rtx-linkd under launchd (launchd.rs).
-libc.workspace = true
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "objc2-core-foundation"] }
 # The process name, which winit's app menu uses (dock.rs).
@@ -54,6 +57,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Graphics_Dwm",
     # open_url: ShellExecuteW (Shell + its SHOW_WINDOW_CMD) on a COM-initialised thread.
     "Win32_System_Com",
+    # supervise.rs: OpenProcess, QueryFullProcessImageNameW and GetProcessTimes on RealTimeX's pid.
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

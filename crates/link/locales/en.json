@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Couldn't save the setting",
   "settings.saveFailed": "Link kept the previous one. Check that RealTimeX Link is running, then try again.",
   "settings.tryAgain": "Try again",
+  "settings.reopenRealtimex": "Reopen RealTimeX if it crashes",
   "settings.startWithComputer": "Start with this computer",
   "settings.startWithComputerHelp": "RealTimeX Link starts when this computer turns on, so computers you've allowed can connect even before anyone signs in. To get past the sign-in screen, they still need a Windows password.",
   "settings.startWithComputerHelpMac": "RealTimeX Link starts when this Mac turns on, so computers you've allowed can connect at the login window and lock screen. To log in, they still need a Mac password. After a restart with FileVault on, someone must unlock the Mac at the computer first.",

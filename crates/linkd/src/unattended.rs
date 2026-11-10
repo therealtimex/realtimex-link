@@ -76,29 +76,14 @@ impl Config {
 
 /// `%ProgramData%\RealTimeX Link`: the installer creates it, writable by SYSTEM and
 /// administrators only. macOS: [`MACOS_MACHINE_DIR`], root's.
+// Only Windows' service reads it since the login item stopped depending on it (#3241).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn machine_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
         return PathBuf::from(MACOS_MACHINE_DIR);
     }
     let base = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
     PathBuf::from(base).join("RealTimeX Link")
-}
-
-/// Whether this data folder's owner turned it on (its login item stays while it is: SD §1).
-/// macOS reads the choice only from a root-owned folder and file that aren't links and that
-/// nobody else may write (#11 M8): anything else reads as off.
-pub fn enabled_for(data_dir: &Path) -> bool {
-    if cfg!(windows) {
-        return Config::load(&machine_dir()).runs(data_dir);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let dir = machine_dir();
-        if root_only(&dir) && root_only(&dir.join(CONFIG_FILE)) {
-            return Config::load(&dir).runs(data_dir);
-        }
-    }
-    false
 }
 
 /// A path root may trust: no link, owned by root, and no group or other write.

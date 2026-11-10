@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "No se pudo guardar el ajuste",
   "settings.saveFailed": "Link conservó el anterior. Comprueba que RealTimeX Link se esté ejecutando y vuelve a intentarlo.",
   "settings.tryAgain": "Intentar de nuevo",
+  "settings.reopenRealtimex": "Volver a abrir RealTimeX si se bloquea",
   "settings.startWithComputer": "Iniciar con este equipo",
   "settings.startWithComputerHelp": "RealTimeX Link se inicia al encender este equipo, así que los equipos que has permitido pueden conectarse incluso antes de que alguien inicie sesión. Para pasar la pantalla de inicio de sesión, aún necesitan una contraseña de Windows.",
   "settings.startWithComputerHelpMac": "RealTimeX Link se inicia al encender este Mac, así que los equipos que permitiste pueden conectarse en la ventana de inicio de sesión y la pantalla de bloqueo. Para iniciar sesión, siguen necesitando una contraseña del Mac. Tras reiniciar con FileVault activado, alguien debe desbloquear el Mac en persona primero.",

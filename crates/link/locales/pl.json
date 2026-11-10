@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Nie udało się zapisać ustawienia",
   "settings.saveFailed": "Link zachował poprzednie. Sprawdź, czy RealTimeX Link działa, i spróbuj ponownie.",
   "settings.tryAgain": "Spróbuj ponownie",
+  "settings.reopenRealtimex": "Otwórz ponownie RealTimeX, jeśli ulegnie awarii",
   "settings.startWithComputer": "Uruchamiaj z tym komputerem",
   "settings.startWithComputerHelp": "RealTimeX Link uruchamia się po włączeniu tego komputera, więc dozwolone komputery mogą się połączyć, zanim ktokolwiek się zaloguje. Aby przejść przez ekran logowania, nadal potrzebują hasła do Windows.",
   "settings.startWithComputerHelpMac": "RealTimeX Link uruchamia się po włączeniu tego Maca, więc dozwolone komputery mogą się połączyć w oknie logowania i na ekranie blokady. Aby się zalogować, nadal potrzebują hasła Maca. Po restarcie z włączonym FileVault ktoś musi najpierw odblokować Maca na miejscu.",

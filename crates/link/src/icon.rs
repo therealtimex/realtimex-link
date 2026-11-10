@@ -81,6 +81,8 @@ pub fn run() -> eframe::Result {
         }
     }
     let shared = Arc::new(Mutex::new(Snapshot::default()));
+    // The icon's process watches RealTimeX (supervise.rs, realtimex-ai-app#3241).
+    crate::supervise::start(shared.clone());
     let (refresh, wake) = channel();
     // No window draws here: the context only carries what the shared code expects.
     let ctx = egui::Context::default();
