@@ -867,7 +867,7 @@ impl Host {
     /// "Keep RealTimeX Link running" (realtimex-ai-app#2836). Off: the relay stops (nothing
     /// shared reaches this computer), remote control stops and Link no longer starts at login; the
     /// local API still answers, so RealTimeX can say Link is off. On: all of it comes back, at
-    /// login too (an earlier opt-out through POST /v1/autostart is cleared).
+    /// login too.
     /// How many virtual displays a headless GNOME Wayland session records (1 to 4): kept with
     /// the settings, taken by the next remote session (realtimex-link#12).
     pub fn set_virtual_displays(&self, count: u64) -> Result<(), ApiError> {
@@ -883,9 +883,6 @@ impl Host {
     pub async fn set_keep_running(&self, on: bool) -> Result<(), ApiError> {
         self.state().keep_running = on;
         self.save_settings()?;
-        if on {
-            crate::autostart::set_opted_out(&self.store, false)?;
-        }
         self.follow_hosting_at_login();
         if !on {
             self.end_hosting().await;
@@ -900,6 +897,23 @@ impl Host {
         Ok(())
     }
 
+    /// "Reopen RealTimeX if it crashes" (supervision.rs, realtimex-ai-app#3241): on by default.
+    pub fn reopen_realtimex(&self) -> bool {
+        crate::supervision::enabled(&self.store)
+    }
+
+    /// Turn it on or off; the login item follows Keep running or this (Q5).
+    pub fn set_reopen_realtimex(&self, on: bool) -> Result<(), ApiError> {
+        crate::supervision::set_enabled(&self.store, on)?;
+        self.follow_hosting_at_login();
+        (self.log)(if on {
+            "[link] RealTimeX is reopened if it crashes"
+        } else {
+            "[link] RealTimeX is no longer reopened if it crashes"
+        });
+        Ok(())
+    }
+
     /// No more incoming control: viewers are cut off first, then capture stops.
     async fn end_hosting(&self) {
         self.end_streams(|_| true).await;
@@ -908,22 +922,18 @@ impl Host {
         self.state().session = None;
     }
 
-    /// Link kept running means this computer should be reachable after a restart too: Link
-    /// starts at login. Turned off, nothing needs Link at login, so the item goes (autostart.rs).
-    /// Turned off through POST /v1/autostart, it stays off until the switch is turned on again.
-    /// A copy with its own data folder (development, tests) leaves the login item alone.
+    /// Link starts at login while Keep running or Reopen RealTimeX is on (realtimex-ai-app#3241
+    /// Q5): with the defaults, always. Both off, nothing needs Link at login, so the item goes
+    /// (autostart.rs). It no longer follows Remote Control. A copy with its own data folder
+    /// (development, tests) leaves the login item alone.
     fn sync_login_item(&self) -> anyhow::Result<()> {
         // The service's daemon runs as SYSTEM: its HKCU isn't the owner's.
         if !crate::paths::is_standard() || crate::service::active() {
             return Ok(());
         }
-        let running = self.state().keep_running;
-        // While this folder starts with the computer, its login item stays (SD §1): the
-        // person's choice is kept and applies again once that is off.
-        let unattended = crate::paths::data_dir()
-            .is_some_and(|dir| crate::unattended::enabled_for(&dir));
-        let opted_out = crate::autostart::opted_out(&self.store) && !unattended;
-        match crate::autostart::follow(running, opted_out)? {
+        let keep_running = self.state().keep_running;
+        let wanted = keep_running || self.reopen_realtimex();
+        match crate::autostart::follow(wanted)? {
             crate::autostart::Change::Add => {
                 (self.log)("[remote-control] RealTimeX Link starts at login");
             }
@@ -948,16 +958,26 @@ impl Host {
         }
     }
 
-    /// POST /v1/autostart: off is kept (the login item stays away whatever hosting does); on
-    /// lets it follow hosting again.
-    pub fn set_start_at_login(&self, on: bool) -> Result<(), ApiError> {
-        crate::autostart::set_opted_out(&self.store, !on)?;
-        self.sync_login_item()?;
-        Ok(())
+    /// POST /v1/autostart, which older RealTimeX builds may still send: it changes nothing now
+    /// (#3241 Q5). The login item follows Keep running or Reopen RealTimeX; off is logged as
+    /// ignored, on was already a no-op.
+    pub fn set_start_at_login(&self, on: bool) {
+        if let Some(line) = crate::autostart::requested(on) {
+            (self.log)(line);
+        }
     }
 
-    pub fn start_at_login_opted_out(&self) -> bool {
-        crate::autostart::opted_out(&self.store)
+    /// The one-time migration at start (#3241 Q5): the old opt-out goes.
+    fn retire_autostart_opt_out(&self) {
+        match crate::autostart::retire_opt_out(&self.store) {
+            Ok(true) => (self.log)(
+                "[link] start at login no longer follows Remote Control: the old opt-out was cleared (#3241)",
+            ),
+            Ok(false) => {}
+            Err(error) => (self.log)(&format!(
+                "[link] couldn't clear the old start-at-login opt-out: {error:#}"
+            )),
+        }
     }
 
     /// The owning RealTimeX lets this Link go (POST /v1/account/release). Link is its own again
@@ -1032,6 +1052,7 @@ impl Host {
             self.state().last_error = Some(error.message);
         }
         self.reconcile().await;
+        self.retire_autostart_opt_out();
         self.follow_hosting_at_login();
         self.relay.start();
         // Only the computer's Link updates itself (instance.rs): the others run whatever binary is
