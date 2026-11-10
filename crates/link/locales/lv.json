@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Neizdevās saglabāt iestatījumu",
   "settings.saveFailed": "Link paturēja iepriekšējo. Pārbaudiet, vai RealTimeX Link darbojas, un mēģiniet vēlreiz.",
   "settings.tryAgain": "Mēģināt vēlreiz",
+  "settings.reopenRealtimex": "Atkārtoti atvērt RealTimeX, ja tā avarē",
   "settings.startWithComputer": "Palaist kopā ar šo datoru",
   "settings.startWithComputerHelp": "RealTimeX Link tiek palaists, kad šis dators tiek ieslēgts, tāpēc atļautie datori var pievienoties pat pirms kāds pierakstās. Lai tiktu garām pierakstīšanās ekrānam, tiem joprojām vajag Windows paroli.",
   "settings.startWithComputerHelpMac": "RealTimeX Link palaižas, kad šis Mac tiek ieslēgts, tāpēc atļautie datori var pieslēgties pieteikšanās logā un bloķēšanas ekrānā. Lai pieteiktos, viņiem joprojām vajag Mac paroli. Pēc restartēšanas ar ieslēgtu FileVault kādam vispirms Mac jāatbloķē uz vietas.",

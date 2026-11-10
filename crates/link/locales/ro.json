@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Setarea nu a putut fi salvată",
   "settings.saveFailed": "Link a păstrat setarea anterioară. Verificați că RealTimeX Link rulează, apoi încercați din nou.",
   "settings.tryAgain": "Încearcă din nou",
+  "settings.reopenRealtimex": "Redeschide RealTimeX dacă se închide neașteptat",
   "settings.startWithComputer": "Pornește odată cu acest computer",
   "settings.startWithComputerHelp": "RealTimeX Link pornește când acest computer este pornit, așa că computerele pe care le-ați permis se pot conecta chiar înainte ca cineva să se conecteze la sesiune. Pentru a trece de ecranul de conectare, au totuși nevoie de o parolă Windows.",
   "settings.startWithComputerHelpMac": "RealTimeX Link pornește când acest Mac se aprinde, astfel încât computerele permise se pot conecta la fereastra de autentificare și la ecranul de blocare. Pentru autentificare au în continuare nevoie de o parolă Mac. După o repornire cu FileVault activat, cineva trebuie mai întâi să deblocheze Mac-ul la fața locului.",

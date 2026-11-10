@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Ayar kaydedilemedi",
   "settings.saveFailed": "Link öncekini korudu. RealTimeX Link'in çalıştığından emin olun ve tekrar deneyin.",
   "settings.tryAgain": "Tekrar dene",
+  "settings.reopenRealtimex": "RealTimeX çökerse yeniden aç",
   "settings.startWithComputer": "Bu bilgisayarla birlikte başlat",
   "settings.startWithComputerHelp": "RealTimeX Link bu bilgisayar açıldığında başlar, böylece izin verdiğiniz bilgisayarlar daha kimse oturum açmadan bağlanabilir. Oturum açma ekranını geçmek için yine de bir Windows parolası gerekir.",
   "settings.startWithComputerHelpMac": "RealTimeX Link bu Mac açıldığında başlar; böylece izin verdiğiniz bilgisayarlar giriş penceresinde ve kilit ekranında bağlanabilir. Giriş yapmak için yine de bir Mac parolası gerekir. FileVault açıkken yeniden başlatmadan sonra birinin Mac'in kilidini önce bilgisayarın başında açması gerekir.",

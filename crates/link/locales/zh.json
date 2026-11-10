@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "无法保存设置",
   "settings.saveFailed": "Link 保留了之前的设置。请确认 RealTimeX Link 正在运行，然后重试。",
   "settings.tryAgain": "重试",
+  "settings.reopenRealtimex": "RealTimeX 崩溃时重新打开",
   "settings.startWithComputer": "随这台电脑启动",
   "settings.startWithComputerHelp": "RealTimeX Link 会在这台电脑开机时启动，因此你允许的电脑在任何人登录之前就能连接。要越过登录界面，它们仍需要 Windows 密码。",
   "settings.startWithComputerHelpMac": "此 Mac 开机时 RealTimeX Link 即启动，因此你允许的电脑可在登录窗口和锁定屏幕连接。要登录，它们仍需要 Mac 密码。在开启 FileVault 的情况下重启后，需要有人先在这台 Mac 上解锁。",

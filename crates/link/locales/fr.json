@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Impossible d'enregistrer le réglage",
   "settings.saveFailed": "Link a conservé le précédent. Vérifiez que RealTimeX Link est en cours d'exécution, puis réessayez.",
   "settings.tryAgain": "Réessayer",
+  "settings.reopenRealtimex": "Rouvrir RealTimeX en cas de plantage",
   "settings.startWithComputer": "Démarrer avec cet ordinateur",
   "settings.startWithComputerHelp": "RealTimeX Link démarre dès que cet ordinateur s'allume : les ordinateurs que vous avez autorisés peuvent se connecter avant même que quelqu'un ouvre une session. Pour passer l'écran de connexion, ils ont toujours besoin d'un mot de passe Windows.",
   "settings.startWithComputerHelpMac": "RealTimeX Link démarre quand ce Mac s'allume : les ordinateurs autorisés peuvent se connecter à la fenêtre de connexion et à l'écran verrouillé. Pour ouvrir une session, il leur faut toujours un mot de passe Mac. Après un redémarrage avec FileVault activé, quelqu'un doit d'abord déverrouiller le Mac sur place.",

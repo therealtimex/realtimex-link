@@ -239,13 +239,25 @@ pub fn save_setting(
             (state.api.clone(), next)
         };
         let Some((field, value)) = next else { break };
-        let mut body = serde_json::Map::new();
-        body.insert(field.key().to_string(), json!(value));
-        let taken = api.is_some_and(|api| api.post("/v1/appearance", Value::Object(body)).is_ok());
+        let (path, body) = setting_request(field, &value);
+        let taken = api.is_some_and(|api| api.post(path, body).is_ok());
         lock(&shared).choices.finished(field, taken);
         let _ = refresh.send(());
         ctx.request_repaint();
     });
+}
+
+/// Where a Settings change goes: the theme and the language to POST /v1/appearance, Reopen
+/// RealTimeX to POST /v1/supervision { enabled } (realtimex-ai-app#3241), nothing else in it.
+fn setting_request(field: Field, value: &str) -> (&'static str, Value) {
+    match field {
+        Field::Reopen => ("/v1/supervision", json!({ "enabled": value == "true" })),
+        Field::Theme | Field::Language => {
+            let mut body = serde_json::Map::new();
+            body.insert(field.key().to_string(), json!(value));
+            ("/v1/appearance", Value::Object(body))
+        }
+    }
 }
 
 /// What this process is to the daemon (POST /v1/window/open): "window", or on Linux "tray" for
@@ -318,6 +330,11 @@ pub fn poll_loop(shared: Shared, wake: Receiver<()>, ctx: egui::Context) {
                     state
                         .choices
                         .status(edits, field("appearance"), field("language"));
+                    // Reopen RealTimeX (#3241); an older daemon has none, and Settings hides it.
+                    if let Some(on) = status["reopenRealtimex"].as_bool() {
+                        let on = if on { "true" } else { "false" };
+                        state.choices.status_of(edits, Field::Reopen, on);
+                    }
                 }
                 (
                     state.choices.shown(Field::Theme).to_string(),
@@ -522,6 +539,11 @@ impl LinkApp {
             )
             .ok()
         };
+        // macOS and Windows: this process holds the window and tray role, so it watches RealTimeX
+        // (supervise.rs; on Linux the icon's own process does).
+        if !cfg!(target_os = "linux") {
+            crate::supervise::start(shared.clone());
+        }
         theme::apply(&cc.egui_ctx);
         crate::dock::veil(cc);
         Self {
@@ -1859,9 +1881,45 @@ impl LinkApp {
                 ui.add_space(4.0);
                 caption(ui, t("settings.realtimexNote"));
             }
+            self.reopen_realtimex_ui(ui, ctx);
             // After the note, which doesn't cover it (contract §2).
             self.start_with_computer_ui(ui, ctx);
         });
+    }
+
+    /// "Reopen RealTimeX if it crashes" (realtimex-ai-app#3241): this computer's own Link only,
+    /// and only once the daemon says what it is. A change goes through the ordered Settings queue.
+    fn reopen_realtimex_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !crate::instance::current().default {
+            return;
+        }
+        let shown = lock(&self.shared).choices.shown(Field::Reopen).to_string();
+        if shown.is_empty() {
+            return;
+        }
+        let label = t("settings.reopenRealtimex");
+        let mut on = shown == "true";
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        let mut changed = false;
+        ui.horizontal_top(|ui| {
+            let side = 2.2 * ui.spacing().interact_size.y;
+            let text_width = (ui.available_width() - side - ui.spacing().item_spacing.x).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(text_width);
+                    ui.label(semibold(label.as_str()));
+                },
+            );
+            changed = toggle(ui, &mut on, &label).changed();
+        });
+        if changed {
+            let value = if on { "true" } else { "false" };
+            save_setting(&self.shared, &self.refresh, ctx, Field::Reopen, value);
+        }
     }
 
     /// Start with this computer (realtimex-ai-app#2967 contract §1–§4): shown only where Link
@@ -2107,6 +2165,26 @@ mod tests {
         assert_eq!(update_install_error(&json!({ "available": false, "installError": null })), None);
         assert_eq!(update_install_error(&json!({ "available": false, "installError": "" })), None);
         assert!(!t("update.failed").is_empty());
+    }
+
+    #[test]
+    fn reopen_realtimex_is_sent_to_supervision_and_nothing_else() {
+        assert_eq!(
+            setting_request(Field::Reopen, "false"),
+            ("/v1/supervision", json!({ "enabled": false }))
+        );
+        assert_eq!(
+            setting_request(Field::Reopen, "true"),
+            ("/v1/supervision", json!({ "enabled": true }))
+        );
+        assert_eq!(
+            setting_request(Field::Theme, "dark"),
+            ("/v1/appearance", json!({ "theme": "dark" }))
+        );
+        assert_eq!(
+            setting_request(Field::Language, "vi"),
+            ("/v1/appearance", json!({ "language": "vi" }))
+        );
     }
 
     fn refused(status: u16, code: Option<&str>) -> anyhow::Result<()> {

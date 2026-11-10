@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Không lưu được cài đặt",
   "settings.saveFailed": "Link giữ cài đặt trước đó. Hãy kiểm tra RealTimeX Link đang chạy rồi thử lại.",
   "settings.tryAgain": "Thử lại",
+  "settings.reopenRealtimex": "Mở lại RealTimeX nếu ứng dụng gặp sự cố",
   "settings.startWithComputer": "Khởi động cùng máy tính này",
   "settings.startWithComputerHelp": "RealTimeX Link khởi động khi máy tính này bật, nên các máy tính bạn đã cho phép có thể kết nối ngay cả trước khi có người đăng nhập. Để qua được màn hình đăng nhập, chúng vẫn cần mật khẩu Windows.",
   "settings.startWithComputerHelpMac": "RealTimeX Link khởi động khi máy Mac này bật, nên các máy bạn đã cho phép có thể kết nối ở màn hình đăng nhập và màn hình khóa. Để đăng nhập, họ vẫn cần mật khẩu Mac. Sau khi khởi động lại khi bật FileVault, cần có người mở khóa Mac tại máy trước.",

@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "تعذّر حفظ الإعداد",
   "settings.saveFailed": "احتفظ Link بالإعداد السابق. تحقق من أن RealTimeX Link قيد التشغيل، ثم حاول مرة أخرى.",
   "settings.tryAgain": "حاول مرة أخرى",
+  "settings.reopenRealtimex": "إعادة فتح RealTimeX إذا تعطّل",
   "settings.startWithComputer": "التشغيل مع بدء هذا الحاسوب",
   "settings.startWithComputerHelp": "يبدأ RealTimeX Link عند تشغيل هذا الحاسوب، لذا يمكن للحواسيب التي سمحت لها الاتصال حتى قبل أن يسجّل أي شخص الدخول. ولتجاوز شاشة تسجيل الدخول، ستظل بحاجة إلى كلمة مرور Windows.",
   "settings.startWithComputerHelpMac": "يبدأ RealTimeX Link عند تشغيل جهاز Mac هذا، لذا يمكن لأجهزة الكمبيوتر التي سمحت بها الاتصال عند نافذة تسجيل الدخول وشاشة القفل. لتسجيل الدخول، ما زالت تحتاج إلى كلمة مرور Mac. بعد إعادة التشغيل مع تفعيل FileVault، يجب أن يفتح أحدهم قفل جهاز Mac أمامه أولًا.",

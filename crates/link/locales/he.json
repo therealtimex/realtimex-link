@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "לא ניתן לשמור את ההגדרה",
   "settings.saveFailed": "Link שמר את ההגדרה הקודמת. ודא ש-RealTimeX Link פועל, ונסה שוב.",
   "settings.tryAgain": "נסה שוב",
+  "settings.reopenRealtimex": "פתיחה מחדש של RealTimeX אם הוא קורס",
   "settings.startWithComputer": "הפעלה עם המחשב הזה",
   "settings.startWithComputerHelp": "RealTimeX Link מופעל כשהמחשב הזה נדלק, כך שמחשבים שאישרת יכולים להתחבר עוד לפני שמישהו נכנס למערכת. כדי לעבור את מסך הכניסה, הם עדיין צריכים סיסמת Windows.",
   "settings.startWithComputerHelpMac": "RealTimeX Link מופעל כשה-Mac נדלק, כך שמחשבים שאישרת יכולים להתחבר בחלון ההתחברות ובמסך הנעילה. כדי להתחבר, הם עדיין צריכים סיסמת Mac. אחרי הפעלה מחדש כש-FileVault פעיל, מישהו צריך קודם לבטל את נעילת ה-Mac ליד המחשב.",

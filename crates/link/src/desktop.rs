@@ -43,14 +43,14 @@ fn spawn(program: &str, args: &[&str]) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Os {
+pub(crate) enum Os {
     MacOs,
     Windows,
     Linux,
 }
 
 impl Os {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         if cfg!(target_os = "macos") {
             Os::MacOs
         } else if cfg!(windows) {

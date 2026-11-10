@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Impossibile salvare l'impostazione",
   "settings.saveFailed": "Link ha mantenuto quella precedente. Controlla che RealTimeX Link sia in esecuzione, poi riprova.",
   "settings.tryAgain": "Riprova",
+  "settings.reopenRealtimex": "Riapri RealTimeX se si arresta in modo anomalo",
   "settings.startWithComputer": "Avvia con questo computer",
   "settings.startWithComputerHelp": "RealTimeX Link si avvia all'accensione di questo computer, così i computer che hai autorizzato possono connettersi anche prima che qualcuno acceda. Per superare la schermata di accesso, serve comunque una password di Windows.",
   "settings.startWithComputerHelpMac": "RealTimeX Link si avvia all'accensione di questo Mac, così i computer autorizzati possono connettersi alla finestra di login e alla schermata di blocco. Per accedere serve comunque una password del Mac. Dopo un riavvio con FileVault attivo, qualcuno deve prima sbloccare il Mac di persona.",

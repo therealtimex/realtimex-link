@@ -179,6 +179,7 @@
   "settings.saveFailedTitle": "Seadet ei õnnestunud salvestada",
   "settings.saveFailed": "Link jättis eelmise alles. Veendu, et RealTimeX Link töötab, ja proovi uuesti.",
   "settings.tryAgain": "Proovi uuesti",
+  "settings.reopenRealtimex": "Ava RealTimeX uuesti, kui see kokku jookseb",
   "settings.startWithComputer": "Käivita koos selle arvutiga",
   "settings.startWithComputerHelp": "RealTimeX Link käivitub, kui see arvuti sisse lülitatakse, nii et lubatud arvutid saavad ühenduda juba enne, kui keegi sisse logib. Sisselogimiskuvast mööda pääsemiseks vajavad nad siiski Windowsi parooli.",
   "settings.startWithComputerHelpMac": "RealTimeX Link käivitub selle Maci sisselülitamisel, nii et lubatud arvutid saavad ühenduse luua sisselogimisaknas ja lukustuskuval. Sisselogimiseks vajavad nad endiselt Maci parooli. Pärast taaskäivitust sisselülitatud FileVaultiga peab keegi Maci kõigepealt kohapeal avama.",
