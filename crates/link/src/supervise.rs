@@ -958,14 +958,21 @@ impl Watcher {
     fn answer_restart_request(&mut self) {
         let Some(watched) = &self.watched else { return };
         let (pid, start_ms) = (watched.pid, watched.start_ms);
-        let Some(nonce) = self
+        let Some(lease) = self
             .lease()
             .and_then(|file| file.lease)
             .filter(|lease| lease.pid == pid && lease.exit.is_none())
-            .and_then(|lease| lease.restart)
         else {
             return;
         };
+        // The request ended (its server is back): an answer it didn't act on is withdrawn.
+        if self.ack.as_ref().is_some_and(|ack| {
+            ack.pid == pid && ack.due_ms.is_none() && lease.restart.as_deref() != Some(ack.nonce.as_str())
+        }) {
+            self.ack = None;
+            self.record(pid, "withdrawn", "server back", &format!("server back pid {pid}; answer withdrawn"));
+        }
+        let Some(nonce) = lease.restart else { return };
         if self.ack.as_ref().is_some_and(|ack| ack.pid == pid && ack.nonce == nonce) {
             return;
         }
@@ -2042,6 +2049,42 @@ mod tests {
         assert_eq!(pc.state()["ack"], Value::Null);
         assert!(pc.watcher.memory.exits.is_empty());
         assert!(pc.log().contains("intended exit pid 200 (quit); relaunch cancelled"));
+    }
+
+    #[test]
+    fn a_request_that_ended_because_the_server_is_back_withdraws_the_answer() {
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"]["nonce"], "n-1");
+        // The person restarted the server: the app rewrote its lease without the request.
+        pc.lease(100, None);
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"], Value::Null);
+        assert!(pc.log().contains("server back pid 100; answer withdrawn"));
+        // A later crash is an ordinary one, not an owed server-down reopen.
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.log().contains("unannounced exit pid 100 → relaunch in 3s (1 of 3)"));
+    }
+
+    #[test]
+    fn declined_then_server_back_then_reopen_on_never_answers() {
+        // Product/UX round 2: give up -> declined (setting off) -> server back -> setting on.
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        lock(&pc.watcher.shared).status = Some(json!({ "reopenRealtimex": false }));
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        pc.lease(100, None);
+        lock(&pc.watcher.shared).status = Some(json!({ "reopenRealtimex": true }));
+        pc.watcher.tick();
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"], Value::Null);
+        assert!(!pc.log().contains("taking over"));
     }
 
     #[test]
