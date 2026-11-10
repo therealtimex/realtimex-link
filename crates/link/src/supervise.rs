@@ -66,6 +66,8 @@ pub const BACKEND_DOWN: &str = "backend-down";
 
 /// SIGTERM or SIGHUP reached the tray (macOS and Linux logout and shutdown).
 static STOPPING: AtomicBool = AtomicBool::new(false);
+/// Link's own Quit withdrew its answers ([`forget`]): the watcher writes no more state.
+static FORGOTTEN: AtomicBool = AtomicBool::new(false);
 
 // --- the lease --------------------------------------------------------------------------------
 
@@ -631,7 +633,9 @@ fn state_json(
         "last": last,
         "enabled": enabled,
         "watching": watching.map(|pid| json!({ "pid": pid })),
-        "ack": ack.map(|ack| json!({ "pid": ack.pid, "nonce": ack.nonce, "startMs": ack.start_ms })),
+        "ack": ack.map(|ack| json!({
+            "pid": ack.pid, "nonce": ack.nonce, "startMs": ack.start_ms, "dueMs": ack.due_ms,
+        })),
     })
 }
 
@@ -642,6 +646,9 @@ struct Ack {
     nonce: String,
     /// The pid's start time from the OS, so a reused pid is never taken for it.
     start_ms: i64,
+    /// Once the pid died and its relaunch was decided (counted once): when it is due (ms since the
+    /// epoch). Kept until the relaunch runs, so a Link restart during the wait still reopens.
+    due_ms: Option<i64>,
 }
 
 fn ack_of(file: Option<&Value>) -> Option<Ack> {
@@ -650,12 +657,15 @@ fn ack_of(file: Option<&Value>) -> Option<Ack> {
         pid: u32::try_from(ack.get("pid")?.as_u64()?).ok().filter(|pid| *pid > 1)?,
         nonce: printable(ack.get("nonce")?.as_str()?, 64),
         start_ms: ack.get("startMs")?.as_i64()?,
+        due_ms: ack.get("dueMs").and_then(Value::as_i64),
     })
 }
 
 /// Link's own Quit: it won't watch any more, so no answer it gave may make RealTimeX quit now
 /// (nobody would reopen it). Drops `ack` and `watching` from app-supervision.json.
 pub fn forget() {
+    // First: the watcher writes nothing more (it could put its answer back), then the file.
+    FORGOTTEN.store(true, Ordering::SeqCst);
     if !crate::api::is_default_instance() {
         return;
     }
@@ -886,6 +896,21 @@ impl Watcher {
             // Link came back (KeepAlive) after answering a restart request: if that RealTimeX has
             // died meanwhile, the reopening is still owed.
             if let Some(ack) = self.ack.clone() {
+                if let Some(due_ms) = ack.due_ms {
+                    // Died and counted before Link restarted: the relaunch is still owed, once.
+                    let wait = u64::try_from(due_ms - now_ms()).unwrap_or(0);
+                    self.pending = Some(Pending {
+                        pid: ack.pid,
+                        died_ms: due_ms,
+                        due: Instant::now() + Duration::from_millis(wait),
+                    });
+                    append_log(
+                        &self.dir,
+                        &format!("server down pid {}; relaunch still owed after a Link restart", ack.pid),
+                        now_ms(),
+                    );
+                    return true;
+                }
                 if !(self.sys.process)(ack.pid).is_some_and(|p| p.start_ms == ack.start_ms) {
                     self.watched = Some(Watched {
                         pid: ack.pid,
@@ -912,6 +937,10 @@ impl Watcher {
                 watched.long = true;
                 self.apply(&Event::AliveLong);
             }
+            // While the app may act on Link's answer, notice the switch at once.
+            if self.ack.as_ref().is_some_and(|ack| ack.due_ms.is_none()) {
+                self.fresh_setting();
+            }
             self.answer_restart_request();
         }
         true
@@ -934,10 +963,22 @@ impl Watcher {
             return;
         }
         let setting = self.fresh_setting();
-        if !setting || self.memory.stopped {
+        // The app never closes itself unless Link will reopen it: not when this exit would be the
+        // one that reaches the crash-loop stop.
+        let would_stop = matches!(
+            decide(&self.memory, &Event::Unannounced, now_ms(), true).0,
+            Decision::Stopped { .. }
+        );
+        if !setting || would_stop {
             if self.declined.as_deref() != Some(nonce.as_str()) {
                 self.declined = Some(nonce);
-                let why = if setting { "crash loop, stopped" } else { "setting off" };
+                let why = if !setting {
+                    "setting off"
+                } else if self.memory.stopped {
+                    "crash loop, stopped"
+                } else {
+                    "a reopening now would reach the crash-loop limit"
+                };
                 self.record(
                     pid,
                     "declined",
@@ -947,7 +988,7 @@ impl Watcher {
             }
             return;
         }
-        self.ack = Some(Ack { pid, nonce, start_ms });
+        self.ack = Some(Ack { pid, nonce, start_ms, due_ms: None });
         self.record(
             pid,
             "taking-over",
@@ -960,6 +1001,19 @@ impl Watcher {
     fn note_setting(&mut self, on: bool) {
         let changed = self.setting != on;
         self.setting = on;
+        // Turned off before the app acted on Link's answer: withdraw it, so the app keeps its
+        // notice (the switch wins over a pending agreement).
+        if !on && self.ack.as_ref().is_some_and(|ack| ack.due_ms.is_none()) {
+            let ack = self.ack.take();
+            if let Some(ack) = ack {
+                self.record(
+                    ack.pid,
+                    "withdrawn",
+                    "setting off",
+                    &format!("server down pid {}; setting off, answer withdrawn", ack.pid),
+                );
+            }
+        }
         if changed {
             self.save();
         }
@@ -994,6 +1048,9 @@ impl Watcher {
     }
 
     fn save(&self) {
+        if FORGOTTEN.load(Ordering::SeqCst) {
+            return;
+        }
         let watching = self.watched.as_ref().map(|watched| watched.pid);
         let text =
             state_json(&self.memory, &self.last, self.setting, watching, self.ack.as_ref()).to_string();
@@ -1067,8 +1124,12 @@ impl Watcher {
     fn died(&mut self) {
         let Some(watched) = self.watched.take() else { return };
         let pid = watched.pid;
-        // Whatever it was, the answer is settled by this death.
-        let acked = self.ack.take().is_some_and(|ack| ack.pid == pid);
+        // An answer for this pid stays (counted, with its due time) until the relaunch runs; any
+        // other answer is settled by this death.
+        let acked = self.ack.as_ref().is_some_and(|ack| ack.pid == pid && ack.due_ms.is_none());
+        if !acked {
+            self.ack = None;
+        }
         // Read again, past the cache: the announcement may be the last write before the exit.
         self.cache = read_lease(&self.dir);
         let announced = self
@@ -1083,13 +1144,23 @@ impl Watcher {
             // Answered, and it died before it could announce: still owed.
             None if acked => format!("server down pid {pid}"),
             Some(reason) => {
+                self.ack = None;
                 self.apply(&Event::Intended);
                 self.record(pid, "intended", &reason, &format!("intended exit pid {pid} ({reason})"));
                 return;
             }
             None => format!("unannounced exit pid {pid}"),
         };
-        match self.apply(&Event::Unannounced) {
+        let decision = self.apply(&Event::Unannounced);
+        match &decision {
+            Decision::Relaunch { delay_secs, .. } => {
+                if let Some(ack) = self.ack.as_mut() {
+                    ack.due_ms = Some(now_ms() + (*delay_secs as i64) * 1000);
+                }
+            }
+            _ => self.ack = None,
+        }
+        match decision {
             Decision::SettingOff => self.record(
                 pid,
                 "setting-off",
@@ -1129,6 +1200,7 @@ impl Watcher {
             Replacement::None => false,
             Replacement::Intended { pid, reason } => {
                 self.pending = None;
+                self.ack = None;
                 self.apply(&Event::Intended);
                 self.record(
                     pid,
@@ -1143,6 +1215,7 @@ impl Watcher {
                     return false;
                 };
                 self.pending = None;
+                self.ack = None;
                 self.record(
                     lease.pid,
                     "already-running",
@@ -1163,6 +1236,8 @@ impl Watcher {
             return;
         }
         let Some(pending) = self.pending.take() else { return };
+        // The owed relaunch is decided now, whatever the outcome.
+        self.ack = None;
         let setting = self.fresh_setting();
         self.cache = read_lease(&self.dir);
         let other = self
@@ -1763,10 +1838,11 @@ mod tests {
         pc.kill(100);
         pc.watcher.tick();
         assert!(pc.log().contains("server down pid 100 → relaunch in 3s (1 of 3)"));
-        assert_eq!(pc.state()["ack"], Value::Null, "settled by the death");
+        assert!(pc.state()["ack"]["dueMs"].is_i64(), "owed until the relaunch runs");
         pc.expire();
         pc.watcher.tick();
         assert_eq!(pc.launches(), 1);
+        assert_eq!(pc.state()["ack"], Value::Null, "settled once it ran");
     }
 
     #[test]
@@ -1790,6 +1866,25 @@ mod tests {
         pc.watcher.tick();
         assert_eq!(pc.state()["ack"], Value::Null);
         assert!(pc.log().contains("crash loop, stopped, RealTimeX keeps its notice"));
+        // Three exits already in the window: this one would be the 4th, so Link wouldn't reopen
+        // it, and it doesn't let the app close.
+        let mut pc = Pretend::new();
+        let now = now_ms();
+        pc.watcher.memory.exits = vec![now - 3 * 60_000, now - 2 * 60_000, now - 60_000];
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-3");
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"], Value::Null);
+        assert!(pc.log().contains("a reopening now would reach the crash-loop limit, RealTimeX keeps its notice"));
+        // Two in the window: the 3rd is still reopened, so it answers.
+        let mut pc = Pretend::new();
+        pc.watcher.memory.exits = vec![now - 2 * 60_000, now - 60_000];
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-4");
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"]["nonce"], "n-4");
     }
 
     #[test]
@@ -1829,6 +1924,60 @@ mod tests {
         pc.watcher.tick();
         assert_eq!(pc.watcher.watched.as_ref().map(|w| w.pid), Some(100));
         assert_eq!(pc.state()["ack"]["nonce"], "n-1");
+    }
+
+    #[test]
+    fn link_restarting_during_the_wait_still_reopens_once_and_counts_once() {
+        // Review: Link answers, the app exits with backend-down, Link sees the death and waits;
+        // then Link crashes and comes back during the wait.
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        pc.lease(100, Some(BACKEND_DOWN));
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some());
+        assert_eq!(pc.watcher.memory.exits.len(), 1);
+        assert!(pc.state()["ack"]["dueMs"].is_i64(), "the owed relaunch is on disk");
+        pc.restart_link();
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some(), "restored");
+        assert_eq!(pc.watcher.memory.exits.len(), 1, "not counted again");
+        assert!(pc.log().contains("relaunch still owed after a Link restart"));
+        pc.expire();
+        pc.watcher.tick();
+        for _ in 0..3 {
+            pc.watcher.tick();
+        }
+        assert_eq!(pc.launches(), 1, "exactly once");
+        assert_eq!(pc.watcher.memory.exits.len(), 1);
+        assert_eq!(pc.state()["ack"], Value::Null, "settled once it ran");
+        // Restarting again now owes nothing.
+        pc.restart_link();
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_none());
+    }
+
+    #[test]
+    fn turning_reopen_off_after_answering_withdraws_the_answer() {
+        // Review: request -> ack -> switch off before the app's next look: the app keeps its notice.
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"]["nonce"], "n-1");
+        lock(&pc.watcher.shared).status = Some(json!({ "reopenRealtimex": false }));
+        pc.watcher.tick();
+        let state = pc.state();
+        assert_eq!(state["ack"], Value::Null);
+        assert_eq!(state["enabled"], false);
+        assert!(pc.log().contains("server down pid 100; setting off, answer withdrawn"));
+        // And it isn't answered again while off.
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"], Value::Null);
     }
 
     #[test]

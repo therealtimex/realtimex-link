@@ -739,6 +739,25 @@ fn keep_running_copy(key: &str) -> String {
     }
 }
 
+/// Keep running's Off copy ("It won't start at login"): since #3241 the login item also stays
+/// while "Reopen RealTimeX if it crashes" is on, so it says so only when Link really won't start
+/// at login: this computer's own Link with Reopen off (or a daemon too old to report it, which
+/// still follows Keep running alone).
+fn keep_running_off_copy(key: &str, default_instance: bool, reopen_shown: &str) -> String {
+    if default_instance && reopen_shown != "true" {
+        key.to_string()
+    } else {
+        format!("{key}NoLogin")
+    }
+}
+
+impl LinkApp {
+    fn keep_running_off_key(&self, key: &str) -> String {
+        let reopen = lock(&self.shared).choices.shown(Field::Reopen).to_string();
+        keep_running_off_copy(key, crate::instance::current().default, &reopen)
+    }
+}
+
 fn caption(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(RichText::new(text.into()).small().weak());
 }
@@ -2047,7 +2066,7 @@ impl LinkApp {
         };
         let part = |part: &str| tf(&format!("confirm.{which}.{part}"), &[("name", name)]);
         let message = match confirm {
-            Confirm::TurnOffLink => part(&keep_running_copy("message")),
+            Confirm::TurnOffLink => part(&self.keep_running_off_key("message")),
             Confirm::StartWithComputer if cfg!(target_os = "macos") => part("messageMac"),
             _ => part("message"),
         };
@@ -2165,6 +2184,20 @@ mod tests {
         assert_eq!(update_install_error(&json!({ "available": false, "installError": null })), None);
         assert_eq!(update_install_error(&json!({ "available": false, "installError": "" })), None);
         assert!(!t("update.failed").is_empty());
+    }
+
+    #[test]
+    fn keep_running_off_says_no_login_only_when_link_really_wont_start_at_login() {
+        // Reopen on (the default): Link still starts at login.
+        assert_eq!(keep_running_off_copy("link.offDescription", true, "true"), "link.offDescriptionNoLogin");
+        assert_eq!(keep_running_off_copy("message", true, "true"), "messageNoLogin");
+        // Reopen off: today's login copy is true again.
+        assert_eq!(keep_running_off_copy("link.offDescription", true, "false"), "link.offDescription");
+        assert_eq!(keep_running_off_copy("message", true, "false"), "message");
+        // An older daemon without the setting follows Keep running alone.
+        assert_eq!(keep_running_off_copy("message", true, ""), "message");
+        // Another instance never starts at login.
+        assert_eq!(keep_running_off_copy("message", false, "false"), "messageNoLogin");
     }
 
     #[test]
