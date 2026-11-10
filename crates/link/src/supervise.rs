@@ -682,12 +682,61 @@ struct Watched {
 struct Pending {
     /// The pid that died.
     pid: u32,
+    /// When it was seen dead (ms since the epoch): a lease for another pid written since then is a
+    /// replacement session.
+    died_ms: i64,
     due: Instant,
+}
+
+/// What the watcher asks of the computer, so the whole sequence can be tested without one.
+struct System {
+    process: Box<dyn Fn(u32) -> Option<Proc> + Send>,
+    target: Box<dyn Fn() -> Option<PathBuf> + Send>,
+    session_ending: Box<dyn Fn() -> bool + Send>,
+    launch: Box<dyn FnMut(&Launch) -> std::io::Result<()> + Send>,
+}
+
+impl System {
+    fn real() -> Self {
+        Self {
+            process: Box::new(process),
+            target: Box::new(crate::desktop::realtimex_app),
+            session_ending: Box::new(session_ending),
+            launch: Box::new(|spec| launch(spec)),
+        }
+    }
+}
+
+/// While a relaunch waits: has another session taken the dead one's place? (The lease names
+/// another pid and was written after the death.)
+#[derive(Debug, PartialEq, Eq)]
+enum Replacement {
+    None,
+    /// It already announced its exit (e.g. the person opened RealTimeX and then quit it).
+    Intended { pid: u32, reason: String },
+    /// It may be running: adopt it if it passes Q2.
+    Candidate,
+}
+
+fn replacement(file: Option<&LeaseFile>, dead_pid: u32, died_ms: i64) -> Replacement {
+    let Some(file) = file else { return Replacement::None };
+    let Some(lease) = file.lease.as_ref().filter(|lease| lease.pid != dead_pid) else {
+        return Replacement::None;
+    };
+    // Whole seconds, like lease_is_fresh: an older lease for another pid is not a replacement.
+    if file.mtime_ms.div_euclid(1000) < died_ms.div_euclid(1000) {
+        return Replacement::None;
+    }
+    match &lease.exit {
+        Some(reason) => Replacement::Intended { pid: lease.pid, reason: reason.clone() },
+        None => Replacement::Candidate,
+    }
 }
 
 struct Watcher {
     dir: PathBuf,
     shared: Shared,
+    sys: System,
     os: Os,
     memory: Memory,
     last: Value,
@@ -711,15 +760,16 @@ pub fn start(shared: Shared) {
     let dir = crate::api::data_dir();
     let _ = std::thread::Builder::new()
         .name("supervise".into())
-        .spawn(move || Watcher::new(dir, shared).run());
+        .spawn(move || Watcher::new(dir, shared, System::real()).run());
 }
 
 impl Watcher {
-    fn new(dir: PathBuf, shared: Shared) -> Self {
+    fn new(dir: PathBuf, shared: Shared, sys: System) -> Self {
         let (memory, last) = load_state(&dir);
         Self {
             dir,
             shared,
+            sys,
             os: Os::current(),
             memory,
             last,
@@ -749,7 +799,9 @@ impl Watcher {
             }
         }
         if let Some(pending) = &self.pending {
-            if Instant::now() >= pending.due {
+            let due = Instant::now() >= pending.due;
+            // Keep looking while the relaunch waits: a session started meanwhile cancels it.
+            if !self.replaced() && due {
                 self.due();
             }
             return true;
@@ -763,7 +815,7 @@ impl Watcher {
             return true;
         };
         // A start time that no longer matches is a death too (the pid was reused).
-        if !process(watched.pid).is_some_and(|p| p.start_ms == watched.start_ms) {
+        if !(self.sys.process)(watched.pid).is_some_and(|p| p.start_ms == watched.start_ms) {
             self.died();
         } else if !watched.long && watched.since.elapsed() >= ALIVE_RESET {
             watched.long = true;
@@ -835,8 +887,8 @@ impl Watcher {
     /// main executable, and no older than the lease. A mismatch is logged once per pid.
     fn passes(&mut self, file: &LeaseFile, except: Option<u32>) -> Option<(Lease, Proc)> {
         let lease = file.lease.clone().filter(|lease| Some(lease.pid) != except)?;
-        let proc = process(lease.pid)?;
-        let target = crate::desktop::realtimex_app()?;
+        let proc = (self.sys.process)(lease.pid)?;
+        let target = (self.sys.target)()?;
         let expected = expected_executable(self.os, &target);
         let why = if !same_executable(&proc.exe, &expected, ignore_case(self.os)) {
             format!("{} is not the installed RealTimeX", proc.exe.display())
@@ -898,6 +950,7 @@ impl Watcher {
                 self.record(pid, "relaunch", &reason, &format!("unannounced exit pid {pid} → {reason}"));
                 self.pending = Some(Pending {
                     pid,
+                    died_ms: now_ms(),
                     due: Instant::now() + Duration::from_secs(delay_secs),
                 });
             }
@@ -914,8 +967,50 @@ impl Watcher {
         }
     }
 
+    /// While a relaunch waits, a session that took the dead one's place cancels it: one that has
+    /// already announced its exit counts as an intended exit (the count starts again), and one
+    /// that passes Q2 is adopted. True when the pending relaunch was cancelled.
+    fn replaced(&mut self) -> bool {
+        let Some(pending) = &self.pending else { return false };
+        let (dead, died_ms) = (pending.pid, pending.died_ms);
+        let file = self.lease();
+        match replacement(file.as_ref(), dead, died_ms) {
+            Replacement::None => false,
+            Replacement::Intended { pid, reason } => {
+                self.pending = None;
+                self.apply(&Event::Intended);
+                self.record(
+                    pid,
+                    "intended",
+                    &reason,
+                    &format!("intended exit pid {pid} ({reason}); relaunch cancelled"),
+                );
+                true
+            }
+            Replacement::Candidate => {
+                let Some((lease, proc)) = file.and_then(|file| self.passes(&file, Some(dead))) else {
+                    return false;
+                };
+                self.pending = None;
+                self.record(
+                    lease.pid,
+                    "already-running",
+                    "",
+                    &format!("already running (pid {}), no relaunch", lease.pid),
+                );
+                self.adopt(&lease, &proc);
+                true
+            }
+        }
+    }
+
     /// The wait is over: check again in order, then launch.
     fn due(&mut self) {
+        // Past the cache: the replacement may have written just now.
+        self.cache = read_lease(&self.dir);
+        if self.replaced() {
+            return;
+        }
         let Some(pending) = self.pending.take() else { return };
         let setting = self.fresh_setting();
         self.cache = read_lease(&self.dir);
@@ -923,9 +1018,9 @@ impl Watcher {
             .cache
             .clone()
             .and_then(|file| self.passes(&file, Some(pending.pid)));
-        let target = crate::desktop::realtimex_app();
+        let target = (self.sys.target)();
         let event = Event::Due {
-            session_ending: session_ending(),
+            session_ending: (self.sys.session_ending)(),
             other_live: other.as_ref().map(|(lease, _)| lease.pid),
             installed: target.is_some(),
         };
@@ -952,7 +1047,8 @@ impl Watcher {
             }
             Decision::Launch => {
                 let Some(target) = target else { return };
-                match launch(&launch_command(self.os, &target)) {
+                let spec = launch_command(self.os, &target);
+                match (self.sys.launch)(&spec) {
                     Ok(()) => self.record(pid, "relaunch", "relaunched", "relaunched RealTimeX"),
                     Err(error) => self.record(
                         pid,
@@ -1297,6 +1393,174 @@ mod tests {
         assert_eq!(std::fs::metadata(dir.path().join(format!("{LOG_FILE}.1"))).unwrap().len(), LOG_LIMIT);
         let log = std::fs::read_to_string(dir.path().join(LOG_FILE)).unwrap();
         assert!(log.starts_with("supervise: relaunched RealTimeX ["));
+    }
+
+    /// A watcher on a pretend computer: its processes, the installed target and its launches.
+    struct Pretend {
+        dir: TempDir,
+        procs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Proc>>>,
+        launches: std::sync::Arc<std::sync::Mutex<usize>>,
+        exe: PathBuf,
+        watcher: Watcher,
+    }
+
+    impl Pretend {
+        fn new() -> Self {
+            use std::sync::{Arc, Mutex};
+            let dir = tempdir();
+            // Paths that don't exist, so the target is compared as written.
+            let target = if cfg!(target_os = "macos") {
+                PathBuf::from("/rtx-none/Applications/RealTimeX.AI.app")
+            } else {
+                PathBuf::from("/rtx-none/opt/RealTimeX.AI/RealTimeX.AI")
+            };
+            let exe = expected_executable(Os::current(), &target);
+            let procs: Arc<Mutex<std::collections::HashMap<u32, Proc>>> = Arc::default();
+            let launches = Arc::new(Mutex::new(0usize));
+            let sys = System {
+                process: {
+                    let procs = procs.clone();
+                    Box::new(move |pid| procs.lock().unwrap().get(&pid).cloned())
+                },
+                target: Box::new(move || Some(target.clone())),
+                session_ending: Box::new(|| false),
+                launch: {
+                    let launches = launches.clone();
+                    Box::new(move |_| {
+                        *launches.lock().unwrap() += 1;
+                        Ok(())
+                    })
+                },
+            };
+            let shared: Shared = Arc::new(Mutex::new(crate::app::Snapshot::default()));
+            lock(&shared).status = Some(json!({ "reopenRealtimex": true, "instance": { "default": true } }));
+            let watcher = Watcher::new(dir.path().to_path_buf(), shared, sys);
+            Self { dir, procs, launches, exe, watcher }
+        }
+
+        /// RealTimeX `pid` runs (started a few seconds ago) and has written its lease.
+        fn start(&mut self, pid: u32) {
+            let proc = Proc { start_ms: now_ms() - 5_000, exe: self.exe.clone() };
+            self.procs.lock().unwrap().insert(pid, proc);
+            self.lease(pid, None);
+        }
+
+        fn lease(&self, pid: u32, exit: Option<&str>) {
+            let mut body = good();
+            body["pid"] = json!(pid);
+            if let Some(reason) = exit {
+                body["exit"] = json!({ "reason": reason, "at": iso(now_ms()) });
+            }
+            std::fs::write(self.dir.path().join(LEASE_FILE), lease_json(body)).unwrap();
+        }
+
+        fn kill(&self, pid: u32) {
+            self.procs.lock().unwrap().remove(&pid);
+        }
+
+        /// The relaunch's wait is over now.
+        fn expire(&mut self) {
+            self.watcher.pending.as_mut().expect("a relaunch waits").due = Instant::now();
+        }
+
+        fn launches(&self) -> usize {
+            *self.launches.lock().unwrap()
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join(LOG_FILE)).unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn a_crash_with_nothing_after_it_relaunches_once_the_wait_is_over() {
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        assert_eq!(pc.watcher.watched.as_ref().map(|w| w.pid), Some(100));
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some());
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 0, "not before the wait is over");
+        pc.expire();
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 1);
+        assert!(pc.log().contains("relaunched RealTimeX"));
+    }
+
+    #[test]
+    fn a_session_started_and_quit_during_the_back_off_cancels_the_relaunch() {
+        // Review (loop-issue-3241): crash -> relaunch waits -> the person opens RealTimeX -> Quit
+        // before the wait is over. That Quit must be honoured: no launch, and the count restarts.
+        let mut pc = Pretend::new();
+        pc.watcher.memory.exits = vec![now_ms() - 60_000];
+        pc.start(100);
+        pc.watcher.tick();
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some(), "the 2nd crash waits 10 s");
+        assert_eq!(pc.watcher.memory.exits.len(), 2);
+        // The person opens RealTimeX: the next look adopts it and cancels the relaunch.
+        pc.start(200);
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_none());
+        assert_eq!(pc.watcher.watched.as_ref().map(|w| w.pid), Some(200));
+        assert!(pc.log().contains("already running (pid 200), no relaunch"));
+        // ...and quits it.
+        pc.lease(200, Some("quit"));
+        pc.kill(200);
+        pc.watcher.tick();
+        for _ in 0..3 {
+            pc.watcher.tick();
+        }
+        assert_eq!(pc.launches(), 0);
+        assert!(pc.log().contains("intended exit pid 200 (quit)"));
+        assert!(pc.watcher.memory.exits.is_empty(), "an intended exit starts the count again");
+        assert!(!pc.watcher.memory.stopped);
+    }
+
+    #[test]
+    fn a_session_that_quit_between_two_looks_still_cancels_the_relaunch() {
+        // Opened and quit within one poll: Link never saw it alive, but its lease says it quit.
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some());
+        pc.lease(200, Some("quit"));
+        pc.expire();
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 0);
+        assert!(pc.watcher.pending.is_none());
+        assert!(pc.log().contains("intended exit pid 200 (quit); relaunch cancelled"));
+        assert!(pc.watcher.memory.exits.is_empty());
+    }
+
+    #[test]
+    fn only_a_lease_for_another_pid_written_after_the_death_replaces_it() {
+        let file = |pid: u32, exit: Option<&str>, mtime_ms: i64| LeaseFile {
+            mtime_ms,
+            size: 100,
+            lease: Some(Lease { pid, version: None, exit: exit.map(str::to_string) }),
+        };
+        let died = 1_762_743_600_500;
+        assert_eq!(replacement(None, 100, died), Replacement::None);
+        // The dead pid's own lease, announced or not, is not a replacement.
+        assert_eq!(replacement(Some(&file(100, None, died + 5_000)), 100, died), Replacement::None);
+        assert_eq!(replacement(Some(&file(100, Some("quit"), died + 5_000)), 100, died), Replacement::None);
+        // Another pid, written before the death: left over, not a replacement.
+        assert_eq!(replacement(Some(&file(200, Some("quit"), died - 2_000)), 100, died), Replacement::None);
+        // Another pid, written since.
+        assert_eq!(
+            replacement(Some(&file(200, Some("quit"), died + 2_000)), 100, died),
+            Replacement::Intended { pid: 200, reason: "quit".into() }
+        );
+        assert_eq!(replacement(Some(&file(200, None, died + 2_000)), 100, died), Replacement::Candidate);
+        // A lease that doesn't parse is nothing.
+        let unreadable = LeaseFile { mtime_ms: died + 2_000, size: 5, lease: None };
+        assert_eq!(replacement(Some(&unreadable), 100, died), Replacement::None);
     }
 
     #[test]
