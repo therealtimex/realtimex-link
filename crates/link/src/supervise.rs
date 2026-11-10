@@ -58,8 +58,10 @@ const DEFAULT_EXECUTABLE: &str = "RealTimeX.AI";
 /// At most this many exit times are kept (the window keeps far fewer).
 const MAX_EXITS: usize = 16;
 /// The exit reason RealTimeX gives when its server is down for good (its own server restarts gave
-/// up). The app quits by itself only while Link watches it with the setting on (`watching` and
-/// `enabled` in app-supervision.json), and Link reopens it like a crash: counted, with back-off.
+/// up). It first asks in the lease (`restart: {reason, nonce}`); a running watcher with the setting
+/// on and no crash-loop stop answers with `ack: {pid, nonce}` in app-supervision.json and owes the
+/// reopening from then on (kept across a Link restart). Only then does the app quit, and Link
+/// reopens it like a crash: counted, with back-off. Without an answer the app keeps its notice.
 pub const BACKEND_DOWN: &str = "backend-down";
 
 /// SIGTERM or SIGHUP reached the tray (macOS and Linux logout and shutdown).
@@ -75,6 +77,8 @@ pub struct Lease {
     pub version: Option<String>,
     /// `exit.reason` once RealTimeX announced an exit (for the log only), else None.
     pub exit: Option<String>,
+    /// `restart.nonce` while RealTimeX asks Link to take over (its server is down for good).
+    pub restart: Option<String>,
 }
 
 /// A lease Link supervises: at most 4 KB, `schema` 1, `"clean-exit"` among its capabilities, and
@@ -111,7 +115,14 @@ pub fn parse_lease(bytes: &[u8]) -> Option<Lease> {
                 .unwrap_or_else(|| "unknown".to_string()),
         ),
     };
-    Some(Lease { pid, version, exit })
+    let restart = value
+        .get("restart")
+        .filter(|restart| restart.get("reason").and_then(Value::as_str) == Some(BACKEND_DOWN))
+        .and_then(|restart| restart.get("nonce"))
+        .and_then(Value::as_str)
+        .map(|nonce| printable(nonce, 64))
+        .filter(|nonce| !nonce.is_empty());
+    Some(Lease { pid, version, exit, restart })
 }
 
 /// Text from the lease as it may appear in a log line: letters, digits and `.-_+` only.
@@ -606,7 +617,13 @@ fn from_iso(text: &str) -> Option<i64> {
 
 /// `app-supervision.json`: `{schema, state, exits, last, enabled, watching}`. RealTimeX reads
 /// `enabled`, `state` and `watching.pid` to know Link would reopen it after a server-down exit.
-fn state_json(memory: &Memory, last: &Value, enabled: bool, watching: Option<u32>) -> Value {
+fn state_json(
+    memory: &Memory,
+    last: &Value,
+    enabled: bool,
+    watching: Option<u32>,
+    ack: Option<&Ack>,
+) -> Value {
     json!({
         "schema": 1,
         "state": if memory.stopped { "stopped" } else { "watching" },
@@ -614,7 +631,49 @@ fn state_json(memory: &Memory, last: &Value, enabled: bool, watching: Option<u32
         "last": last,
         "enabled": enabled,
         "watching": watching.map(|pid| json!({ "pid": pid })),
+        "ack": ack.map(|ack| json!({ "pid": ack.pid, "nonce": ack.nonce, "startMs": ack.start_ms })),
     })
+}
+
+/// A restart request Link answered: it owes reopening that pid's RealTimeX once it dies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ack {
+    pid: u32,
+    nonce: String,
+    /// The pid's start time from the OS, so a reused pid is never taken for it.
+    start_ms: i64,
+}
+
+fn ack_of(file: Option<&Value>) -> Option<Ack> {
+    let ack = file?.get("ack")?;
+    Some(Ack {
+        pid: u32::try_from(ack.get("pid")?.as_u64()?).ok().filter(|pid| *pid > 1)?,
+        nonce: printable(ack.get("nonce")?.as_str()?, 64),
+        start_ms: ack.get("startMs")?.as_i64()?,
+    })
+}
+
+/// Link's own Quit: it won't watch any more, so no answer it gave may make RealTimeX quit now
+/// (nobody would reopen it). Drops `ack` and `watching` from app-supervision.json.
+pub fn forget() {
+    if !crate::api::is_default_instance() {
+        return;
+    }
+    forget_in(&crate::api::data_dir());
+}
+
+fn forget_in(dir: &Path) {
+    let path = dir.join(STATE_FILE);
+    let Some(mut state) = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
+    else {
+        return;
+    };
+    state["ack"] = Value::Null;
+    state["watching"] = Value::Null;
+    let _ = write_atomically(&path, state.to_string().as_bytes());
 }
 
 /// The memory and last decision from `app-supervision.json`, so a Link restart (KeepAlive after
@@ -638,14 +697,16 @@ fn memory_of(file: Option<&Value>) -> (Memory, Value) {
     (memory, last)
 }
 
-fn load_state(dir: &Path) -> (Memory, Value) {
+fn load_state(dir: &Path) -> (Memory, Value, Option<Ack>) {
     let path = dir.join(STATE_FILE);
     let file = std::fs::metadata(&path)
         .ok()
         .filter(|meta| meta.len() <= MAX_STATE_BYTES)
         .and_then(|_| std::fs::read(&path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    memory_of(file.as_ref())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|file| file.get("schema").and_then(Value::as_u64) == Some(1));
+    let (memory, last) = memory_of(file.as_ref());
+    (memory, last, ack_of(file.as_ref()))
 }
 
 /// Written whole to a temporary file in the same folder, then renamed over the old one.
@@ -757,6 +818,10 @@ struct Watcher {
     refused: Option<u32>,
     /// The setting as last read: on until rtx-linkd says otherwise.
     setting: bool,
+    /// The restart request answered (kept in the state file across a Link restart).
+    ack: Option<Ack>,
+    /// The request last declined (setting off or stopped): logged once.
+    declined: Option<String>,
 }
 
 /// Start watching RealTimeX, from the process that holds the tray, for this computer's own Link
@@ -774,7 +839,7 @@ pub fn start(shared: Shared) {
 
 impl Watcher {
     fn new(dir: PathBuf, shared: Shared, sys: System) -> Self {
-        let (memory, last) = load_state(&dir);
+        let (memory, last, ack) = load_state(&dir);
         Self {
             dir,
             shared,
@@ -787,6 +852,8 @@ impl Watcher {
             pending: None,
             refused: None,
             setting: true,
+            ack,
+            declined: None,
         }
     }
 
@@ -816,6 +883,20 @@ impl Watcher {
             return true;
         }
         let Some(watched) = &mut self.watched else {
+            // Link came back (KeepAlive) after answering a restart request: if that RealTimeX has
+            // died meanwhile, the reopening is still owed.
+            if let Some(ack) = self.ack.clone() {
+                if !(self.sys.process)(ack.pid).is_some_and(|p| p.start_ms == ack.start_ms) {
+                    self.watched = Some(Watched {
+                        pid: ack.pid,
+                        start_ms: ack.start_ms,
+                        since: Instant::now(),
+                        long: false,
+                    });
+                    self.died();
+                    return true;
+                }
+            }
             if let Some(file) = self.lease() {
                 if let Some((lease, proc)) = self.passes(&file, None) {
                     self.adopt(&lease, &proc);
@@ -826,11 +907,53 @@ impl Watcher {
         // A start time that no longer matches is a death too (the pid was reused).
         if !(self.sys.process)(watched.pid).is_some_and(|p| p.start_ms == watched.start_ms) {
             self.died();
-        } else if !watched.long && watched.since.elapsed() >= ALIVE_RESET {
-            watched.long = true;
-            self.apply(&Event::AliveLong);
+        } else {
+            if !watched.long && watched.since.elapsed() >= ALIVE_RESET {
+                watched.long = true;
+                self.apply(&Event::AliveLong);
+            }
+            self.answer_restart_request();
         }
         true
+    }
+
+    /// The watched RealTimeX asks Link to take over (its server is down for good). Answer only
+    /// with the setting on and no crash-loop stop; from then on Link owes the reopening.
+    fn answer_restart_request(&mut self) {
+        let Some(watched) = &self.watched else { return };
+        let (pid, start_ms) = (watched.pid, watched.start_ms);
+        let Some(nonce) = self
+            .lease()
+            .and_then(|file| file.lease)
+            .filter(|lease| lease.pid == pid && lease.exit.is_none())
+            .and_then(|lease| lease.restart)
+        else {
+            return;
+        };
+        if self.ack.as_ref().is_some_and(|ack| ack.pid == pid && ack.nonce == nonce) {
+            return;
+        }
+        let setting = self.fresh_setting();
+        if !setting || self.memory.stopped {
+            if self.declined.as_deref() != Some(nonce.as_str()) {
+                self.declined = Some(nonce);
+                let why = if setting { "crash loop, stopped" } else { "setting off" };
+                self.record(
+                    pid,
+                    "declined",
+                    why,
+                    &format!("server down pid {pid}; {why}, RealTimeX keeps its notice"),
+                );
+            }
+            return;
+        }
+        self.ack = Some(Ack { pid, nonce, start_ms });
+        self.record(
+            pid,
+            "taking-over",
+            BACKEND_DOWN,
+            &format!("server down pid {pid}; RealTimeX asked to be reopened, taking over"),
+        );
     }
 
     /// The setting from rtx-linkd; a turn is a decision of its own (off then on resets).
@@ -872,7 +995,8 @@ impl Watcher {
 
     fn save(&self) {
         let watching = self.watched.as_ref().map(|watched| watched.pid);
-        let text = state_json(&self.memory, &self.last, self.setting, watching).to_string();
+        let text =
+            state_json(&self.memory, &self.last, self.setting, watching, self.ack.as_ref()).to_string();
         if let Err(error) = write_atomically(&self.dir.join(STATE_FILE), text.as_bytes()) {
             eprintln!("supervise: couldn't write {STATE_FILE}: {error}");
         }
@@ -926,7 +1050,9 @@ impl Watcher {
             long: false,
         });
         self.refused = None;
-        // RealTimeX reads `watching` before a server-down exit.
+        if self.ack.as_ref().is_some_and(|ack| ack.pid != lease.pid) {
+            self.ack = None;
+        }
         self.save();
         let version = lease.version.as_deref().unwrap_or("unknown");
         append_log(
@@ -941,6 +1067,8 @@ impl Watcher {
     fn died(&mut self) {
         let Some(watched) = self.watched.take() else { return };
         let pid = watched.pid;
+        // Whatever it was, the answer is settled by this death.
+        let acked = self.ack.take().is_some_and(|ack| ack.pid == pid);
         // Read again, past the cache: the announcement may be the last write before the exit.
         self.cache = read_lease(&self.dir);
         let announced = self
@@ -952,6 +1080,8 @@ impl Watcher {
         // Its server down for good: reopened like a crash, but named for what it was.
         let what = match announced {
             Some(reason) if reason == BACKEND_DOWN => format!("server down pid {pid}"),
+            // Answered, and it died before it could announce: still owed.
+            None if acked => format!("server down pid {pid}"),
             Some(reason) => {
                 self.apply(&Event::Intended);
                 self.record(pid, "intended", &reason, &format!("intended exit pid {pid} ({reason})"));
@@ -1130,7 +1260,7 @@ mod tests {
         let lease = parse_lease(&lease_json(good())).unwrap();
         assert_eq!(
             lease,
-            Lease { pid: 4242, version: Some("1.4.2".into()), exit: None }
+            Lease { pid: 4242, version: Some("1.4.2".into()), exit: None, restart: None }
         );
         let mut announced = good();
         announced["exit"] = json!({ "reason": "quit", "at": "2026-11-10T03:01:00.000Z" });
@@ -1392,13 +1522,13 @@ mod tests {
         let t0 = 1_762_743_600_000;
         let memory = Memory { stopped: true, exits: vec![t0, t0 + MIN], setting: Some(true) };
         let last = json!({ "at": iso(t0), "pid": 4242, "decision": "stopped", "reason": "4 unannounced exits in 10 min" });
-        let text = state_json(&memory, &last, true, None).to_string();
+        let text = state_json(&memory, &last, true, None, None).to_string();
         write_atomically(&dir.path().join(STATE_FILE), text.as_bytes()).unwrap();
         let written: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join(STATE_FILE)).unwrap()).unwrap();
         assert_eq!(written["schema"], 1);
         assert_eq!(written["state"], "stopped");
         assert_eq!(written["exits"][0], "2025-11-10T03:00:00.000Z");
-        let (loaded, loaded_last) = load_state(dir.path());
+        let (loaded, loaded_last, _) = load_state(dir.path());
         assert_eq!(loaded, Memory { setting: None, ..memory });
         assert_eq!(loaded_last, last);
         // No temporary file is left.
@@ -1422,6 +1552,7 @@ mod tests {
         procs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Proc>>>,
         launches: std::sync::Arc<std::sync::Mutex<usize>>,
         exe: PathBuf,
+        target: PathBuf,
         watcher: Watcher,
     }
 
@@ -1430,7 +1561,7 @@ mod tests {
             use std::sync::{Arc, Mutex};
             let dir = tempdir();
             // Paths that don't exist, so the target is compared as written.
-            let target = if cfg!(target_os = "macos") {
+            let target: PathBuf = if cfg!(target_os = "macos") {
                 PathBuf::from("/rtx-none/Applications/RealTimeX.AI.app")
             } else {
                 PathBuf::from("/rtx-none/opt/RealTimeX.AI/RealTimeX.AI")
@@ -1438,7 +1569,19 @@ mod tests {
             let exe = expected_executable(Os::current(), &target);
             let procs: Arc<Mutex<std::collections::HashMap<u32, Proc>>> = Arc::default();
             let launches = Arc::new(Mutex::new(0usize));
-            let sys = System {
+            let shared: Shared = Arc::new(Mutex::new(crate::app::Snapshot::default()));
+            lock(&shared).status = Some(json!({ "reopenRealtimex": true, "instance": { "default": true } }));
+            let sys = Self::system(&procs, &launches, target.clone());
+            let watcher = Watcher::new(dir.path().to_path_buf(), shared, sys);
+            Self { dir, procs, launches, exe, target, watcher }
+        }
+
+        fn system(
+            procs: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Proc>>>,
+            launches: &std::sync::Arc<std::sync::Mutex<usize>>,
+            target: PathBuf,
+        ) -> System {
+            System {
                 process: {
                     let procs = procs.clone();
                     Box::new(move |pid| procs.lock().unwrap().get(&pid).cloned())
@@ -1452,11 +1595,26 @@ mod tests {
                         Ok(())
                     })
                 },
-            };
-            let shared: Shared = Arc::new(Mutex::new(crate::app::Snapshot::default()));
-            lock(&shared).status = Some(json!({ "reopenRealtimex": true, "instance": { "default": true } }));
-            let watcher = Watcher::new(dir.path().to_path_buf(), shared, sys);
-            Self { dir, procs, launches, exe, watcher }
+            }
+        }
+
+        /// Link dies and comes back (KeepAlive): a new watcher on the same data folder.
+        fn restart_link(&mut self) {
+            let shared = self.watcher.shared.clone();
+            let sys = Self::system(&self.procs, &self.launches, self.target.clone());
+            self.watcher = Watcher::new(self.dir.path().to_path_buf(), shared, sys);
+        }
+
+        /// RealTimeX asks Link to take over: its server is down for good.
+        fn request(&self, pid: u32, nonce: &str) {
+            let mut body = good();
+            body["pid"] = json!(pid);
+            body["restart"] = json!({ "reason": BACKEND_DOWN, "nonce": nonce, "at": iso(now_ms()) });
+            std::fs::write(self.dir.path().join(LEASE_FILE), lease_json(body)).unwrap();
+        }
+
+        fn state(&self) -> Value {
+            serde_json::from_str(&std::fs::read_to_string(self.dir.path().join(STATE_FILE)).unwrap()).unwrap()
         }
 
         /// RealTimeX `pid` runs (started a few seconds ago) and has written its lease.
@@ -1590,11 +1748,121 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_request_is_answered_only_by_a_watcher_that_will_reopen() {
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        let state = pc.state();
+        assert_eq!(state["ack"]["pid"], 100);
+        assert_eq!(state["ack"]["nonce"], "n-1");
+        assert!(pc.log().contains("server down pid 100; RealTimeX asked to be reopened, taking over"));
+        // The app announces and quits; Link reopens it like a crash.
+        pc.lease(100, Some(BACKEND_DOWN));
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.log().contains("server down pid 100 → relaunch in 3s (1 of 3)"));
+        assert_eq!(pc.state()["ack"], Value::Null, "settled by the death");
+        pc.expire();
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 1);
+    }
+
+    #[test]
+    fn with_the_setting_off_or_stopped_the_request_is_declined_and_the_app_keeps_its_notice() {
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        lock(&pc.watcher.shared).status = Some(json!({ "reopenRealtimex": false }));
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"], Value::Null);
+        assert_eq!(pc.log().matches("setting off, RealTimeX keeps its notice").count(), 1, "logged once");
+        // Stopped after a crash loop: declined too. (A fresh watcher: turning the setting off and
+        // on again would itself reset the stop.)
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.watcher.memory.stopped = true;
+        pc.request(100, "n-2");
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"], Value::Null);
+        assert!(pc.log().contains("crash loop, stopped, RealTimeX keeps its notice"));
+    }
+
+    #[test]
+    fn link_dying_across_the_handoff_still_reopens_the_app() {
+        // Link answers, then dies; the app quits while Link is down; KeepAlive brings Link back.
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        pc.lease(100, Some(BACKEND_DOWN));
+        pc.kill(100);
+        pc.restart_link();
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some(), "the owed reopening survived the restart");
+        assert!(pc.log().contains("server down pid 100 → relaunch in 3s (1 of 3)"));
+        pc.expire();
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 1);
+        // Died before it could announce: still owed.
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        pc.kill(100);
+        pc.restart_link();
+        pc.watcher.tick();
+        assert!(pc.log().contains("server down pid 100 → relaunch"));
+        // Link back while the app still runs: it is adopted again, and the answer stands.
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        pc.restart_link();
+        pc.watcher.tick();
+        assert_eq!(pc.watcher.watched.as_ref().map(|w| w.pid), Some(100));
+        assert_eq!(pc.state()["ack"]["nonce"], "n-1");
+    }
+
+    #[test]
+    fn links_own_quit_withdraws_its_answer() {
+        let mut pc = Pretend::new();
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        assert_eq!(pc.state()["ack"]["nonce"], "n-1");
+        forget_in(pc.dir.path());
+        let state = pc.state();
+        assert_eq!(state["ack"], Value::Null);
+        assert_eq!(state["watching"], Value::Null);
+        assert_eq!(state["schema"], 1, "the rest is kept");
+    }
+
+    #[test]
+    fn the_lease_carries_a_restart_request_only_for_a_server_down() {
+        let mut body = good();
+        body["restart"] = json!({ "reason": BACKEND_DOWN, "nonce": "abc-123", "at": "x" });
+        assert_eq!(parse_lease(&lease_json(body.clone())).unwrap().restart.as_deref(), Some("abc-123"));
+        body["restart"]["reason"] = json!("other");
+        assert_eq!(parse_lease(&lease_json(body.clone())).unwrap().restart, None);
+        body["restart"] = json!({ "reason": BACKEND_DOWN, "nonce": "" });
+        assert_eq!(parse_lease(&lease_json(body)).unwrap().restart, None);
+    }
+
+    #[test]
     fn only_a_lease_for_another_pid_written_after_the_death_replaces_it() {
         let file = |pid: u32, exit: Option<&str>, mtime_ms: i64| LeaseFile {
             mtime_ms,
             size: 100,
-            lease: Some(Lease { pid, version: None, exit: exit.map(str::to_string) }),
+            lease: Some(Lease { pid, version: None, exit: exit.map(str::to_string), restart: None }),
         };
         let died = 1_762_743_600_500;
         assert_eq!(replacement(None, 100, died), Replacement::None);

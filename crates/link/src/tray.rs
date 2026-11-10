@@ -259,6 +259,8 @@ impl Tray {
                     &done,
                 );
             } else if id == quit {
+                // Nobody will reopen RealTimeX now: withdraw any answer to its restart request.
+                crate::supervise::forget();
                 // Quit is all of RealTimeX Link: hosting stops too, and any other window.
                 if let Some(api) = lock(&shared).api.clone() {
                     let _ = api.post(
