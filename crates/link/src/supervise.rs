@@ -635,6 +635,7 @@ fn state_json(
         "watching": watching.map(|pid| json!({ "pid": pid })),
         "ack": ack.map(|ack| json!({
             "pid": ack.pid, "nonce": ack.nonce, "startMs": ack.start_ms, "dueMs": ack.due_ms,
+            "diedMs": ack.died_ms,
         })),
     })
 }
@@ -649,6 +650,9 @@ struct Ack {
     /// Once the pid died and its relaunch was decided (counted once): when it is due (ms since the
     /// epoch). Kept until the relaunch runs, so a Link restart during the wait still reopens.
     due_ms: Option<i64>,
+    /// When the death was seen (ms since the epoch), kept with `due_ms`: a replacement session's
+    /// lease written since then cancels the relaunch, also after a Link restart.
+    died_ms: Option<i64>,
 }
 
 fn ack_of(file: Option<&Value>) -> Option<Ack> {
@@ -658,6 +662,7 @@ fn ack_of(file: Option<&Value>) -> Option<Ack> {
         nonce: printable(ack.get("nonce")?.as_str()?, 64),
         start_ms: ack.get("startMs")?.as_i64()?,
         due_ms: ack.get("dueMs").and_then(Value::as_i64),
+        died_ms: ack.get("diedMs").and_then(Value::as_i64),
     })
 }
 
@@ -901,7 +906,9 @@ impl Watcher {
                     let wait = u64::try_from(due_ms - now_ms()).unwrap_or(0);
                     self.pending = Some(Pending {
                         pid: ack.pid,
-                        died_ms: due_ms,
+                        // The real death time, never the deadline: a replacement started and quit
+                        // during the wait (even while Link was down) must still cancel it.
+                        died_ms: ack.died_ms.unwrap_or(ack.start_ms),
                         due: Instant::now() + Duration::from_millis(wait),
                     });
                     append_log(
@@ -988,7 +995,7 @@ impl Watcher {
             }
             return;
         }
-        self.ack = Some(Ack { pid, nonce, start_ms, due_ms: None });
+        self.ack = Some(Ack { pid, nonce, start_ms, due_ms: None, died_ms: None });
         self.record(
             pid,
             "taking-over",
@@ -1151,11 +1158,13 @@ impl Watcher {
             }
             None => format!("unannounced exit pid {pid}"),
         };
+        let died_ms = now_ms();
         let decision = self.apply(&Event::Unannounced);
         match &decision {
             Decision::Relaunch { delay_secs, .. } => {
                 if let Some(ack) = self.ack.as_mut() {
-                    ack.due_ms = Some(now_ms() + (*delay_secs as i64) * 1000);
+                    ack.died_ms = Some(died_ms);
+                    ack.due_ms = Some(died_ms + (*delay_secs as i64) * 1000);
                 }
             }
             _ => self.ack = None,
@@ -1172,7 +1181,7 @@ impl Watcher {
                 self.record(pid, "relaunch", &reason, &format!("{what} → {reason}"));
                 self.pending = Some(Pending {
                     pid,
-                    died_ms: now_ms(),
+                    died_ms,
                     due: Instant::now() + Duration::from_secs(delay_secs),
                 });
             }
@@ -1712,6 +1721,13 @@ mod tests {
             self.procs.lock().unwrap().remove(&pid);
         }
 
+        /// The relaunch's wait is over now, if one waits.
+        fn expire_if_pending(&mut self) {
+            if let Some(pending) = self.watcher.pending.as_mut() {
+                pending.due = Instant::now();
+            }
+        }
+
         /// The relaunch's wait is over now.
         fn expire(&mut self) {
             self.watcher.pending.as_mut().expect("a relaunch waits").due = Instant::now();
@@ -1958,6 +1974,74 @@ mod tests {
         pc.restart_link();
         pc.watcher.tick();
         assert!(pc.watcher.pending.is_none());
+    }
+
+    /// Answered, the app exited with backend-down, Link saw the death and waits 30 s (the 3rd).
+    fn owed_and_waiting() -> Pretend {
+        let mut pc = Pretend::new();
+        let now = now_ms();
+        pc.watcher.memory.exits = vec![now - 2 * 60_000, now - 60_000];
+        pc.start(100);
+        pc.watcher.tick();
+        pc.request(100, "n-1");
+        pc.watcher.tick();
+        pc.lease(100, Some(BACKEND_DOWN));
+        pc.kill(100);
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some());
+        assert!(pc.log().contains("server down pid 100 → relaunch in 30s (3 of 3)"));
+        pc
+    }
+
+    /// The lease's mtime, set back to `ms` (a write in an earlier second than the deadline).
+    fn age_lease(pc: &Pretend, ms: i64) {
+        let file = std::fs::File::options().write(true).open(pc.dir.path().join(LEASE_FILE)).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_millis(ms as u64)).unwrap();
+    }
+
+    #[test]
+    fn after_a_link_restart_a_replacement_quit_during_the_wait_still_cancels_the_relaunch() {
+        // Review: owed relaunch persisted -> Link restart -> the person opens RealTimeX and quits it
+        // before the saved deadline -> deadline: no launch, and the count starts again.
+        let mut pc = owed_and_waiting();
+        let died = pc.state()["ack"]["diedMs"].as_i64().unwrap();
+        assert!(pc.state()["ack"]["dueMs"].as_i64().unwrap() >= died + 30_000);
+        pc.restart_link();
+        pc.watcher.tick();
+        assert!(pc.watcher.pending.is_some(), "restored");
+        assert_eq!(pc.watcher.pending.as_ref().unwrap().died_ms, died, "the death time, not the deadline");
+        // A replacement starts and quits; its lease is written well before the deadline.
+        pc.start(200);
+        pc.lease(200, Some("quit"));
+        pc.kill(200);
+        age_lease(&pc, died + 2_000);
+        pc.watcher.tick();
+        pc.expire_if_pending();
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 0, "the explicit Quit is honoured");
+        assert!(pc.watcher.pending.is_none());
+        assert_eq!(pc.state()["ack"], Value::Null);
+        assert!(pc.watcher.memory.exits.is_empty(), "an intended exit starts the count again");
+    }
+
+    #[test]
+    fn a_replacement_started_and_quit_while_link_was_down_still_cancels_the_relaunch() {
+        let mut pc = owed_and_waiting();
+        let died = pc.state()["ack"]["diedMs"].as_i64().unwrap();
+        // Link is down: the person opens RealTimeX and quits it.
+        pc.start(200);
+        pc.lease(200, Some("quit"));
+        pc.kill(200);
+        age_lease(&pc, died + 2_000);
+        pc.restart_link();
+        pc.watcher.tick();
+        pc.expire_if_pending();
+        pc.watcher.tick();
+        assert_eq!(pc.launches(), 0);
+        assert!(pc.watcher.pending.is_none());
+        assert_eq!(pc.state()["ack"], Value::Null);
+        assert!(pc.watcher.memory.exits.is_empty());
+        assert!(pc.log().contains("intended exit pid 200 (quit); relaunch cancelled"));
     }
 
     #[test]
