@@ -128,10 +128,12 @@ verify:
     paths:
       - link-signed/
 
+# The macOS arm64 signing machine is the app's build-realtimex-ai runner (usa-mac-mini-03 since
+# 2026-11-13); it holds the Developer ID identity in its login keychain.
 sign-mac-arm64:
   extends: .sign-mac
   tags:
-    - usa-macmini-m4
+    - build-realtimex-ai
   variables:
     CPU_ARCH: arm64
 
